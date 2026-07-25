@@ -30,7 +30,7 @@ The hub exposes two WebSocket routes on the same port:
 |---|---|---|---|
 | `/device` | Browser extension (dials **out**) | ext -> hub | `hello`, `heartbeat`, `result`, `event` |
 | | | hub -> ext | `command`, `ping`, `error` |
-| `/agent` | CLI / lib / (later) MCP server | agent -> hub | `list_devices`, `command`, `poll` |
+| `/agent` | CLI / lib / (later) MCP server | agent -> hub | `list_devices`, `command`, `poll`, `confirm` |
 | | | hub -> agent | `devices`, `result`, `error` |
 
 The extension always dials **out** to the hub -- it never listens on an inbound port. This is
@@ -212,6 +212,50 @@ returns *immediately* with a queued status. It never silently blocks waiting for
 reconnect -- design doc §5: "A tool call that hangs for two minutes is indistinguishable from a
 broken system."
 
+Response -- the target failed a **denylist** check (see docs/POLICY.md):
+```json
+{"v": 1, "id": "...", "type": "result", "ok": false, "error": "target is not accessible under current policy"}
+```
+The reason text is deliberately generic -- it never names the matched category or domain. A
+denied tab must stay invisible; naming *why* a target was refused reveals as much as showing it
+in a `tabs` listing would. Full detail (category, matched domain) goes to the audit log only.
+
+Response -- the command matched a **confirmation gate** (an irreversible/world-visible action;
+see docs/POLICY.md for the full category list and the honest limits of detection):
+```json
+{
+  "v": 1,
+  "id": "...",
+  "type": "result",
+  "status": "needs_confirmation",
+  "confirmation_token": "9f2c...hex",
+  "category": "delete",
+  "detected": {"category": "delete", "label_match": "\\bdelete\\b", "url_match": null}
+}
+```
+The command was **not** dispatched to the device. Re-submit it via `confirm` (below) with the
+same `confirmation_token` to execute it, or let the token expire (5 minutes by default) to
+abandon it.
+
+### `confirm` (agent -> hub) / `result` (hub -> agent)
+
+Executes a command that previously returned `needs_confirmation`:
+
+```json
+{"v": 1, "id": "...", "type": "confirm", "confirmation_token": "9f2c...hex", "token": "..."}
+```
+
+(Note the two different `token` fields: `token` is the hub's own auth token, same as every other
+agent request; `confirmation_token` is the single-use policy token from the gated response --
+they are unrelated and deliberately spelled differently to avoid confusion.)
+
+Response is whatever the original command would have returned had it not been gated (an
+immediate `result`, a `queued` status, or -- if the target became denylisted in the meantime --
+another denial; a confirmation only bypasses the *gate*, never the denylist). A second `confirm`
+with the same `confirmation_token` fails with `{"ok": false, "error": "confirmation token already
+used"}`; one submitted after the token's TTL fails with `{"ok": false, "error": "confirmation
+token expired"}`.
+
 ### `poll` (agent -> hub) / `result` (hub -> agent)
 
 Used to check on (or retrieve the eventual result of) a previously queued command:
@@ -278,6 +322,21 @@ Commands are partitioned into `PAGE_WORLD_COMMANDS` (dispatched into `injected.j
 the page's isolated world) and `BROWSER_LEVEL_COMMANDS` (handled directly by
 `background.js` against `chrome.tabs`/`chrome.windows`, which are not reachable from page
 context). See `protocol.py` for the exact partition.
+
+### Optional policy-hint args
+
+Three `args` keys are recognized by the hub's policy engine (policy.py) but are **not**
+populated by anything in this codebase yet -- see docs/POLICY.md for why, and what that means
+for gate detection today:
+
+| Key | Applies to | Meaning |
+|---|---|---|
+| `label` | `click`, `type` | Visible text / `aria-label` of the target element -- exactly what `injected.js`'s `snapshot()` already computes as each node's `name` |
+| `page_url` | any command without its own `url` | The tab's current URL, for gate URL-pattern matching when the command itself doesn't carry one |
+| `input_type` | `click`, `type` | Element type hint, e.g. `"file"` for an `input[type=file]` |
+
+A future caller (CLI, MCP tool, or the extension) can pass these through from a prior
+`snapshot`/`tabs` result to give the policy engine real signal for click/type-based gates.
 
 ## The three-tier connectivity model
 

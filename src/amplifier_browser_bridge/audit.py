@@ -10,6 +10,29 @@ interaction speed, not high-frequency event streams -- a blocking append-and-flu
 per record is simpler and more obviously correct than an async writer, and there is
 no measured need for the latter (ruthless simplicity: don't build for a load that
 doesn't exist).
+
+## Policy events (see policy.py, hub.py)
+
+This is the single log both dispatch events and policy decisions are recorded to
+-- there is no separate policy log. `event` names to know when reviewing:
+
+    policy_denied                a target matched the denylist; command refused
+    policy_tab_hidden            a `tabs` result entry was filtered out (response-
+                                  path invisibility -- see policy.py)
+    policy_gated                 an irreversible/world-visible action was detected;
+                                  a confirmation token was issued instead of dispatching
+    policy_confirmed             a confirmation token was redeemed; the original
+                                  command was re-submitted for dispatch
+    policy_confirmation_expired  a confirmation token expired (unused) and was purged
+    kill_switch_engaged          hub-level stop-all activated
+    kill_switch_rejected         one queued (not-yet-dispatched) command rejected
+                                  as part of a kill-switch engagement
+    kill_switch_disengaged       stop-all lifted
+
+This is the compensating control for broad-by-default access (design doc §6.2):
+since most reads/navigations run unprompted, the audit log -- not a approval
+dialog -- is what lets the human review, after the fact, everything the agent did
+and every policy decision the hub made on its behalf.
 """
 
 from __future__ import annotations
