@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Amplifier Browser Bridge",
+  "version": "0.1.0",
+  "description": "Lets an Amplifier (or any MCP-speaking) agent observe and drive this browser from another device over the user's own tailnet. Injection-only in this phase -- no chrome.debugger/CDP permission is requested.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "scripting",
+    "tabs",
+    "storage",
+    "alarms",
+    "downloads",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

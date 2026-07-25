@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets and local runtime state -- NEVER commit tokens or audit logs
+.abb/
+tokens.json
+*.token
+audit*.jsonl
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Node (extension has no build step today, but guard against future tooling)
+node_modules/
