@@ -9,6 +9,22 @@ description = "Cross-device agent <-> real-browser bridge (Microsoft Edge, over 
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+keywords = ["browser-automation", "microsoft-edge", "tailscale", "mcp", "agent", "amplifier"]
+authors = [
+    { name = "Microsoft Corporation" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
 dependencies = [
     "websockets>=12.0",
     "aiohttp>=3.9",
