@@ -19,10 +19,20 @@ Amplifier tool module, the policy/consent engine, and CDP escalation.
 ```
 docs/designs/browser-bridge.md   -- the design (read this first)
 docs/PROTOCOL.md                 -- the wire protocol
-src/amplifier_browser_bridge/    -- the lib: protocol, addressing, tiers, hub, client, CLI
+docs/AGENT_SURFACES.md           -- the MCP server and Amplifier tool module (agent surfaces)
+bundle.md                        -- Amplifier bundle composing the tool-browser-bridge module
+src/amplifier_browser_bridge/    -- the lib: protocol, addressing, tiers, hub, client, CLI, mcp_server
+modules/tool-browser-bridge/     -- the Amplifier tool module (thin adapter over the lib)
 extension/                       -- the MV3 browser extension (one build, all platforms)
 tests/                           -- unit tests for everything testable without a live browser
 ```
+
+## Agent surfaces: MCP server and Amplifier tool module
+
+Beyond the CLI above, the lib is also exposed as an MCP server (`abb-mcp`, any
+MCP-speaking client) and an Amplifier tool module (`modules/tool-browser-bridge/`,
+composed via `bundle.md`). See `docs/AGENT_SURFACES.md` for how to run and
+configure each, and the proof that both work end-to-end.
 
 ## Running the hub
 

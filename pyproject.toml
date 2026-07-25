@@ -15,8 +15,14 @@ dependencies = [
     "click>=8.1",
 ]
 
+[project.optional-dependencies]
+# Optional so the core lib/CLI stay lean (design doc \u00a73.3: MCP server is one of
+# four agent-surface adapters, not a required dependency of the lib itself).
+mcp = ["mcp>=1.6"]
+
 [project.scripts]
 abb = "amplifier_browser_bridge.cli:main"
+abb-mcp = "amplifier_browser_bridge.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/amplifier_browser_bridge"]

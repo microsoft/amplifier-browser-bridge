@@ -1,0 +1,240 @@
+"""Tests for the MCP server adapter (mcp_server.py).
+
+The `@mcp.tool()` decorator returns the original function unchanged (see
+`mcp.server.fastmcp.FastMCP.tool`'s `decorator`), so every `browser_*` function is
+directly callable/awaitable here -- no MCP client/transport needed to exercise the
+adapter logic itself. The end-to-end proof (a real MCP client driving a real
+subprocess over stdio) is a separate, manual step -- see docs/AGENT_SURFACES.md.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from amplifier_browser_bridge import HubError, Target
+from amplifier_browser_bridge import mcp_server as srv
+
+
+class _FakeHubClient:
+    """Stands in for HubClient -- records every call, returns a canned response."""
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        self.response = response
+        self.command_calls: list[tuple[Target, str, dict[str, Any]]] = []
+        self.list_devices_calls = 0
+        self.poll_calls: list[tuple[str, str]] = []
+
+    async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]:
+        self.command_calls.append((target, command, args))
+        return self.response
+
+    async def list_devices(self) -> list[dict[str, Any]]:
+        self.list_devices_calls += 1
+        return self.response.get("devices", [])
+
+    async def poll(self, device_id: str, command_id: str) -> dict[str, Any]:
+        self.poll_calls.append((device_id, command_id))
+        return self.response
+
+
+# ---------------------------------------------------------------------------
+# Tool schema validity -- every tool FastMCP registered has a name, a
+# non-empty description, and a JSON-schema-shaped input schema.
+# ---------------------------------------------------------------------------
+
+
+def test_all_expected_tools_are_registered():
+    expected = {
+        "browser_devices",
+        "browser_tabs",
+        "browser_snapshot",
+        "browser_read",
+        "browser_click",
+        "browser_type",
+        "browser_key",
+        "browser_scroll",
+        "browser_navigate",
+        "browser_tab_open",
+        "browser_tab_close",
+        "browser_tab_activate",
+        "browser_screenshot",
+        "browser_wait_for",
+        "browser_wait_text",
+        "browser_poll",
+    }
+    registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
+    assert registered == expected
+
+
+def test_every_tool_has_a_nonempty_description_and_schema():
+    for tool in srv.mcp._tool_manager.list_tools():
+        assert tool.description and len(tool.description) > 10, tool.name
+        schema = tool.parameters
+        assert isinstance(schema, dict)
+        assert schema.get("type") == "object"
+
+
+def test_browser_devices_and_browser_tabs_descriptions_teach_addressing():
+    """The entry-point tools must teach an agent that has never seen this system
+    that it needs to pick a device, then a tab, before acting."""
+    tools = {t.name: t for t in srv.mcp._tool_manager.list_tools()}
+    devices_desc = tools["browser_devices"].description or ""
+    tabs_desc = tools["browser_tabs"].description or ""
+    assert "first" in devices_desc.lower()
+    assert "device_id" in tabs_desc or "device" in tabs_desc.lower()
+
+
+def test_queue_note_present_on_every_tab_acting_tool_description():
+    """Every tool that can target a non-live device must document the queued
+    pass-through shape in its own description (an MCP client typically shows one
+    tool's description in isolation)."""
+    tab_acting = {
+        "browser_tabs",
+        "browser_snapshot",
+        "browser_read",
+        "browser_click",
+        "browser_type",
+        "browser_key",
+        "browser_scroll",
+        "browser_navigate",
+        "browser_tab_open",
+        "browser_tab_close",
+        "browser_tab_activate",
+        "browser_screenshot",
+        "browser_wait_for",
+        "browser_wait_text",
+    }
+    tools = {t.name: t for t in srv.mcp._tool_manager.list_tools()}
+    for name in tab_acting:
+        desc = tools[name].description or ""
+        assert "queued" in desc, f"{name} description is missing the queued/tier note"
+        assert "not an error" in desc.lower() or "not a hang" in desc.lower(), name
+
+
+# ---------------------------------------------------------------------------
+# Argument -> lib-call mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browser_click_maps_args_to_target_and_command(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"ok": True, "result": {"clicked": True}})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_click(device_id="d1", tab_id=7, ref="e12")
+
+    assert result == {"ok": True, "result": {"clicked": True}}
+    assert len(fake.command_calls) == 1
+    target, command, args = fake.command_calls[0]
+    assert target == Target(device_id="d1", tab_id=7)
+    assert command == "click"
+    assert args == {"ref": "e12"}
+
+
+@pytest.mark.asyncio
+async def test_browser_type_maps_ref_and_text(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"ok": True, "result": {}})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    await srv.browser_type(device_id="d1", tab_id=3, ref="e1", text="hello")
+
+    _, command, args = fake.command_calls[0]
+    assert command == "type"
+    assert args == {"ref": "e1", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_browser_tab_open_defaults_to_background(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"ok": True, "result": {"tab_id": 99}})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    await srv.browser_tab_open(device_id="d1")
+
+    target, command, args = fake.command_calls[0]
+    assert target == Target(device_id="d1")  # device-only -- no tab exists yet
+    assert command == "tab_open"
+    assert args == {"url": "about:blank", "active": False}
+
+
+@pytest.mark.asyncio
+async def test_browser_devices_calls_list_devices_not_command(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"devices": [{"device_id": "d1", "tier": "live"}]})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_devices()
+
+    assert fake.list_devices_calls == 1
+    assert fake.command_calls == []
+    assert result == {"ok": True, "devices": [{"device_id": "d1", "tier": "live"}]}
+
+
+@pytest.mark.asyncio
+async def test_browser_poll_calls_poll_not_command(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"status": "pending"})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_poll(device_id="d1", command_id="cmd-1")
+
+    assert fake.poll_calls == [("d1", "cmd-1")]
+    assert result == {"status": "pending"}
+
+
+# ---------------------------------------------------------------------------
+# The load-bearing guarantee: queued/tier results pass through untouched, and
+# are never mistaken for an error or blocked on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queued_result_passes_through_verbatim(monkeypatch: pytest.MonkeyPatch):
+    queued_response = {
+        "status": "queued",
+        "command_id": "cmd-42",
+        "tier": "intermittent",
+        "last_seen": "2026-07-25T17:58:02.001+00:00",
+        "queue_position": 1,
+    }
+    fake = _FakeHubClient(queued_response)
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_snapshot(device_id="d1", tab_id=7)
+
+    # Bit-for-bit identical to what the hub returned -- not flattened into an
+    # "ok" shape, not turned into an error, and (being a plain return, not an
+    # await on some retry/backoff loop) not blocked on either.
+    assert result == queued_response
+    assert result["status"] == "queued"
+    assert "ok" not in result
+    assert "error" not in result
+
+
+@pytest.mark.asyncio
+async def test_dormant_device_queue_result_also_passes_through(monkeypatch: pytest.MonkeyPatch):
+    dormant_response = {
+        "status": "queued",
+        "command_id": "cmd-7",
+        "tier": "dormant",
+        "last_seen": None,
+        "queue_position": 1,
+    }
+    fake = _FakeHubClient(dormant_response)
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="phone-1")
+
+    assert result == dormant_response
+    assert result["tier"] == "dormant"
+
+
+@pytest.mark.asyncio
+async def test_hub_error_surfaces_as_ok_false_not_an_exception(monkeypatch: pytest.MonkeyPatch):
+    class _RaisingClient:
+        async def command(self, *a, **k):
+            raise HubError("unauthorized")
+
+    monkeypatch.setattr(srv, "_client", lambda: _RaisingClient())
+
+    result = await srv.browser_read(device_id="d1", tab_id=1)
+
+    assert result == {"ok": False, "error": "unauthorized"}

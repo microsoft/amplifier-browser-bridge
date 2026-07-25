@@ -1,0 +1,46 @@
+[project]
+name = "amplifier-module-tool-browser-bridge"
+version = "0.1.0"
+description = "Amplifier tool module: drive the user's real Edge browsers via amplifier-browser-bridge"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# amplifier-core is a peer dependency -- do NOT declare it here (see
+# creating-amplifier-modules skill). amplifier-browser-bridge is the lib this
+# module wraps; it lives at the root of this same repository.
+dependencies = [
+    "amplifier-browser-bridge",
+]
+
+[project.entry-points."amplifier.modules"]
+tool-browser-bridge = "amplifier_module_tool_browser_bridge:mount"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_module_tool_browser_bridge"]
+
+[tool.hatch.metadata]
+# Needed once `amplifier-browser-bridge` in [tool.uv.sources] (or a published
+# git dependency) resolves via a direct reference rather than PyPI.
+allow-direct-references = true
+
+[tool.uv.sources]
+# Monorepo local-dev resolution: this module's sibling package lives two
+# directories up (modules/tool-browser-bridge -> repo root). Only respected by
+# `uv`; a plain `pip install` of this module (e.g. after publishing, via
+# `git+https://.../amplifier-browser-bridge@main#subdirectory=modules/tool-browser-bridge`)
+# falls back to resolving `amplifier-browser-bridge` as a normal dependency --
+# see docs/AGENT_SURFACES.md for the production dependency once the repo is
+# published.
+amplifier-browser-bridge = { path = "../..", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
