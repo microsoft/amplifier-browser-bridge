@@ -199,9 +199,9 @@ def test_evaluate_allows_unobserved_tab_absent_denylist_signal(tmp_path: Any) ->
 
 
 def test_evaluate_allows_ordinary_site() -> None:
-    from amplifier_browser_bridge.audit import AuditLog as _AL
-
     import tempfile
+
+    from amplifier_browser_bridge.audit import AuditLog as _AL
 
     with tempfile.TemporaryDirectory() as d:
         engine = PolicyEngine(_AL(f"{d}/audit.jsonl"))
@@ -247,7 +247,7 @@ def test_hub_tabs_result_filtered_before_reaching_agent(tmp_path: Any) -> None:
     has the denylisted entry removed -- this exercises `Hub._ingest_result`,
     the exact code path a real device `result` message flows through."""
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
     fake_ws.canned_result = {
         "ok": True,
         "result": [
@@ -273,7 +273,7 @@ def test_hub_command_targeting_denied_tab_is_rejected(tmp_path: Any) -> None:
     tab_id despite never seeing it in a `tabs` listing -- is rejected before
     ever reaching the device."""
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
     fake_ws.canned_result = {
         "ok": True,
         "result": [{"tab_id": 11, "window_id": 1, "url": "https://mychart.com/portal", "title": "MyChart"}],
@@ -472,7 +472,7 @@ def test_default_confirmation_ttl_is_positive_and_bounded() -> None:
 
 def test_hub_gated_action_does_not_reach_device_until_confirmed(tmp_path: Any) -> None:
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
 
     async def run() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         gated = await hub.send_command(
@@ -510,7 +510,7 @@ def test_hub_confirm_does_not_bypass_denylist(tmp_path: Any) -> None:
     target became denylisted between gating and confirming (edge case, but the
     principle matters): the confirm must still be refused."""
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
 
     async def run() -> tuple[dict[str, Any], dict[str, Any]]:
         gated = await hub.send_command(
@@ -575,7 +575,7 @@ def test_choke_point_unaffected_commands_still_flow_normally(tmp_path: Any) -> N
     """Regression guard: ordinary allowed commands must be completely
     unaffected by the policy layer's presence."""
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
     fake_ws.canned_result = {"ok": True, "result": {"title": "Example"}}
 
     async def run() -> dict[str, Any]:
@@ -592,7 +592,7 @@ def test_choke_point_unaffected_commands_still_flow_normally(tmp_path: Any) -> N
 
 def test_kill_switch_halts_new_dispatch(tmp_path: Any) -> None:
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
     hub.engage_kill_switch()
 
     async def run() -> dict[str, Any]:
@@ -628,7 +628,7 @@ def test_kill_switch_rejects_already_queued_commands(tmp_path: Any) -> None:
 
 def test_kill_switch_disengage_restores_dispatch(tmp_path: Any) -> None:
     hub = _hub(tmp_path)
-    record, fake_ws = _live_device(hub)
+    _record, fake_ws = _live_device(hub)
     hub.engage_kill_switch()
     hub.disengage_kill_switch()
 

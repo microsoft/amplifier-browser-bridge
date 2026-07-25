@@ -29,6 +29,20 @@ already passed through `send_command` once, at enqueue time. A command cannot
 reach a device without a policy decision having been made first; this is what
 makes the capability-binding guarantee in design doc §6.2 structural rather than
 a convention future contributors could accidentally route around.
+
+## `_dispatch_live` is the single choke point for CDP escalation (Phase 4)
+
+Symmetrically: `_dispatch_live` is the only place a command's wire envelope is
+actually constructed and sent to a *live* device (`_send_and_await` does the
+raw send-and-await; `_dispatch_live` wraps it). Every command reaches a device
+through here -- both the immediate-dispatch path (`send_command`, when the
+device is already `Tier.LIVE`) and the drained-later path (`_drain_queue`,
+once a queued device reconnects) call `_dispatch_live`, never `_send_and_await`
+directly. This is where `cdp.requires_cdp` is checked and, if the caller's
+`args` genuinely need it (trusted input, hidden-tab capture -- see cdp.py),
+CDP is auto-attached (never speculatively) before the real command is sent
+with a hub-asserted `_cdp` flag the device honors. See `_ensure_cdp_attached`
+and docs/PROTOCOL.md's CDP section.
 """
 
 from __future__ import annotations
@@ -36,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from typing import Any
 
 from aiohttp import WSMsgType, web
@@ -43,22 +58,32 @@ from aiohttp import WSMsgType, web
 from .addressing import Target, TargetError
 from .audit import AuditLog
 from .auth import TokenStore
+from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .policy import PolicyEngine, PolicyError
 from .protocol import COMMANDS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
-from .registry import DeviceRecord, DeviceRegistry
+from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .tiers import Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
 
 DEFAULT_PORT = 8900
 DEFAULT_COMMAND_TIMEOUT = 30.0
+DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS = 30.0
 
 # Commands whose successful device result carries a `url` field directly usable
 # to update the policy engine's tab-host cache (see policy.py's "Observation
 # intake" section). `tabs` is handled separately since its result is a *list* of
 # per-tab entries rather than one url -- see `_ingest_result` below.
 _URL_BEARING_RESULT_COMMANDS = frozenset({"navigate", "snapshot", "read"})
+
+
+class _DeviceAuthError(Exception):
+    """Raised internally by `_handle_device_message` on a bad `hello` token.
+    Signals the caller (`_handle_device_ws`) to close the connection -- kept
+    as an exception rather than a sentinel return value so the "keep looping"
+    vs. "stop, close the socket" distinction can't be silently lost at a call
+    site."""
 
 
 class Hub:
@@ -72,12 +97,20 @@ class Hub:
         audit_log: AuditLog,
         command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
         policy: PolicyEngine | None = None,
+        cdp_idle_seconds: float = DEFAULT_SOFT_DETACH_IDLE_SECONDS,
+        soft_detach_sweep_interval: float = DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS,
     ) -> None:
         self.registry = DeviceRegistry()
         self.token_store = token_store
         self.audit = audit_log
         self.command_timeout = command_timeout
         self.policy = policy if policy is not None else PolicyEngine(audit_log)
+        # Per-(device, tab) CDP attach bookkeeping (Phase 4, design doc §7) --
+        # see cdp.py and this module's "single choke point for CDP escalation"
+        # docstring section above.
+        self.cdp = CdpRegistry(idle_seconds=cdp_idle_seconds)
+        self.soft_detach_sweep_interval = soft_detach_sweep_interval
+        self._soft_detach_task: asyncio.Task[None] | None = None
         # command_id -> the QueuedCommand that was sent, kept only long enough to
         # know (a) whether a returning device result needs tabs-filtering / cache
         # updates, and (b) nothing more -- popped as soon as the result arrives.
@@ -96,7 +129,22 @@ class Hub:
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_get("/device", self._handle_device_ws)
         app.router.add_get("/agent", self._handle_agent_ws)
+        # Background soft-detach sweep (design doc §6.3/§7) -- started/stopped
+        # via aiohttp's own app lifecycle so `cli.py`'s `hub` command needs no
+        # changes to benefit from it. Tests that want deterministic control
+        # call `soft_detach_idle_tabs()` directly instead of relying on this
+        # loop's real sleep interval -- see tests/test_cdp.py.
+        app.on_startup.append(self._start_soft_detach_task)
+        app.on_cleanup.append(self._stop_soft_detach_task)
         return app
+
+    async def _start_soft_detach_task(self, app: web.Application) -> None:
+        self._soft_detach_task = asyncio.create_task(self.soft_detach_loop())
+
+    async def _stop_soft_detach_task(self, app: web.Application) -> None:
+        if self._soft_detach_task is not None:
+            self._soft_detach_task.cancel()
+            self._soft_detach_task = None
 
     # ------------------------------------------------------------------
     # HTTP
@@ -122,64 +170,11 @@ class Hub:
             except json.JSONDecodeError:
                 logger.warning("device sent non-JSON frame, ignoring")
                 continue
-
-            mtype = env.get("type")
-
-            if mtype == "hello":
-                candidate_id = env.get("device_id")
-                if not candidate_id or not isinstance(candidate_id, str):
-                    await ws.send_json(
-                        {"type": "error", "id": env.get("id"), "error": "hello missing device_id"}
-                    )
-                    continue
-                if not self.token_store.validate(env.get("token"), candidate_id):
-                    await ws.send_json({"type": "error", "id": env.get("id"), "error": "unauthorized"})
-                    await ws.close()
-                    return ws
-                device_id = candidate_id
-                record = self.registry.get_or_create(device_id)
-                record.bind(ws, env)
-                self.audit.record(
-                    "device_connected",
-                    device_id=device_id,
-                    label=record.label,
-                    platform=record.platform,
-                    capabilities=record.capabilities,
-                )
-                logger.info("device connected: %s (%s, %s)", device_id, record.label, record.platform)
-                # Now that the device is live, drain anything that queued up while it was away.
-                asyncio.create_task(self._drain_queue(record))
-
-            elif mtype == "heartbeat":
-                if device_id:
-                    self.registry.get_or_create(device_id).touch()
-
-            elif mtype == "result":
-                if device_id:
-                    record = self.registry.get_or_create(device_id)
-                    record.touch()
-                    cmd_id = env.get("id")
-                    env = self._ingest_result(device_id, cmd_id, env)
-                    fut = record.pending.pop(cmd_id, None)
-                    record.results[cmd_id] = env
-                    self.audit.record(
-                        "result_received", device_id=device_id, command_id=cmd_id, ok=env.get("ok")
-                    )
-                    if fut is not None and not fut.done():
-                        fut.set_result(env)
-
-            elif mtype == "event":
-                if device_id:
-                    self.registry.get_or_create(device_id).touch()
-                    self.audit.record(
-                        "device_event",
-                        device_id=device_id,
-                        device_event_name=env.get("event"),
-                        data=env.get("data"),
-                    )
-
-            else:
-                logger.warning("device sent unknown message type: %s", mtype)
+            try:
+                device_id = await self._handle_device_message(ws, device_id, env)
+            except _DeviceAuthError:
+                await ws.close()
+                return ws
 
         if device_id:
             record = self.registry.get(device_id)
@@ -190,31 +185,203 @@ class Hub:
 
         return ws
 
+    async def _handle_device_message(
+        self, ws: DeviceConnection, device_id: str | None, env: dict[str, Any]
+    ) -> str | None:
+        """Process one `/device`-route message and return the (possibly
+        newly-established) device_id for this connection. Extracted from
+        `_handle_device_ws` so this logic -- including `hello`,
+        `capabilities_update`, and CDP-related `event`s -- can be exercised
+        directly in tests without a real WebSocket (see tests/test_hub.py,
+        tests/test_capabilities.py). Only needs `send_json` (the same
+        `DeviceConnection` protocol `registry.py`'s `DeviceRecord.bind` uses)
+        -- never the concrete `web.WebSocketResponse` -- so test doubles
+        don't need to satisfy aiohttp's full type. Raises `_DeviceAuthError`
+        on a bad `hello` token; the caller is responsible for closing the
+        connection in that case."""
+        mtype = env.get("type")
+
+        if mtype == "hello":
+            candidate_id = env.get("device_id")
+            if not candidate_id or not isinstance(candidate_id, str):
+                await ws.send_json({"type": "error", "id": env.get("id"), "error": "hello missing device_id"})
+                return device_id
+            if not self.token_store.validate(env.get("token"), candidate_id):
+                await ws.send_json({"type": "error", "id": env.get("id"), "error": "unauthorized"})
+                raise _DeviceAuthError()
+            device_id = candidate_id
+            record = self.registry.get_or_create(device_id)
+            record.bind(ws, env)
+            self.audit.record(
+                "device_connected",
+                device_id=device_id,
+                label=record.label,
+                platform=record.platform,
+                capabilities=record.capabilities,
+            )
+            logger.info("device connected: %s (%s, %s)", device_id, record.label, record.platform)
+            # Now that the device is live, drain anything that queued up while it was away.
+            asyncio.create_task(self._drain_queue(record))
+            return device_id
+
+        if mtype == "heartbeat":
+            if device_id:
+                self.registry.get_or_create(device_id).touch()
+            return device_id
+
+        if mtype == "result":
+            if device_id:
+                record = self.registry.get_or_create(device_id)
+                record.touch()
+                raw_cmd_id = env.get("id")
+                if not isinstance(raw_cmd_id, str):
+                    logger.warning("device sent a 'result' with no correlation id, ignoring")
+                    return device_id
+                cmd_id: str = raw_cmd_id
+                env = self._ingest_result(device_id, cmd_id, env)
+                fut = record.pending.pop(cmd_id, None)
+                record.results[cmd_id] = env
+                self.audit.record("result_received", device_id=device_id, command_id=cmd_id, ok=env.get("ok"))
+                if fut is not None and not fut.done():
+                    fut.set_result(env)
+            return device_id
+
+        if mtype == "event":
+            if device_id:
+                self.registry.get_or_create(device_id).touch()
+                event_name = env.get("event")
+                raw_data = env.get("data")
+                data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+                # Unsolicited CDP detach (Cancel on the banner, DevTools
+                # opened -- which force-detaches every session on the target
+                # -- or the target crashed/was discarded). The hub did not
+                # ask for this detach, so it must learn about it here rather
+                # than from a `detach` command's own result -- see cdp.py's
+                # module docstring and docs/POLICY.md's CDP section.
+                if event_name == "cdp_detached":
+                    tab_id = data.get("tab_id")
+                    reason = data.get("reason")
+                    if isinstance(tab_id, int):
+                        self.cdp.mark_detached(
+                            device_id,
+                            tab_id,
+                            reason=reason if isinstance(reason, str) else "unsolicited_detach",
+                        )
+                self.audit.record(
+                    "device_event", device_id=device_id, device_event_name=event_name, data=data
+                )
+            return device_id
+
+        if mtype == "capabilities_update":
+            # Phase 1 finding: capture_visible_tab/scripting probes can
+            # under-report `false` at `hello` time if no real tab existed yet
+            # (design doc §2). The extension re-probes once a tab appears and
+            # corrects the record here -- see background.js's
+            # `maybeReprobe()`. Merge rather than replace: an update may
+            # report a subset of keys.
+            if device_id:
+                record = self.registry.get_or_create(device_id)
+                caps = env.get("capabilities")
+                if isinstance(caps, dict):
+                    merged = dict(record.capabilities)
+                    for key, value in caps.items():
+                        if isinstance(value, bool):
+                            merged[key] = value
+                    record.capabilities = merged
+                    record.touch()
+                    self.audit.record(
+                        "capabilities_updated", device_id=device_id, capabilities=record.capabilities
+                    )
+            return device_id
+
+        logger.warning("device sent unknown message type: %s", mtype)
+        return device_id
+
     def _ingest_result(self, device_id: str, cmd_id: str | None, env: dict[str, Any]) -> dict[str, Any]:
-        """Feed a device's `result` envelope into the policy engine before it is
-        stored or handed back to any agent -- the response-path half of the
-        invisibility guarantee (design doc §6.2): a `tabs` result is filtered
-        for denylisted hosts here, before it ever reaches `record.results` or a
-        pending future, so both the immediate-dispatch and later-`poll` paths
-        see the same sanitized data. Also feeds the policy engine's tab-host
-        cache from `navigate`/`snapshot`/`read` results so the request-path
-        denylist check (`PolicyEngine.evaluate`) has ground truth to check
-        future commands against, even for tabs the agent never listed via `tabs`.
+        """Feed a device's `result` envelope into the policy engine and the
+        CDP registry before it is stored or handed back to any agent -- the
+        response-path half of the invisibility guarantee (design doc §6.2): a
+        `tabs` result is filtered for denylisted hosts here, before it ever
+        reaches `record.results` or a pending future, so both the
+        immediate-dispatch and later-`poll` paths see the same sanitized
+        data. Also feeds:
+
+        - the policy engine's tab-host cache (`navigate`/`snapshot`/`read`),
+          and its ref-label cache (`snapshot`/`wait_for` -- Phase 4, see
+          policy.py's "Label hints are now wired") so gate detection has
+          ground truth even for tabs/refs the agent never listed explicitly;
+        - the CDP registry's attach state (`attach`/`detach` results -- Phase
+          4, see cdp.py), handled first and unconditionally (even on
+          failure), since an attach/detach's own success or failure IS the
+          state transition, not a side observation of one.
         """
         cmd = self._inflight.pop(cmd_id, None) if cmd_id else None
-        if cmd is None or not env.get("ok"):
+        if cmd is None:
+            return env
+
+        if cmd.command == "attach":
+            tab_id = cmd.target.tab_id
+            if tab_id is not None:
+                if env.get("ok"):
+                    self.cdp.mark_attached(device_id, tab_id)
+                    self.audit.record("cdp_attached", device_id=device_id, tab_id=tab_id)
+                else:
+                    self.audit.record(
+                        "cdp_attach_failed", device_id=device_id, tab_id=tab_id, error=env.get("error")
+                    )
+            return env
+
+        if cmd.command == "detach":
+            tab_id = cmd.target.tab_id
+            if tab_id is not None:
+                if env.get("ok"):
+                    reason = (
+                        cmd.args.get("reason") if isinstance(cmd.args.get("reason"), str) else "requested"
+                    )
+                else:
+                    reason = f"detach command failed: {env.get('error')}"
+                self.cdp.mark_detached(device_id, tab_id, reason=reason)
+                self.audit.record("cdp_detached", device_id=device_id, tab_id=tab_id, reason=reason)
+            return env
+
+        if not env.get("ok"):
             return env
 
         result = env.get("result")
         if cmd.command == "tabs" and isinstance(result, list):
             filtered = self.policy.filter_tabs_result(device_id, result)
-            return {**env, "result": filtered}
+            enriched = [
+                {**tab, "cdp_attached": self.cdp.is_attached(device_id, tab["tab_id"])}
+                if isinstance(tab, dict) and isinstance(tab.get("tab_id"), int)
+                else tab
+                for tab in filtered
+            ]
+            return {**env, "result": enriched}
 
         if cmd.command in _URL_BEARING_RESULT_COMMANDS and isinstance(result, dict):
             url = result.get("url")
             tab_id = cmd.target.tab_id
             if isinstance(url, str) and tab_id is not None:
                 self.policy.note_tab_url(device_id, tab_id, url)
+            if cmd.command == "snapshot":
+                nodes = result.get("nodes")
+                if isinstance(url, str) and tab_id is not None and isinstance(nodes, list):
+                    self.policy.note_snapshot(device_id, tab_id, url, nodes)
+
+        if cmd.command == "wait_for" and isinstance(result, dict):
+            tab_id = cmd.target.tab_id
+            ref = result.get("ref")
+            url = result.get("url")
+            if tab_id is not None and isinstance(ref, str) and isinstance(url, str):
+                self.policy.note_ref(
+                    device_id,
+                    tab_id,
+                    url,
+                    ref,
+                    label=result.get("name"),
+                    tag=result.get("tag"),
+                    input_type=result.get("input_type"),
+                )
 
         return env
 
@@ -265,7 +432,7 @@ class Hub:
                             "v": PROTOCOL_VERSION,
                             "type": "devices",
                             "id": rid,
-                            "devices": self.registry.snapshot(),
+                            "devices": self._devices_snapshot(),
                         }
                     )
                 elif rtype == "command":
@@ -359,6 +526,19 @@ class Hub:
         if command not in COMMANDS:
             return {"ok": False, "error": f"unknown command: {command!r}. Valid: {sorted(COMMANDS)}"}
 
+        # `_cdp` is a hub-internal wire signal (see cdp.py, `_dispatch_live`)
+        # that authorizes the DEVICE to use CDP dispatch for this specific
+        # command. It is set ONLY by the hub's own auto-escalation logic --
+        # never accepted from a caller. Honoring a caller-supplied `_cdp`
+        # would let an agent (or a prompt-injected one) request trusted-input
+        # / hidden-capture dispatch without ever passing through the
+        # capability check or attach bookkeeping in `_ensure_cdp_attached` --
+        # the same capability-binding discipline policy.py applies to
+        # denylisted targets applies here to CDP usage. `trusted` and
+        # `capture_hidden` remain legitimate caller-facing intent args.
+        if "_cdp" in args:
+            args = {k: v for k, v in args.items() if k != "_cdp"}
+
         decision = self.policy.evaluate(target, command, args, skip_gate=skip_gate)
         if decision.status == "deny":
             return {"ok": False, "error": decision.reason}
@@ -397,6 +577,63 @@ class Hub:
         }
 
     async def _dispatch_live(self, record: DeviceRecord, cmd: QueuedCommand) -> dict[str, Any]:
+        """The single choke point for CDP escalation (see this module's
+        docstring). Called for both the immediate-dispatch path
+        (`send_command`, device already live) and the drained-later path
+        (`_drain_queue`, once a queued device reconnects) -- CDP escalation
+        must apply identically to both, since a caller has no way to know
+        (or control) which path their command will take."""
+        assert record.ws is not None  # only called when record.tier is LIVE
+        if requires_cdp(cmd.command, cmd.args):
+            cdp_error = await self._ensure_cdp_attached(record, cmd.target.tab_id)
+            if cdp_error is not None:
+                # Never silently fall back to the injection-only path the
+                # caller didn't ask for (design doc §8). Persist the result
+                # exactly as if a device `result` had arrived, so a command
+                # that was queued and only reaches this branch on drain still
+                # behaves correctly under `poll()` -- see docs/PROTOCOL.md.
+                self._inflight.pop(cmd.id, None)
+                record.results[cmd.id] = {"v": PROTOCOL_VERSION, "id": cmd.id, "type": "result", **cdp_error}
+                return cdp_error
+            cmd = replace(cmd, args={**cmd.args, "_cdp": True})
+        return await self._send_and_await(record, cmd)
+
+    async def _ensure_cdp_attached(self, record: DeviceRecord, tab_id: int | None) -> dict[str, Any] | None:
+        """Pre-flight for a CDP-requiring command. Returns `None` if CDP is
+        (now) attached and the real command may proceed; otherwise an
+        `{"ok": False, "error": ...}` dict to return in its place. Attaches
+        on demand (never speculatively) by sending a real `attach` command
+        and waiting for the device's result -- exactly the same wire
+        round-trip an agent's own explicit `attach` command would produce."""
+        if tab_id is None:
+            return {"ok": False, "error": "CDP-requiring command needs an explicit tab_id in target"}
+        if not record.capabilities.get("debugger"):
+            return {
+                "ok": False,
+                "error": (
+                    f"capability unavailable on this device ({record.label}): chrome.debugger/CDP is "
+                    "not present here (e.g. Edge Android) -- cannot satisfy trusted input or "
+                    "hidden-tab capture; refusing rather than silently falling back to the "
+                    "injection-only path"
+                ),
+            }
+        if self.cdp.is_attached(record.device_id, tab_id):
+            self.cdp.touch(record.device_id, tab_id)
+            return None
+
+        attach_cmd = QueuedCommand(
+            id=new_id(), target=Target(device_id=record.device_id, tab_id=tab_id), command="attach", args={}
+        )
+        result = await self._send_and_await(record, attach_cmd)
+        if not result.get("ok"):
+            return {"ok": False, "error": f"CDP auto-attach failed: {result.get('error', 'unknown error')}"}
+        self.cdp.touch(record.device_id, tab_id)
+        return None
+
+    async def _send_and_await(self, record: DeviceRecord, cmd: QueuedCommand) -> dict[str, Any]:
+        """Raw wire send + await the device's result future. No policy, no
+        CDP escalation -- `_dispatch_live` is the only caller for real
+        commands; tests may call this directly to bypass escalation."""
         assert record.ws is not None  # only called when record.tier is LIVE
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
@@ -492,3 +729,60 @@ class Hub:
     def disengage_kill_switch(self) -> None:
         self.policy.disengage_kill_switch()
         self.audit.record("kill_switch_disengaged")
+
+    # ------------------------------------------------------------------
+    # CDP soft-detach -- design doc §6.3/§7: "so the banner clears while the
+    # human is just browsing." Idle tracking lives entirely on the hub side
+    # (`CdpRegistry`), so this is testable without real sleeps -- see
+    # tests/test_cdp.py, which shortens `cdp_idle_seconds` and calls
+    # `soft_detach_idle_tabs()` directly rather than running `soft_detach_loop`.
+    # ------------------------------------------------------------------
+
+    async def soft_detach_idle_tabs(self, *, now: Any = None) -> list[tuple[str, int]]:
+        """One sweep: detach every CDP-attached tab idle past the configured
+        threshold. Returns the (device_id, tab_id) pairs actually detached.
+        Safe to call repeatedly and safe to call directly in tests (with an
+        injected `now`) for a deterministic proof without waiting out a real
+        idle window."""
+        detached: list[tuple[str, int]] = []
+        for device_id, tab_id in self.cdp.idle_tabs(now=now):
+            record = self.registry.get(device_id)
+            if record is None or not record.connected:
+                continue
+            detach_cmd = QueuedCommand(
+                id=new_id(),
+                target=Target(device_id=device_id, tab_id=tab_id),
+                command="detach",
+                args={"reason": "idle"},
+            )
+            result = await self._send_and_await(record, detach_cmd)
+            if result.get("ok"):
+                detached.append((device_id, tab_id))
+        return detached
+
+    async def soft_detach_loop(self, *, interval_seconds: float | None = None) -> None:
+        """Background task started by `build_app`'s `on_startup` hook --
+        periodically sweeps for idle CDP sessions. Not used by tests, which
+        call `soft_detach_idle_tabs()` directly instead of running a real
+        timer loop."""
+        interval = interval_seconds if interval_seconds is not None else self.soft_detach_sweep_interval
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.soft_detach_idle_tabs()
+            except Exception:
+                logger.exception("soft-detach sweep failed")
+
+    # ------------------------------------------------------------------
+    # Devices snapshot -- enriches DeviceRegistry.snapshot() with per-tab CDP
+    # attach state (design doc §7: "report CDP attach state per tab so an
+    # agent can reason about it"). Separate from DeviceRecord.to_summary()
+    # (registry.py) because CDP state is owned by Hub (via CdpRegistry), not
+    # by the registry -- see cdp.py's module docstring on why.
+    # ------------------------------------------------------------------
+
+    def _devices_snapshot(self) -> list[dict[str, Any]]:
+        summaries = self.registry.snapshot()
+        for summary in summaries:
+            summary["cdp"] = self.cdp.snapshot(summary["device_id"])
+        return summaries

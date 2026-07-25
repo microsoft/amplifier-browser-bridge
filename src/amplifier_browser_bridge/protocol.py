@@ -51,22 +51,44 @@ COMMANDS: frozenset[str] = frozenset(
         "screenshot",
         "wait_for",
         "wait_text",
+        # CDP escalation (Phase 4, design doc §7) -- explicit attach/detach.
+        # BROWSER_LEVEL_COMMANDS (handled by background.js against
+        # chrome.debugger directly; see cdp.py for the hub-side state
+        # machine and docs/PROTOCOL.md for the wire shape).
+        "attach",
+        "detach",
     }
 )
 
 # Commands that operate purely inside the page (dispatched into injected.js).
 # The rest are browser-chrome-level commands the extension's background script
-# executes directly against chrome.tabs / chrome.windows.
+# executes directly against chrome.tabs / chrome.windows / chrome.debugger.
 PAGE_WORLD_COMMANDS: frozenset[str] = frozenset(
     {"snapshot", "read", "click", "type", "key", "scroll", "back", "forward", "wait_for", "wait_text"}
 )
 BROWSER_LEVEL_COMMANDS: frozenset[str] = COMMANDS - PAGE_WORLD_COMMANDS
 
+# Optional args that opt a PAGE_WORLD_COMMAND into CDP-backed dispatch instead
+# of injected.js's synthetic events -- see cdp.py's `requires_cdp`. Declarative
+# intent from the caller ("I need this to be isTrusted" / "I need this tab even
+# though it's not active"), never a raw CDP on/off switch -- the hub decides
+# HOW to satisfy the request (attach bookkeeping, capability check) and is the
+# only writer of the wire-level `_cdp` flag the device actually acts on.
+CDP_INTENT_ARGS: frozenset[str] = frozenset({"trusted", "capture_hidden"})
+
 # ---------------------------------------------------------------------------
 # Message type vocabularies
 # ---------------------------------------------------------------------------
 
-DEVICE_TO_HUB_TYPES: frozenset[str] = frozenset({"hello", "heartbeat", "result", "event"})
+# `capabilities_update` (Phase 4): an unsolicited, post-`hello` correction to a
+# device's capability set -- see cdp.py/background.js's re-probe logic and
+# docs/PROTOCOL.md. Needed because some capabilities (capture_visible_tab,
+# scripting) are only truthfully probeable once a real tab exists, which is not
+# guaranteed at `hello` time (Phase 1 finding: a fresh browser launch can have
+# zero tabs).
+DEVICE_TO_HUB_TYPES: frozenset[str] = frozenset(
+    {"hello", "heartbeat", "result", "event", "capabilities_update"}
+)
 HUB_TO_DEVICE_TYPES: frozenset[str] = frozenset({"command", "ping", "error"})
 
 AGENT_TO_HUB_TYPES: frozenset[str] = frozenset({"list_devices", "command", "poll"})

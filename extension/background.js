@@ -77,11 +77,19 @@ async function probeCapabilities() {
     caps.tab_groups = false;
   }
 
-  // Intentionally not requested in this phase's manifest -- injection-only is the
-  // default posture, CDP escalation is Phase 6 (design doc §7). Reporting false
-  // here is honest: we did not ask for the permission, so the capability is absent
-  // by our own choice, not by platform limitation.
-  caps.debugger = false;
+  // Real behavioral probe (Phase 4, design doc §7): chrome.debugger is
+  // desktop-only on Edge -- genuinely undefined/throwing on Android even when
+  // requested, so a plain try/catch is both correct AND sufficient (no
+  // separate `typeof` pre-check needed -- accessing .getTargets on an
+  // undefined chrome.debugger throws the same way a real API failure would).
+  // getTargets() is a read-only, side-effect-free call -- safe to run on
+  // every probe.
+  try {
+    await chrome.debugger.getTargets();
+    caps.debugger = true;
+  } catch {
+    caps.debugger = false;
+  }
 
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -199,6 +207,34 @@ function sendHello() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Capability re-probe (Phase 1 fix, Phase 4 wiring): capture_visible_tab and
+// scripting can under-report `false` at `hello` time if no real tab existed
+// yet (design doc §2 -- a fresh browser launch can have zero tabs). Re-probe
+// whenever a real tab becomes available and, if the result differs from what
+// the hub was told, push a `capabilities_update` -- an under-reporting
+// capability set is worse than none: agents route around capabilities that
+// actually exist (see docs/PROTOCOL.md).
+// ---------------------------------------------------------------------------
+
+async function maybeReprobe() {
+  if (!capabilities) return;
+  const stale = capabilities.capture_visible_tab === false || capabilities.scripting === false;
+  if (!stale) return;
+  const fresh = await probeCapabilities();
+  const changed = JSON.stringify(fresh) !== JSON.stringify(capabilities);
+  capabilities = fresh;
+  if (changed) {
+    send({
+      v: PROTOCOL_VERSION,
+      id: crypto.randomUUID(),
+      type: "capabilities_update",
+      device_id: deviceId,
+      capabilities,
+    });
+  }
+}
+
 function platformLabel() {
   const ua = navigator.userAgent || "";
   if (/Android/i.test(ua)) return "edge-android";
@@ -273,7 +309,23 @@ async function executeCommand(command, target, args) {
     if (command === "tab_close") return { ok: true, result: await tabClose(target) };
     if (command === "tab_activate") return { ok: true, result: await tabActivate(target) };
     if (command === "navigate") return { ok: true, result: await navigate(target, args) };
-    if (command === "screenshot") return { ok: true, result: await screenshot(target) };
+    if (command === "screenshot") return { ok: true, result: await screenshot(target, args) };
+    // CDP escalation (Phase 4, design doc §7). `attach`/`detach` are explicit,
+    // hub-issued commands (either agent-requested or hub auto-escalation --
+    // see hub.py's _ensure_cdp_attached / soft_detach_idle_tabs). `_cdp` on
+    // click/type/key is set ONLY by the hub, never by a caller directly (see
+    // hub.py's send_command, which strips any caller-supplied `_cdp`).
+    if (command === "attach") return { ok: true, result: await cdpAttach(requireTabId(target)) };
+    if (command === "detach") return { ok: true, result: await cdpDetach(requireTabId(target)) };
+    if (command === "click" && args && args._cdp) {
+      return { ok: true, result: await cdpClick(requireTabId(target), args.ref) };
+    }
+    if (command === "type" && args && args._cdp) {
+      return { ok: true, result: await cdpType(requireTabId(target), args.ref, args.text) };
+    }
+    if (command === "key" && args && args._cdp) {
+      return { ok: true, result: await cdpKey(requireTabId(target), args.ref, args.key) };
+    }
     if (PAGE_WORLD_COMMANDS.has(command)) return { ok: true, result: await runInPage(target, command, args) };
     return { ok: false, error: `unsupported command: ${command}` };
   } catch (err) {
@@ -341,21 +393,169 @@ async function navigate(target, args) {
   return { tab_id: tabId, url: args.url };
 }
 
-async function screenshot(target) {
+async function screenshot(target, args) {
   const tabId = requireTabId(target);
+  if (args && args._cdp) {
+    // Hub-authorized escalation (args.capture_hidden -> hub set _cdp=true
+    // after attaching -- see hub.py's _ensure_cdp_attached). Page.
+    // captureScreenshot works on minimized/occluded windows (design doc
+    // §2/§7: measured 41-81ms, does not hang).
+    return await cdpScreenshot(tabId);
+  }
   const tab = await chrome.tabs.get(tabId);
   if (!tab.active) {
-    // Co-working etiquette: never activate a tab merely to screenshot it. Without
-    // CDP (a later phase -- design doc §7), chrome.tabs.captureVisibleTab can only
-    // ever capture the active tab of a focused window. Fail loud rather than
-    // silently stealing focus to satisfy the request.
+    // Co-working etiquette: never activate a tab merely to screenshot it.
+    // Without capture_hidden (which auto-escalates to CDP), chrome.tabs.
+    // captureVisibleTab can only ever capture the active tab of a focused
+    // window. Fail loud rather than silently stealing focus to satisfy the
+    // request.
     throw new Error(
-      "screenshot requires the target tab to already be active/visible in this " +
-        "injection-only phase; CDP-based any-tab capture is a later phase"
+      "screenshot requires the target tab to already be active/visible unless " +
+        "args.capture_hidden=true is set (auto-escalates to CDP any-tab capture, " +
+        "requires the debugger capability on this device)"
     );
   }
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 80 });
   return { tab_id: tabId, format: "jpeg", data_url_length: dataUrl.length };
+}
+
+// ---------------------------------------------------------------------------
+// CDP escalation (chrome.debugger) -- opt-in per tab, never speculative.
+// ---------------------------------------------------------------------------
+// design doc §7: injection-only by default; escalate to CDP per-tab only when
+// trusted input or any-tab/hidden capture is genuinely requested by the hub
+// (which sets args._cdp only after its own capability check + attach
+// bookkeeping -- see hub.py's _ensure_cdp_attached). Soft-detach after idle
+// (hub-driven `detach` command) so the banner clears while the human is just
+// browsing (design doc §6.3).
+//
+// chrome.debugger is Edge-desktop-only -- measured genuinely absent on
+// Android (design doc §2/§7). `hasDebuggerApi()` is a real presence check
+// used only to produce a clear error message before attempting the call;
+// every actual capability ANSWER (the `debugger` key in probeCapabilities)
+// comes from a real invocation, never from this check alone.
+
+const attachedTabs = new Set(); // tab_ids with a live chrome.debugger session held by THIS extension
+
+function hasDebuggerApi() {
+  return typeof chrome.debugger !== "undefined" && typeof chrome.debugger.attach === "function";
+}
+
+async function cdpAttach(tabId) {
+  if (!hasDebuggerApi()) {
+    throw new Error("CDP unavailable on this device: chrome.debugger is not present (e.g. Edge Android)");
+  }
+  if (attachedTabs.has(tabId)) return { tab_id: tabId, attached: true, already: true };
+  await chrome.debugger.attach({ tabId }, "1.3");
+  attachedTabs.add(tabId);
+  return { tab_id: tabId, attached: true };
+}
+
+async function cdpDetach(tabId) {
+  if (!attachedTabs.has(tabId)) return { tab_id: tabId, attached: false, already: true };
+  try {
+    await chrome.debugger.detach({ tabId });
+  } finally {
+    attachedTabs.delete(tabId);
+  }
+  return { tab_id: tabId, attached: false };
+}
+
+async function cdpClick(tabId, ref) {
+  // Resolve the ref's viewport rect FIRST, before attaching CDP. Attaching
+  // chrome.debugger to a tab can invalidate/recreate the isolated world's
+  // execution context that chrome.scripting content scripts run in --
+  // resolving the ref after attach intermittently raced a fresh (empty)
+  // world and reported the ref as stale even immediately after a snapshot.
+  // Order matters: rect resolution needs no CDP at all, so do it first.
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["injected.js"] });
+  const [{ result: rect }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (r) => window.__abb.rectFor(r),
+    args: [ref],
+  });
+  if (!rect) throw new Error(`stale or unknown element ref: ${ref}`);
+  await cdpAttach(tabId);
+  const x = rect.x + rect.width / 2;
+  const y = rect.y + rect.height / 2;
+  // mouseMoved first -- some sites gate click handling on a preceding
+  // pointer/mouse move (hover states, dropdown reveals).
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+  });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+  });
+  return { ref, tag: rect.tag, trusted: true };
+}
+
+async function cdpType(tabId, ref, text) {
+  await cdpAttach(tabId);
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["injected.js"] });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (r) => window.__abb.focusFor(r),
+    args: [ref],
+  });
+  await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text });
+  return { ref, trusted: true };
+}
+
+async function cdpKey(tabId, ref, keyName) {
+  await cdpAttach(tabId);
+  if (ref) {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["injected.js"] });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (r) => window.__abb.focusFor(r),
+      args: [ref],
+    });
+  }
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyDown", key: keyName });
+  await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyUp", key: keyName });
+  return { key: keyName, trusted: true };
+}
+
+async function cdpScreenshot(tabId) {
+  await cdpAttach(tabId);
+  const { data } = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+    format: "jpeg",
+    quality: 80,
+    fromSurface: true,
+  });
+  return { tab_id: tabId, format: "jpeg", data_url_length: data.length, via: "cdp" };
+}
+
+// Fires on ANY debugger detach -- including ones we didn't ask for: the
+// human clicking Cancel on the yellow banner, opening DevTools (which
+// force-detaches every session on the target), or the target tab crashing/
+// closing. Push it to the hub as an unsolicited `event` so the hub's
+// CdpRegistry stays truthful even when the detach wasn't hub-initiated
+// (design doc §8: "surface real errors; recover by re-attaching where
+// sensible").
+if (typeof chrome.debugger !== "undefined" && chrome.debugger.onDetach) {
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    const tabId = source && source.tabId;
+    if (typeof tabId !== "number") return;
+    attachedTabs.delete(tabId);
+    send({
+      v: PROTOCOL_VERSION,
+      id: crypto.randomUUID(),
+      type: "event",
+      device_id: deviceId,
+      event: "cdp_detached",
+      data: { tab_id: tabId, reason: reason || "unknown" },
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +574,22 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) connect(); // the revival path for a killed connection
+  if (alarm.name === ALARM_NAME) {
+    connect(); // the revival path for a killed connection
+    maybeReprobe(); // periodic fallback re-probe (Phase 1 fix) -- reuses the
+    // existing keepalive alarm rather than adding a second one.
+  }
+});
+
+// Prompt re-probe as soon as a real tab becomes available, rather than
+// waiting up to 30s for the next alarm tick -- the common case the Phase 1
+// bug actually hits (a browser launched with zero tabs, then the user opens
+// one).
+chrome.tabs.onActivated.addListener(() => {
+  maybeReprobe();
+});
+chrome.tabs.onUpdated.addListener((_tabId, info) => {
+  if (info.status === "complete") maybeReprobe();
 });
 
 // A freshly-revived service worker shouldn't wait for the next half-minute alarm

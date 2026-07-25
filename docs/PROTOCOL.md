@@ -75,9 +75,36 @@ identity, just a display aid.
 
 Every capability is the result of a **behavioral probe**: a real invocation in a try/catch,
 never a `typeof` check. See `extension/background.js`'s `probeCapabilities()` for exactly what
-each one calls. `debugger` is unconditionally `false` in this phase -- the manifest does not
-request the `debugger` permission at all (injection-only is the default posture; CDP escalation
-is a later phase).
+each one calls. As of Phase 4, `debugger` is a real probe (`chrome.debugger.getTargets()` in a
+try/catch) -- `true` on desktop builds using `manifest.json` (which requests the `debugger`
+permission), `false` on Android builds using `manifest.android.json` (which deliberately omits
+it -- `chrome.debugger` is genuinely absent on Edge Android; see design doc §2/§7) or on any
+device where the API throws.
+
+**`capture_visible_tab`/`scripting` can under-report `false` here** if no real tab existed yet
+at connect time (a fresh browser launch can have zero tabs). See `capabilities_update` below for
+the correction path -- don't treat a `false` here as final if the device has only just connected.
+
+### `capabilities_update` (ext -> hub)
+
+```json
+{
+  "v": 1,
+  "id": "...",
+  "type": "capabilities_update",
+  "device_id": "5e9f...",
+  "capabilities": {"capture_visible_tab": true, "scripting": true}
+}
+```
+
+Sent whenever the extension re-probes and finds a capability differs from what it last told the
+hub -- see `background.js`'s `maybeReprobe()`, triggered on `chrome.tabs.onActivated`/`onUpdated`
+(a real tab becoming available) and as a periodic fallback on the existing keepalive alarm. The
+hub **merges** the reported keys into the device's existing capability set (`Hub.
+_handle_device_message`'s `capabilities_update` branch) -- a partial update does not clobber
+capabilities it didn't mention. This exists because a capability set that under-reports is worse
+than none: an agent will route around a capability (e.g. `capture_visible_tab`) that actually
+works, simply because it was told `false` once at `hello` time before any tab existed.
 
 ### `heartbeat` (ext -> hub)
 
@@ -316,27 +343,111 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 | `tab_open` | background.js (`chrome.tabs.create`) | target is device-only; `args.url`, `args.active` (default background) |
 | `tab_close` | background.js (`chrome.tabs.remove`) | |
 | `tab_activate` | background.js (`chrome.tabs.update`) | the one command that's explicitly *allowed* to steal focus, because it was asked to |
-| `screenshot` | background.js (`chrome.tabs.captureVisibleTab`) | **injection-only limitation**: only works if the target tab is already active (no CDP this phase) -- fails loud rather than activating the tab to comply |
+| `screenshot` | background.js (`chrome.tabs.captureVisibleTab`, or CDP `Page.captureScreenshot` -- see CDP section below) | Injection-only by default: only works if the target tab is already active. Pass `args.capture_hidden: true` to auto-escalate to CDP for any-tab/hidden capture. |
+| `attach` | background.js (`chrome.debugger.attach`) | Phase 4: explicit CDP attach for a tab. See CDP section below. |
+| `detach` | background.js (`chrome.debugger.detach`) | Phase 4: explicit CDP detach for a tab. |
 
 Commands are partitioned into `PAGE_WORLD_COMMANDS` (dispatched into `injected.js` running in
 the page's isolated world) and `BROWSER_LEVEL_COMMANDS` (handled directly by
-`background.js` against `chrome.tabs`/`chrome.windows`, which are not reachable from page
-context). See `protocol.py` for the exact partition.
+`background.js` against `chrome.tabs`/`chrome.windows`/`chrome.debugger`, which are not
+reachable from page context). See `protocol.py` for the exact partition.
 
 ### Optional policy-hint args
 
-Three `args` keys are recognized by the hub's policy engine (policy.py) but are **not**
-populated by anything in this codebase yet -- see docs/POLICY.md for why, and what that means
-for gate detection today:
+Three `args` keys are recognized by the hub's policy engine (policy.py) for gate detection:
 
 | Key | Applies to | Meaning |
 |---|---|---|
-| `label` | `click`, `type` | Visible text / `aria-label` of the target element -- exactly what `injected.js`'s `snapshot()` already computes as each node's `name` |
-| `page_url` | any command without its own `url` | The tab's current URL, for gate URL-pattern matching when the command itself doesn't carry one |
-| `input_type` | `click`, `type` | Element type hint, e.g. `"file"` for an `input[type=file]` |
+| `label` | `click`, `type` | Visible text / `aria-label` of the target element. |
+| `page_url` | any command without its own `url` | The tab's current URL, for gate URL-pattern matching when the command itself doesn't carry one. |
+| `input_type` | `click`, `type` | Element type hint, e.g. `"file"` for an `input[type=file]`. |
 
-A future caller (CLI, MCP tool, or the extension) can pass these through from a prior
-`snapshot`/`tabs` result to give the policy engine real signal for click/type-based gates.
+As of Phase 4, a caller does **not** need to populate these itself for `click`/`type` commands
+targeting a `ref`: the hub resolves `label`/`input_type` from its own remembered
+`snapshot`/`wait_for` observations for that ref (see policy.py's "Label hints are now wired"
+section and `Hub._ingest_result`). A caller-supplied value always takes precedence over the
+remembered one. `page_url` was already resolved this way (from the hub's `_tab_hosts` cache) in
+earlier phases. Explicitly supplying any of these is still supported and still wins.
+
+### CDP escalation args (Phase 4)
+
+Two more `args` keys express **caller intent** for CDP-backed dispatch -- see
+`cdp.requires_cdp` and design doc §7. Neither is a raw on/off switch for CDP itself; each
+describes *what the caller needs*, and the hub decides how to satisfy it (auto-attaching,
+never speculatively):
+
+| Key | Applies to | Meaning |
+|---|---|---|
+| `trusted` | `click`, `type`, `key` | `true` requests `isTrusted: true` input events (`Input.dispatchMouseEvent`/`dispatchKeyEvent` via CDP) -- `injected.js`'s synthetic `dispatchEvent` calls cannot produce these. |
+| `capture_hidden` | `screenshot` | `true` requests capture of a tab that may not be the active tab of a focused window (`Page.captureScreenshot` via CDP) -- `chrome.tabs.captureVisibleTab` cannot do this. |
+
+When either is set and the hub determines CDP is genuinely required (`cdp.requires_cdp`), it:
+
+1. Checks `record.capabilities["debugger"]` -- if falsy (e.g. Edge Android), returns
+   `{"ok": false, "error": "capability unavailable on this device: ..."}` immediately. **No
+   silent fallback** to the injection-only path.
+2. If not already attached for that tab (`Hub.cdp`, a `CdpRegistry` -- see cdp.py), sends an
+   internal `attach` command and waits for it to succeed before proceeding.
+3. Sets a hub-internal `_cdp: true` flag on the command's `args` before dispatching it to the
+   device -- this is the ONLY way `_cdp` reaches the wire; a caller-supplied `_cdp` in its own
+   request is stripped by `Hub.send_command` before any of this runs (the same
+   capability-binding discipline policy.py applies to denylisted targets applies here: the hub
+   decides CDP usage from its own state, never from anything the caller asserts).
+
+### `attach` / `detach` (agent -> hub -> ext)
+
+Explicit escalation, independent of any specific command -- useful for a caller that wants to
+hold a CDP session open across several commands, or to detach proactively:
+
+```json
+{"v": 1, "id": "...", "type": "command", "command": "attach", "target": {"device_id": "...", "tab_id": 7}, "args": {}, "token": "..."}
+```
+
+Result carries `{"tab_id": 7, "attached": true}` (or `{"...": "...", "already": true}` if a
+session was already held). `detach` is symmetric. Both flow through the normal command
+choke point (policy + queueing) like any other command -- there is nothing gate-worthy about
+attaching/detaching itself, though the *target* is still subject to the denylist like any
+other command.
+
+### Soft-detach on idle
+
+The hub sweeps for CDP sessions idle past a configurable threshold (default ~10 minutes,
+`Hub`'s `cdp_idle_seconds` constructor arg) and detaches them automatically -- design doc
+§6.3: "so the banner clears while the human is just browsing." This runs as a background task
+(`Hub.soft_detach_loop`, started via `build_app`'s `on_startup` hook) and requires no extension
+changes: it is simply a `detach` command the hub sends on its own initiative, indistinguishable
+on the wire from an agent-requested one (see `Hub.soft_detach_idle_tabs`, `args: {"reason":
+"idle"}`, audited as `cdp_detached` with that reason).
+
+The idle clock only resets on CDP-*requiring* activity (an attach, or a trusted
+click/type/key, or a hidden-capture screenshot) -- not on ordinary commands against the same
+tab. If the agent stops needing CDP specifically but keeps issuing plain clicks, the session
+still soft-detaches on schedule.
+
+### Unsolicited CDP detach (ext -> hub, `event`)
+
+`chrome.debugger` can be detached without the hub ever asking: the human clicking Cancel on
+the yellow banner, opening DevTools (which force-detaches every session on the target), or the
+target tab crashing/being discarded. The extension reports this via the existing `event`
+message type:
+
+```json
+{"v": 1, "id": "...", "type": "event", "device_id": "...", "event": "cdp_detached", "data": {"tab_id": 7, "reason": "canceled_by_user"}}
+```
+
+The hub updates `Hub.cdp`'s attach state immediately on receipt. The *next* CDP-requiring
+command against that tab transparently re-attaches (design doc §8: "surface real errors;
+recover by re-attaching where sensible") -- there is no special recovery step a caller needs
+to take.
+
+### Reporting CDP attach state to an agent
+
+Two places (design doc §7: "report CDP attach state per tab so an agent can reason about it"):
+
+- `devices` (`list_devices`): each device summary gains a `"cdp"` key -- `{tab_id: {"attached":
+  bool, "attached_at": iso8601|null, "last_activity": iso8601|null, "last_detach_reason":
+  str|null}}` for every tab this hub has ever attached to on that device.
+- `tabs`: each entry in the result gains `"cdp_attached": bool` for its current state.
 
 ## The three-tier connectivity model
 

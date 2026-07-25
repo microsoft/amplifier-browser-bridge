@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Amplifier Browser Bridge",
+  "version": "0.4.0",
+  "description": "Android-safe variant: identical to manifest.json but omits the debugger permission. chrome.debugger is genuinely absent on Edge Android (design doc §2/§7) -- declaring it here is unnecessary and, per the task's guidance to avoid installation risk on Android, deliberately left out. Every command still works via injection (chrome.scripting); only CDP-requiring commands (trusted input, capture_hidden screenshot) will fail loud with a clear 'capability unavailable on this device' error instead of silently degrading -- see hub.py's _ensure_cdp_attached and docs/POLICY.md.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "scripting",
+    "tabs",
+    "storage",
+    "alarms",
+    "downloads",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}

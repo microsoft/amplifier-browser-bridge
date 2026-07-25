@@ -147,24 +147,47 @@ common on its own -- cookie banners and notification-permission prompts say "All
 `file_upload` also accepts an explicit `args["input_type"] == "file"` hint as an unambiguous
 alternative to label matching.
 
-### The signal that isn't wired up yet -- read this
+### The label signal -- now wired (Phase 4)
 
-**`args["label"]` is populated by nothing in this codebase today.** `injected.js`'s `snapshot()`
-already computes exactly this string per element (the `name` field on each snapshot node) -- a
-future caller (a CLI flag, an MCP tool wrapper, or the extension itself) can pass it straight
-through as `args["label"]` on a `click`/`type` command. Until something does:
+**As of Phase 4, `args["label"]`/`args["input_type"]` are resolved by the hub itself** when a
+`click`/`type` command names a `target.ref` and doesn't supply them explicitly. The hub
+remembers, per `(device_id, tab_id)`, the `ref -> {label, tag, input_type}` map from the most
+recent `snapshot` result (`injected.js`'s `snapshot()` already computes exactly this per
+element -- the `name`/`input_type` fields on each node) and from `wait_for` results (which
+resolve exactly one ref -- `injected.js`'s `waitFor()` now returns the same fields for that one
+element). See `PolicyEngine.note_snapshot`/`note_ref`/`_resolve_ref_hint`, fed from
+`Hub._ingest_result`.
 
-- **`navigate`-based gates are fully live today** (`purchase` via checkout URLs, `account_creation`
-  via signup URLs) -- `args["url"]` is mandatory for `navigate` in the existing wire protocol, so
-  this signal has always been available.
+This resolution happens **before the command is ever dispatched to the device** -- it runs
+inside `PolicyEngine.evaluate`, called from `Hub.send_command` before `_dispatch_live`/enqueue
+(the same choke point that has always governed the denylist). A `click` whose ref matches a
+gate-worthy label is gated pre-action; the click never reaches the page. This closes the gap
+described in earlier phases, where click/type-based gates had a real matching *mechanism*
+(`tests/test_policy.py` proved that directly) but zero live signal because nothing populated
+the hint args.
+
+- **`navigate`-based gates remain fully live** (`purchase` via checkout URLs, `account_creation`
+  via signup URLs) -- `args["url"]` is mandatory for `navigate`, so this signal has always been
+  available.
 - **`click`/`type`-based gates (`purchase` via button text, `send`, `delete`, `oauth_grant`,
-  `file_upload`, `permission_change`) have zero real signal in the currently wired system and will
-  not fire**, because nothing populates `args["label"]`/`args["page_url"]`/`args["input_type"]`
-  yet. This is not a bug in this phase -- it is the honest boundary of what a hub with no DOM
-  access can know about a `click`, documented rather than silently assumed to work.
-  `tests/test_policy.py` proves the matching *mechanism* is correct by supplying these hints
-  directly; wiring a real caller to populate them is future work (outside this phase's scope,
-  which does not touch the extension, CLI, or MCP server).
+  `file_upload`, `permission_change`) now fire pre-action** whenever the clicked/typed `ref` was
+  observed via a prior `snapshot` or `wait_for` on that tab -- which, in this system's intended
+  usage, is the only way to obtain a `ref` in the first place. `tests/test_ref_hints.py` proves
+  this end-to-end through a real hub-routed `snapshot`/`wait_for` result, not just via a
+  synthetic hint supplied directly to `PolicyEngine.evaluate`.
+- **What is still NOT gated pre-action:** a `click` targeting a `ref` the hub has never seen in
+  any `snapshot`/`wait_for` result for that tab (not possible via the CLI/MCP surfaces, which
+  only ever obtain refs that way, but possible if a caller invents one), and a `click` whose ref
+  label was captured before the tab navigated to a different URL (see "staleness" below -- the
+  hint is discarded rather than trusted, degrading to the same "no signal" case). Both fall back
+  to the pre-Phase-4 behavior: allowed through, not gated, because the hub genuinely has no
+  reliable signal.
+- **Staleness is handled conservatively, not ignored.** `injected.js`'s `window.__abb` (and every
+  `ref`) is destroyed on navigation. If the hub's own last-observed URL for a tab differs from
+  the URL recorded when a ref's label was captured, the label is discarded -- the hub does not
+  claim a click is safe, and does not claim a stale label is real. See policy.py's "Label hints
+  are now wired" docstring section for the full reasoning, including the one accepted
+  false-negative (a same-page SPA route change can unnecessarily invalidate a still-valid ref).
 
 ### Other honest limits
 

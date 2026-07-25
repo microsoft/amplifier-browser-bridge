@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+
 from amplifier_browser_bridge import HubError, Target
 from amplifier_browser_bridge import mcp_server as srv
 

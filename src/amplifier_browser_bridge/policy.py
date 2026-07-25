@@ -46,17 +46,58 @@ what a page does. Two signal channels feed it, and both have real gaps:
   last observed for that tab (via a prior `tabs`/`navigate`/`snapshot`/`read`
   result). If nothing has been observed yet, there is no URL signal at all.
 - **Label patterns** (`args["label"]`, matched against a button/link's visible
-  text or `aria-label`): this is an **optional** argument that nothing in this
-  codebase populates yet. `injected.js`'s `snapshot()` already computes exactly
-  this string per element (`node.name`) -- a future caller (CLI, MCP tool, or the
-  extension itself) can pass it straight through as `args["label"]` on a
-  `click`/`type` command. Until some caller does, **click/type-based gate
-  categories have zero real signal in the current wired system** and will not
-  fire. This is not a bug in this phase; it is the honest boundary of what a
-  hub with no DOM access can know, documented rather than hidden. Tests in
-  `tests/test_policy.py` exercise the matching logic directly by supplying
-  `args["label"]` explicitly, proving the mechanism works the moment a signal
-  exists.
+  text or `aria-label`): reliable *when a label is available*. As of Phase 4,
+  the hub resolves this itself when the caller doesn't supply it explicitly --
+  see "Label hints are now wired" below -- but the resolution has its own
+  honest gap: a `ref` the hub has never seen in a `snapshot`/`wait_for` result
+  carries no label, and a `ref` whose tab has since navigated to a different
+  URL is treated as **stale** and discarded rather than trusted. Both cases
+  fall back to "no label signal" -- the same pre-Phase-4 behavior -- rather
+  than guessing.
+
+### Label hints are now wired (Phase 4)
+
+The hub remembers, per `(device_id, tab_id)`, the `ref -> {label, tag,
+input_type}` map from the most recent `snapshot` result (and incrementally
+from `wait_for` results, which resolve exactly one ref). See
+`PolicyEngine.note_snapshot` / `note_ref` / `_resolve_ref_hint`, fed from
+`Hub._ingest_result`. When a `click`/`type` command names a `target.ref` and
+doesn't supply `args["label"]`/`args["input_type"]` itself, `evaluate()` looks
+them up from this cache before running gate rules -- **before the command is
+ever dispatched to the device** (it runs inside `PolicyEngine.evaluate`, which
+`Hub.send_command` calls before `_dispatch_live`/enqueue; see hub.py's module
+docstring on the choke point). This is what makes click/type-based gates fire
+pre-action rather than after the click has already landed on the page.
+
+**Why this approach, not extension-side resolve-then-report:** the
+alternative design (the extension resolves a click's label and reports it to
+the hub in a first round trip, then the hub decides whether to actually
+dispatch in a second) also gates pre-action, but costs an extra WebSocket
+round trip per click and requires the extension to understand two-phase
+command execution. Remembering `snapshot`/`wait_for` results the hub already
+receives is free -- no protocol round trip, no extension complexity -- at the
+cost of the staleness handling described below. Given every click is, in
+practice, preceded by a `snapshot` or `wait_for` in this system's intended
+usage (there is no other way to obtain a `ref`), the hub already has the data
+it needs by the time a `click` arrives.
+
+**Staleness, handled conservatively:** `injected.js`'s `window.__abb` (and
+therefore every `ref`) is destroyed on navigation (see injected.js's module
+docstring). If the hub's own last-observed URL for a tab (`_tab_hosts`, fed by
+`navigate`/`snapshot`/`read`/`tabs` results -- never by anything a caller
+asserts) differs from the URL recorded when a ref's label was captured, the
+hub treats the label as unknown rather than risk gating (or failing to gate)
+based on a DOM that may no longer exist. This is deliberately conservative in
+both directions -- it does not claim a click is safe, and it does not claim a
+sanitized label is real; it degrades to the pre-Phase-4 "no signal" case. One
+known false-negative this produces: a same-page client-side (SPA) route change
+that updates the tab's URL without a full navigation may invalidate a still-
+valid ref's label unnecessarily. We accept this rather than risk the reverse
+(trusting a label for a DOM that changed underneath it).
+
+Tests in `tests/test_ref_hints.py` exercise both the wiring (a `click`
+targeting a ref observed via a real hub-routed `snapshot` result fires a gate
+with no explicit label in the `click`'s own args) and the staleness guard.
 - We cannot reliably tell a "Post" button that publishes a public tweet from a
   "Post" button that saves a private draft. Label patterns are deliberately
   narrow (word-boundaried, category-specific phrases) to reduce false positives,
@@ -220,7 +261,7 @@ class Denylist:
         return None
 
     @staticmethod
-    def load(path: str | Path | None = None) -> "Denylist":
+    def load(path: str | Path | None = None) -> Denylist:
         """Resolution order (design doc + auth.py's TokenStore precedent):
 
             1. explicit `path` argument
@@ -483,6 +524,14 @@ class PolicyEngine:
         # cannot assert its way past a host the hub itself has already recorded.
         self._tab_hosts: dict[tuple[str, int], str] = {}
 
+        # (device_id, tab_id) -> {"url": <url at capture time>, "nodes": {ref:
+        # {"label", "tag", "input_type"}}}. Fed by `note_snapshot` (a full
+        # `snapshot` result) and `note_ref` (a single resolved `wait_for`
+        # ref) -- see `_resolve_ref_hint` and the module docstring's "Label
+        # hints are now wired" section (Phase 4). Never trusted across a
+        # URL change -- see `_resolve_ref_hint`'s staleness check.
+        self._tab_refs: dict[tuple[str, int], dict[str, Any]] = {}
+
         self._confirmations: dict[str, PendingConfirmation] = {}
 
     # ------------------------------------------------------------------
@@ -496,6 +545,70 @@ class PolicyEngine:
         if tab_id is None or not url:
             return
         self._tab_hosts[(device_id, tab_id)] = url
+
+    def note_snapshot(
+        self, device_id: str, tab_id: int | None, url: str | None, nodes: list[dict[str, Any]]
+    ) -> None:
+        """Record a full `ref -> {label, tag, input_type}` map from a
+        `snapshot` result -- replaces any prior map for this tab outright
+        (a fresh snapshot is authoritative for the page it was taken on;
+        stale entries from a since-navigated-away page must not linger).
+        Called from `Hub._ingest_result`."""
+        if tab_id is None or not url:
+            return
+        node_map: dict[str, dict[str, Any]] = {}
+        for n in nodes:
+            ref = n.get("ref") if isinstance(n, dict) else None
+            if not isinstance(ref, str):
+                continue
+            node_map[ref] = {
+                "label": n.get("name"),
+                "tag": n.get("tag"),
+                "input_type": n.get("input_type"),
+            }
+        self._tab_refs[(device_id, tab_id)] = {"url": url, "nodes": node_map}
+
+    def note_ref(
+        self,
+        device_id: str,
+        tab_id: int | None,
+        url: str | None,
+        ref: str | None,
+        *,
+        label: str | None = None,
+        tag: str | None = None,
+        input_type: str | None = None,
+    ) -> None:
+        """Incremental update for a single resolved ref -- e.g. from a
+        `wait_for` result, which resolves exactly one element without a full
+        page snapshot. If the tab has moved to a different URL since the
+        cached map was built, the old map is discarded first (same
+        authority-of-the-latest-observation reasoning as `note_snapshot`)."""
+        if tab_id is None or not url or not ref:
+            return
+        key = (device_id, tab_id)
+        cache = self._tab_refs.get(key)
+        if cache is None or cache.get("url") != url:
+            cache = {"url": url, "nodes": {}}
+            self._tab_refs[key] = cache
+        cache["nodes"][ref] = {"label": label, "tag": tag, "input_type": input_type}
+
+    def _resolve_ref_hint(self, target: Target) -> dict[str, Any] | None:
+        """Best-effort `{label, tag, input_type}` for `target.ref`, or `None`
+        if unknown or stale. See the module docstring's "Label hints are now
+        wired" section for the full reasoning; in short: this never invents
+        a label, and discards one the moment the hub's own observations
+        suggest the page may have changed since it was captured."""
+        if target.tab_id is None or not target.ref:
+            return None
+        key = (target.device_id, target.tab_id)
+        cache = self._tab_refs.get(key)
+        if cache is None:
+            return None
+        current_url = self._tab_hosts.get(key)
+        if current_url is not None and current_url != cache.get("url"):
+            return None  # stale -- see "Staleness, handled conservatively"
+        return cache["nodes"].get(target.ref)
 
     def filter_tabs_result(self, device_id: str, tabs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Response-path filtering for a `tabs` command result (design doc §6.2:
@@ -561,6 +674,19 @@ class PolicyEngine:
         if not skip_gate:
             label = args.get("label") if isinstance(args.get("label"), str) else None
             input_type = args.get("input_type") if isinstance(args.get("input_type"), str) else None
+            # Phase 4: if the caller didn't supply a label/input_type
+            # explicitly, resolve them from the hub's own remembered
+            # snapshot/wait_for observations for this ref -- see
+            # `_resolve_ref_hint` and the module docstring's "Label hints are
+            # now wired" section. Caller-supplied values always win; this is
+            # a fallback, never an override.
+            if label is None or input_type is None:
+                hint = self._resolve_ref_hint(target)
+                if hint is not None:
+                    if label is None and isinstance(hint.get("label"), str):
+                        label = hint["label"]
+                    if input_type is None and isinstance(hint.get("input_type"), str):
+                        input_type = hint["input_type"]
             for rule in self.gate_rules:
                 if command not in rule.commands:
                     continue

@@ -128,9 +128,37 @@ if (!window.__abb) {
         if (!interesting || !isVisible(el)) continue;
         const node = { ref: refFor(el), role: roleOf(el), name: nameOf(el), tag: el.tagName.toLowerCase() };
         if ("value" in el) node.value = String(el.value ?? "");
+        // input_type feeds the hub's file_upload gate detection (policy.py's
+        // FILE_UPLOAD_INPUT_TYPES) -- an unambiguous alternative to fuzzy
+        // label matching for input[type=file]. Only meaningful on <input>.
+        if (el.tagName === "INPUT") node.input_type = el.type;
         nodes.push(node);
       }
       return { url: location.href, title: document.title, nodes };
+    }
+
+    // Resolve a ref to its viewport-space bounding rect, WITHOUT dispatching
+    // any synthetic event -- used by background.js's CDP-backed trusted
+    // input (Input.dispatchMouseEvent needs real viewport coordinates, not a
+    // DOM event). Scrolls the element into view first so the rect is valid
+    // even for an element currently outside the viewport; measured (design
+    // doc §2/§7) that getBoundingClientRect() never returns zeros on Edge in
+    // any window state (minimized, occluded), so this is reliable input to
+    // CDP even for a hidden/minimized tab.
+    function rectFor(ref) {
+      const el = resolveRef(ref);
+      el.scrollIntoView({ block: "center", inline: "center" });
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height, tag: el.tagName.toLowerCase() };
+    }
+
+    // Focus an element without dispatching a click -- used before CDP-backed
+    // trusted typing (Input.insertText types into whatever currently has
+    // focus; CDP has no notion of "ref").
+    function focusFor(ref) {
+      const el = resolveRef(ref);
+      el.focus();
+      return { ref };
     }
 
     function read() {
@@ -235,6 +263,6 @@ if (!window.__abb) {
       }
     }
 
-    return { dispatch, resolveRef, snapshot, read, deepQueryAll };
+    return { dispatch, resolveRef, snapshot, read, deepQueryAll, rectFor, focusFor };
   })();
 }

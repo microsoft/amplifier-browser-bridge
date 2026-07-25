@@ -63,5 +63,8 @@ def test_command_vocabulary_matches_design_doc() -> None:
         "screenshot",
         "wait_for",
         "wait_text",
+        # Phase 4: CDP escalation (design doc §7).
+        "attach",
+        "detach",
     }
     assert COMMANDS == expected
