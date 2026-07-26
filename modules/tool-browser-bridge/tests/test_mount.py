@@ -25,8 +25,16 @@ class _FakeHubClient:
         self.list_devices_calls = 0
         self.poll_calls: list[tuple[str, str]] = []
 
-    async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def command(
+        self, target: Target, command: str, args: dict[str, Any], *, session_id: str | None = None
+    ) -> dict[str, Any]:
         self.command_calls.append((target, command, args))
+        return self.response
+
+    async def establish_session(self, **kwargs: Any) -> dict[str, Any]:
+        return self.response
+
+    async def narrow_scope(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         return self.response
 
     async def list_devices(self) -> list[dict[str, Any]]:
@@ -106,6 +114,8 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_downloads_list",
         "browser_download",
         "browser_wait_download",
+        "browser_establish_session",
+        "browser_narrow_scope",
     }
     assert names == expected
 

@@ -86,6 +86,7 @@ async def _run_command(
     window_id: int | None = None,
     tab_id: int | None = None,
     timeout_s: float | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Shared adapter: send one command, hand the hub's response straight back.
 
@@ -97,12 +98,16 @@ async def _run_command(
     `timeout_s`, if given, overrides the hub's default device-round-trip wait for
     THIS command only (see hub.py's DEFAULT_COMMAND_TIMEOUT / HUB_ONLY_ARGS in
     protocol.py) -- useful for a heavy SPA that needs longer than the hub default.
+
+    `session_id`, if given, must come from a prior `browser_establish_session`
+    call -- the hub enforces that session's declared write scope
+    (docs/designs/confirmation-gate.md section 11.2) against this command.
     """
     target = Target(device_id=device_id, window_id=window_id, tab_id=tab_id)
     if timeout_s is not None:
         args = {**args, "timeout_s": timeout_s}
     try:
-        return await _client().command(target, command, args)
+        return await _client().command(target, command, args, session_id=session_id)
     except HubError as e:
         return {"ok": False, "error": str(e)}
 
@@ -275,7 +280,12 @@ async def browser_read(
 
 @mcp.tool()
 async def browser_click(
-    device_id: str, tab_id: int, ref: str, window_id: int | None = None, timeout_s: float | None = None
+    device_id: str,
+    tab_id: int,
+    ref: str,
+    window_id: int | None = None,
+    timeout_s: float | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Click an element by ref (from a prior browser_snapshot call). A
     frame-qualified ref (e.g. 'f3.e7') routes the click to that exact frame.
@@ -285,9 +295,20 @@ async def browser_click(
     instead of {"ok": ...}. That is a normal, actionable result, not an error or a
     hang -- call browser_poll(device_id, command_id) later to retrieve the
     eventual result.
+
+    session_id, if given, must come from a prior browser_establish_session call --
+    the hub enforces that session's declared write scope
+    (docs/designs/confirmation-gate.md section 11.2) against this command before
+    it reaches the device.
     """
     return await _run_command(
-        device_id, "click", {"ref": ref}, window_id=window_id, tab_id=tab_id, timeout_s=timeout_s
+        device_id,
+        "click",
+        {"ref": ref},
+        window_id=window_id,
+        tab_id=tab_id,
+        timeout_s=timeout_s,
+        session_id=session_id,
     )
 
 
@@ -299,6 +320,7 @@ async def browser_type(
     text: str,
     window_id: int | None = None,
     timeout_s: float | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Type text into an element by ref (from a prior browser_snapshot call). A
     frame-qualified ref (e.g. 'f3.e7') routes the input to that exact frame.
@@ -308,6 +330,11 @@ async def browser_type(
     instead of {"ok": ...}. That is a normal, actionable result, not an error or a
     hang -- call browser_poll(device_id, command_id) later to retrieve the
     eventual result.
+
+    session_id, if given, must come from a prior browser_establish_session call --
+    the hub enforces that session's declared write scope
+    (docs/designs/confirmation-gate.md section 11.2) against this command before
+    it reaches the device.
     """
     return await _run_command(
         device_id,
@@ -316,6 +343,7 @@ async def browser_type(
         window_id=window_id,
         tab_id=tab_id,
         timeout_s=timeout_s,
+        session_id=session_id,
     )
 
 
@@ -327,6 +355,7 @@ async def browser_key(
     ref: str | None = None,
     window_id: int | None = None,
     timeout_s: float | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Send a key press (e.g. 'Enter', 'Escape', 'Tab'), optionally focused on a
     specific element ref first. A frame-qualified ref (e.g. 'f3.e7') routes the
@@ -337,11 +366,18 @@ async def browser_key(
     instead of {"ok": ...}. That is a normal, actionable result, not an error or a
     hang -- call browser_poll(device_id, command_id) later to retrieve the
     eventual result.
+
+    session_id, if given, must come from a prior browser_establish_session call --
+    the hub enforces that session's declared write scope
+    (docs/designs/confirmation-gate.md section 11.2) against this command before
+    it reaches the device.
     """
     args: dict[str, Any] = {"key": key}
     if ref is not None:
         args["ref"] = ref
-    return await _run_command(device_id, "key", args, window_id=window_id, tab_id=tab_id, timeout_s=timeout_s)
+    return await _run_command(
+        device_id, "key", args, window_id=window_id, tab_id=tab_id, timeout_s=timeout_s, session_id=session_id
+    )
 
 
 @mcp.tool()
@@ -361,7 +397,12 @@ async def browser_scroll(
 
 @mcp.tool()
 async def browser_navigate(
-    device_id: str, tab_id: int, url: str, window_id: int | None = None, timeout_s: float | None = None
+    device_id: str,
+    tab_id: int,
+    url: str,
+    window_id: int | None = None,
+    timeout_s: float | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Navigate a tab to a URL.
 
@@ -370,9 +411,20 @@ async def browser_navigate(
     instead of {"ok": ...}. That is a normal, actionable result, not an error or a
     hang -- call browser_poll(device_id, command_id) later to retrieve the
     eventual result.
+
+    session_id, if given, must come from a prior browser_establish_session call --
+    the hub enforces that session's declared write scope
+    (docs/designs/confirmation-gate.md section 11.2) against this command before
+    it reaches the device.
     """
     return await _run_command(
-        device_id, "navigate", {"url": url}, window_id=window_id, tab_id=tab_id, timeout_s=timeout_s
+        device_id,
+        "navigate",
+        {"url": url},
+        window_id=window_id,
+        tab_id=tab_id,
+        timeout_s=timeout_s,
+        session_id=session_id,
     )
 
 
@@ -786,6 +838,84 @@ async def browser_confirm(confirmation_token: str) -> dict[str, Any]:
     naming why."""
     try:
         return await _client().confirm(confirmation_token)
+    except HubError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_establish_session(
+    write: str = "*",
+    read: str = "*",
+    on_unknown: str = "allow",
+    redeem: str = "agent",
+    unattended: bool = False,
+) -> dict[str, Any]:
+    """Create a new session with a caller-declared WRITE scope
+    (docs/designs/confirmation-gate.md, Candidate C). This is a boundary the
+    page itself can never touch -- see the design doc's section 2 lemma.
+    Pass the returned session_id to browser_click/browser_type/browser_key/
+    browser_navigate to enforce this scope on those commands.
+
+    write/read: '*' (default, unrestricted) or a comma-separated list of
+    hostnames (subdomain-inclusive, e.g. 'github.com' also covers
+    'gist.github.com'). on_unknown: 'allow' (default) | 'gate' | 'deny' --
+    what to do when an action cannot be classified at all. redeem: 'agent'
+    (default, self-attestation) | 'out_of_band' (not yet implemented --
+    reserved). unattended: whether this session is running without a human
+    watching (one-way False -> True).
+
+    IMPORTANT: this ALWAYS creates a brand-new session with a fresh
+    session_id -- it can never be used to reset an existing session's scope
+    back to broad. To change an existing session, call
+    browser_narrow_scope instead, which can only ever narrow, never widen.
+    """
+    read_scope = "*" if read == "*" else [o.strip() for o in read.split(",") if o.strip()]
+    write_scope = "*" if write == "*" else [o.strip() for o in write.split(",") if o.strip()]
+    try:
+        return await _client().establish_session(
+            read=read_scope, write=write_scope, on_unknown=on_unknown, redeem=redeem, unattended=unattended
+        )
+    except HubError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_narrow_scope(
+    session_id: str,
+    write: str | None = None,
+    read: str | None = None,
+    on_unknown: str | None = None,
+    redeem: str | None = None,
+    unattended: bool = False,
+) -> dict[str, Any]:
+    """Narrow an EXISTING session's scope -- NEVER widens
+    (docs/designs/confirmation-gate.md section 11.2). write/read may only
+    shrink to a strict subset of the current grant (comma-separated
+    hostnames), on_unknown may only move allow -> gate -> deny, redeem only
+    agent -> out_of_band, unattended only False -> True. Only the
+    parameters you pass are touched; the rest of the scope is unaffected.
+
+    Once the session has ingested any page content (a browser_read/
+    browser_snapshot/browser_tabs result), the hub SEALS it and every
+    subsequent call to this tool for that session_id -- including this one
+    -- is rejected outright, no matter how narrow the request. This is the
+    property that makes the scope page-immune to a prompt-injected
+    instruction: by the time such an instruction could exist in your
+    context, the session that read it has already sealed.
+    """
+    kwargs: dict[str, Any] = {}
+    if write is not None:
+        kwargs["write"] = [o.strip() for o in write.split(",") if o.strip()]
+    if read is not None:
+        kwargs["read"] = [o.strip() for o in read.split(",") if o.strip()]
+    if on_unknown is not None:
+        kwargs["on_unknown"] = on_unknown
+    if redeem is not None:
+        kwargs["redeem"] = redeem
+    if unattended:
+        kwargs["unattended"] = True
+    try:
+        return await _client().narrow_scope(session_id, **kwargs)
     except HubError as e:
         return {"ok": False, "error": str(e)}
 

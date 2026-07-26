@@ -606,29 +606,45 @@ One test keeps passing but changes meaning and needs a companion:
 9. **A caller that declares broad scope, or a hub operator who disables the classifier.** The
    bridge supplies mechanism. It cannot supply judgment on the caller's behalf — which is the
    point of §5, and also its cost.
-10. **`scope.py` (Candidate C) is not implemented in this build pass.** `PolicyEngine` exposes a
-    hub-wide `on_unknown` constructor setting standing in for a per-session `SessionScope`, but
-    there is no caller-declared write-scope enforcement, no narrow-only/seal-on-first-read
-    guarantee, and no `out_of_band` redemption channel yet (design doc §15 steps 5-6). The only
-    page-immune *prevention* this design promises (§4: "C is the only page-immune prevention")
-    is therefore absent from this pass — what shipped is page-immune *detection* (effects/flow
-    elevation) and page-advisory classification, not the scope boundary. Session establishment,
-    `abb confirm`/`browser_confirm`'s `redeem: "agent"` self-attestation only (no
-    `out_of_band`/`abb approve`), and the operator-configured screening hook (Candidate B) are
-    likewise deferred — see the implementing PR's report for the exact stopping point.
-11. **Cases 2-5 of the §14.1 regression suite are proven against synthetic fixtures, not the real
-    incident page.** The exact `FLOW_URL`, whether the real elevation click issues an observable
-    non-GET request, and the page's actual `<title>`/heading text were never captured for this
-    implementation pass — the operational constraint for this work explicitly prohibited
-    touching the maintainer's live hub/browser session. `tests/test_gate_elevation.py` proves the
-    flow-elevation MECHANISM (an observed effect, or a page-context match, elevates a tab) using
-    clearly-labeled synthetic triggers on the real host name; it does not confirm that the actual
-    JIT-elevation flow at `repos.opensource.microsoft.com` produces either trigger in practice.
-    **What would settle this:** drive the real flow once, with the effects collector enabled and
-    a `snapshot` taken on the bland-labeled page, and capture (a) the exact URL, (b) the `effects`
-    block from clicking through the flow's first step, and (c) the `page_title`/`headings` from
-    that snapshot. Until then, the measured, verbatim-label case (case 1, `ELEVATE_LABEL` itself)
-    remains the only fully-proven-against-reality regression case; cases 2-5 are mechanism proofs.
+10. **`scope.py` (Candidate C) is now implemented** (a later PR than the one that originally wrote
+    this section). Session establishment, narrow-only/seal-on-first-read enforcement, and
+    write-scope denial are wired into `PolicyEngine.evaluate`/`Hub.send_command` and surfaced on
+    the CLI (`abb session-establish`/`abb session-narrow`), the MCP server
+    (`browser_establish_session`/`browser_narrow_scope`), and the Amplifier tool module. This is
+    the one page-immune *prevention* this design promises (§4: "C is the only page-immune
+    prevention"). **Still deferred:** `redeem: "out_of_band"`'s actual redemption channel (`abb
+    approve`, §15 step 6 — `redeem` can be *declared* `"out_of_band"` on a session, but nothing
+    yet redeems a token that way) and the operator-configured screening hook (Candidate B). Also
+    deferred: enforcing `SessionScope.read` against any command — the field exists and
+    participates fully in `narrow()`'s validation, but `PolicyEngine.evaluate` only ever consults
+    `write` (matching this document's own §12 decision flow, which never mentions a read-scope
+    check). See the implementing PR's report for the exact stopping point.
+11. **Cases 2-3 of the §14.1 regression suite are proven against a fixture built from an OBSERVED
+    URL shape and title template, not a fully-reproduced incident page.** A read-only `snapshot`
+    of the maintainer's real, already-connected browser (a DIFFERENT repository than the
+    incident, taken without clicking or otherwise changing any state) recorded:
+
+        url:   https://repos.opensource.microsoft.com/orgs/microsoft/repos/amplifier-app-wiki-weaver/jit
+        title: microsoft/amplifier-app-wiki-weaver repository | Microsoft Open Source
+
+    This confirms, as OBSERVED fact rather than guesswork, that the flow URL has the shape
+    `.../orgs/{org}/repos/{repo}/jit` and the page title follows the template `{org}/{repo}
+    repository | Microsoft Open Source`. `tests/test_gate_elevation.py`'s `FLOW_URL`/`PAGE_TITLE`
+    now use this observed shape (with a neutral placeholder org/repo — the real names carry no
+    test-relevant signal and this project is headed for public release).
+
+    **Two facts remain genuinely unverified**, and nothing in the test suite claims them: whether
+    the elevation click itself issues an observable non-GET request (case 2's trigger is still a
+    synthetic `ObservedRequest`, not a captured one), and the page's exact heading (`<h1>`/`<h2>`)
+    structure (case 3's heading text is still synthetic). Both require actually clicking through
+    the JIT-elevation flow, which the operational instructions for the PR that captured the
+    URL/title explicitly prohibited (read-only observation only, no state changes to the
+    maintainer's live hub/browser). **What would settle this:** drive the real flow once, with the
+    effects collector enabled, and capture (a) the `effects` block from clicking through the
+    flow's first step, and (b) the real `headings` from a `snapshot` taken on the bland-labeled
+    page. Until then, the measured, verbatim-label case (case 1, `ELEVATE_LABEL` itself, plus the
+    now-observed URL/title shape) is the most-verified-against-reality regression case; cases 2-3
+    remain mechanism proofs on an observed-shape fixture.
 
 ---
 
@@ -1131,6 +1147,9 @@ Each step is independently shippable and independently valuable.
    `browser_confirm` MCP tool. Without this, every gate is still a dead end.
 4. **Flow elevation.** Wires 1 and 2 together; makes bland labels catchable.
 5. **`scope.py` (C).** Session establishment, narrow-only, `on_unknown`, seal-on-first-read.
+   **Done** — see §9 item 10. `write`-scope enforcement is wired into `PolicyEngine.evaluate`
+   and surfaced on all three agent surfaces (CLI/MCP/tool module). `read`-scope enforcement and
+   `redeem: "out_of_band"`'s redemption channel (step 6, below) remain open.
 6. **`redeem: out_of_band` (D2, part 2).** `abb approve`, the separate redemption channel.
 7. **Optional operator-configured screening hook (B).** Escalate-only, out-of-process, off by
    default. Only if a real consumer appears — otherwise skip it (design doc §13; `KERNEL_PHILOSOPHY`

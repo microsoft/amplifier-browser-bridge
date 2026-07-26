@@ -324,6 +324,84 @@ with the same `confirmation_token` fails with `{"ok": false, "error": "confirmat
 used"}`; one submitted after the token's TTL fails with `{"ok": false, "error": "confirmation
 token expired"}`.
 
+### `establish_session` (agent -> hub) / `result` (hub -> agent)
+
+Creates a brand-new session with a caller-declared **write scope** (`scope.py`, `docs/designs/
+confirmation-gate.md` section 11.2, Candidate C) -- the only pre-execution signal an adversarial
+page cannot touch at all (design doc section 2's lemma). All fields are optional and default to
+fully permissive (matching every caller that predates sessions):
+
+```json
+{
+  "v": 1, "id": "...", "type": "establish_session",
+  "read": "*", "write": ["github.com"], "on_unknown": "allow", "redeem": "agent",
+  "unattended": false, "token": "..."
+}
+```
+
+```json
+{
+  "v": 1, "id": "...", "type": "result",
+  "ok": true, "session_id": "9f2c...hex",
+  "scope": {"session_id": "9f2c...hex", "read": "*", "write": ["github.com"],
+            "on_unknown": "allow", "redeem": "agent", "unattended": false, "sealed": false}
+}
+```
+
+The hub **always** mints a fresh `session_id` (a `uuid4`) and never accepts a caller-supplied
+one -- this is what stops `establish_session` from ever being replayed against an existing
+(possibly already-sealed) session to reset its scope back to broad. `write`/`read` entries are
+bare hostnames (subdomain-inclusive, e.g. `"github.com"` also matches `"gist.github.com"` --
+the same matching `policy.py`'s denylist uses), not scheme-qualified origin URLs.
+
+Pass the returned `session_id` as an optional `session_id` field on a `command` request
+(below) to enforce this session's write scope against that command. Omitting `session_id`
+entirely keeps the existing, fully-permissive default every pre-`scope.py` caller already gets.
+
+### `narrow_scope` (agent -> hub) / `result` (hub -> agent)
+
+Narrows an **existing** session's scope -- never widens:
+
+```json
+{"v": 1, "id": "...", "type": "narrow_scope", "session_id": "9f2c...hex", "write": ["github.com"], "token": "..."}
+```
+
+Only the fields present in the request are touched. Rules, enforced field-by-field and
+validated atomically (a call that narrows three fields correctly and gets the fourth wrong
+changes nothing at all):
+
+- `write`/`read`: `"*"` -> any finite list, or a **strict subset** of the current list. Never
+  back to `"*"`, never a superset, never a disjoint set.
+- `on_unknown`: `allow -> gate -> deny` only (may skip directly from `allow` to `deny`).
+- `redeem`: `agent -> out_of_band` only.
+- `unattended`: `false -> true` only.
+
+```json
+{"v": 1, "id": "...", "type": "result", "ok": false,
+ "error": "write may only narrow to a STRICT subset of the current grant ['github.com'], got ['github.com', 'contoso.com'], which is not a strict subset"}
+```
+
+**Once a session has ingested any page content** (a `read`/`snapshot`/`tabs` result -- see
+`command`'s response section below), the hub **seals** it, and every subsequent `narrow_scope`
+call for that `session_id` -- including a further-narrowing one -- is rejected outright:
+
+```json
+{"v": 1, "id": "...", "type": "result", "ok": false,
+ "error": "session '9f2c...hex' is sealed (it has already ingested page content) -- scope can no longer be changed at all, narrowing included"}
+```
+
+This is the property that actually matters (`scope.py`'s module docstring): a prompt-injected
+instruction can only exist inside page content the agent has already read, which means the
+session has already sealed by the time such an instruction could possibly reach the model.
+There is no sequence of calls, starting from a session that has read anything, that ends with a
+wider grant than it started with.
+
+A session's scope survives its device disconnecting/reconnecting -- it is hub-process state,
+torn down only by hub restart (like the confirmation-token and flow-elevation state in
+`policy.py`), not by any one device's `/device`-route connection lifecycle. Mobile devices drop
+and re-attach by design (the three-tier connectivity model below); a scope that evaporated on
+reconnect would defeat its own purpose.
+
 ### `poll` (agent -> hub) / `result` (hub -> agent)
 
 Used to check on (or retrieve the eventual result of) a previously queued command:

@@ -72,8 +72,19 @@ class HubClient:
         return list(resp.get("devices", []))
 
     async def command(
-        self, target: Target, command: str, args: dict[str, Any] | None = None
+        self,
+        target: Target,
+        command: str,
+        args: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
+        """`session_id`, if given, must come from a prior `establish_session()`
+        call -- the hub enforces that session's declared write scope
+        (`scope.py`, docs/designs/confirmation-gate.md section 11.2) against
+        this command before it can reach the device. Omitting it keeps the
+        existing fully-permissive default every caller that predates
+        sessions already gets."""
         args = args or {}
         # If the caller asked the HUB to wait longer than this client's own
         # default (via args.timeout_s -- see hub.py/protocol.py's HUB_ONLY_ARGS),
@@ -134,4 +145,71 @@ class HubClient:
                 "confirmation_token": confirmation_token,
             }
         )
+        return resp
+
+    async def establish_session(
+        self,
+        *,
+        read: str | list[str] | tuple[str, ...] = "*",
+        write: str | list[str] | tuple[str, ...] = "*",
+        on_unknown: str = "allow",
+        redeem: str = "agent",
+        unattended: bool = False,
+    ) -> dict[str, Any]:
+        """Create a brand-new session with a caller-declared write scope
+        (docs/designs/confirmation-gate.md section 11.2, Candidate C). The
+        hub ALWAYS mints a fresh `session_id` -- pass it as `session_id` to
+        `command()` to enforce this scope, or to `narrow_scope()` to shrink
+        it further. Returns `{"ok": True, "session_id": ..., "scope": {...}}`
+        on success, or `{"ok": False, "error": ...}` if the declared values
+        were malformed (e.g. `write` given as something other than `"*"` or a
+        list of hostnames)."""
+        resp = await self._request(
+            {
+                "v": PROTOCOL_VERSION,
+                "id": new_id(),
+                "type": "establish_session",
+                "read": list(read) if isinstance(read, (list, tuple)) else read,
+                "write": list(write) if isinstance(write, (list, tuple)) else write,
+                "on_unknown": on_unknown,
+                "redeem": redeem,
+                "unattended": unattended,
+            }
+        )
+        return resp
+
+    async def narrow_scope(
+        self,
+        session_id: str,
+        *,
+        read: list[str] | tuple[str, ...] | None = None,
+        write: list[str] | tuple[str, ...] | None = None,
+        on_unknown: str | None = None,
+        redeem: str | None = None,
+        unattended: bool | None = None,
+    ) -> dict[str, Any]:
+        """Narrow an EXISTING session's scope -- never widens (scope.py's
+        `SessionScope.narrow`). Only the fields explicitly passed here are
+        touched; omitted fields (`None`, the default) are left exactly as
+        they are. Fails with `{"ok": False, "error": ...}` naming the
+        specific violation on any widening attempt, or if the session has
+        already sealed (ingested page content) and can no longer change at
+        all."""
+        req: dict[str, Any] = {
+            "v": PROTOCOL_VERSION,
+            "id": new_id(),
+            "type": "narrow_scope",
+            "session_id": session_id,
+        }
+        if read is not None:
+            req["read"] = list(read)
+        if write is not None:
+            req["write"] = list(write)
+        if on_unknown is not None:
+            req["on_unknown"] = on_unknown
+        if redeem is not None:
+            req["redeem"] = redeem
+        if unattended is not None:
+            req["unattended"] = unattended
+        resp = await self._request(req)
         return resp

@@ -120,7 +120,14 @@ async def _command(
     timeout_s = input_data.get("timeout_s")
     if timeout_s is not None:
         args = {**args, "timeout_s": timeout_s}
-    return await _client().command(_target(input_data), command, args)
+    # `session_id`, if the caller supplied one, must come from a prior
+    # browser_establish_session call -- the hub enforces that session's
+    # declared write scope (docs/designs/confirmation-gate.md section 11.2)
+    # against STATE_CHANGING_COMMANDS (click/type/key/navigate) before they
+    # reach the device. Harmless to pass on read-only commands too; the hub
+    # only consults it for state-changing ones.
+    session_id = input_data.get("session_id")
+    return await _client().command(_target(input_data), command, args, session_id=session_id)
 
 
 def _no_args(_input_data: dict[str, Any]) -> dict[str, Any]:
@@ -134,6 +141,16 @@ def _no_args(_input_data: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _DEVICE_ID_PROP = {"device_id": {"type": "string", "description": "Device id, from browser_devices."}}
+_SESSION_ID_PROP = {
+    "session_id": {
+        "type": "string",
+        "description": (
+            "Optional session id from a prior browser_establish_session call. If given, the hub "
+            "enforces that session's declared write scope (docs/designs/confirmation-gate.md "
+            "section 11.2) against this command before it reaches the device."
+        ),
+    }
+}
 _TAB_TARGET_PROPS = {
     **_DEVICE_ID_PROP,
     "tab_id": {"type": "integer", "description": "Tab id, from browser_tabs."},
@@ -256,6 +273,31 @@ def _build_tools() -> list[_HubTool]:
             args["page_delay_ms"] = input_data["page_delay_ms"]
         return args
 
+    async def establish_session_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        read = input_data.get("read", "*")
+        write = input_data.get("write", "*")
+        return await _client().establish_session(
+            read=read if read == "*" else [o.strip() for o in str(read).split(",") if o.strip()],
+            write=write if write == "*" else [o.strip() for o in str(write).split(",") if o.strip()],
+            on_unknown=input_data.get("on_unknown", "allow"),
+            redeem=input_data.get("redeem", "agent"),
+            unattended=bool(input_data.get("unattended", False)),
+        )
+
+    async def narrow_scope_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if input_data.get("write") is not None:
+            kwargs["write"] = [o.strip() for o in str(input_data["write"]).split(",") if o.strip()]
+        if input_data.get("read") is not None:
+            kwargs["read"] = [o.strip() for o in str(input_data["read"]).split(",") if o.strip()]
+        if input_data.get("on_unknown") is not None:
+            kwargs["on_unknown"] = input_data["on_unknown"]
+        if input_data.get("redeem") is not None:
+            kwargs["redeem"] = input_data["redeem"]
+        if input_data.get("unattended"):
+            kwargs["unattended"] = True
+        return await _client().narrow_scope(input_data["session_id"], **kwargs)
+
     async def vision_read_runner(input_data: dict[str, Any]) -> dict[str, Any]:
         target = _target(input_data)
         try:
@@ -341,7 +383,11 @@ def _build_tools() -> list[_HubTool]:
             "Click an element by ref (from a prior browser_snapshot call). " + _QUEUE_NOTE,
             {
                 "type": "object",
-                "properties": {**_TAB_TARGET_PROPS, "ref": {"type": "string", "description": "Element ref."}},
+                "properties": {
+                    **_TAB_TARGET_PROPS,
+                    **_SESSION_ID_PROP,
+                    "ref": {"type": "string", "description": "Element ref."},
+                },
                 "required": ["device_id", "tab_id", "ref"],
             },
             lambda input_data: _command("click", click_args, input_data),
@@ -353,6 +399,7 @@ def _build_tools() -> list[_HubTool]:
                 "type": "object",
                 "properties": {
                     **_TAB_TARGET_PROPS,
+                    **_SESSION_ID_PROP,
                     "ref": {"type": "string", "description": "Element ref."},
                     "text": {"type": "string", "description": "Text to type."},
                 },
@@ -368,6 +415,7 @@ def _build_tools() -> list[_HubTool]:
                 "type": "object",
                 "properties": {
                     **_TAB_TARGET_PROPS,
+                    **_SESSION_ID_PROP,
                     "key": {"type": "string", "description": "Key name, e.g. 'Enter'."},
                     "ref": {"type": "string", "description": "Optional element ref to focus first."},
                 },
@@ -394,7 +442,7 @@ def _build_tools() -> list[_HubTool]:
             "Navigate a tab to a URL. " + _QUEUE_NOTE,
             {
                 "type": "object",
-                "properties": {**_TAB_TARGET_PROPS, "url": {"type": "string"}},
+                "properties": {**_TAB_TARGET_PROPS, **_SESSION_ID_PROP, "url": {"type": "string"}},
                 "required": ["device_id", "tab_id", "url"],
             },
             lambda input_data: _command("navigate", navigate_args, input_data),
@@ -667,6 +715,60 @@ def _build_tools() -> list[_HubTool]:
                 "required": ["device_id", "command_id"],
             },
             poll_runner,
+        ),
+        _HubTool(
+            "browser_establish_session",
+            "Create a new session with a caller-declared WRITE scope "
+            "(docs/designs/confirmation-gate.md, Candidate C) -- a boundary the page itself can never "
+            "touch. Pass the returned session_id to browser_click/browser_type/browser_key/"
+            "browser_navigate to enforce this scope on those commands. ALWAYS creates a brand-new "
+            "session with a fresh session_id -- can never be used to reset an existing session's scope "
+            "back to broad. To change an existing session, use browser_narrow_scope instead, which can "
+            "only ever narrow, never widen.",
+            {
+                "type": "object",
+                "properties": {
+                    "write": {
+                        "type": "string",
+                        "default": "*",
+                        "description": (
+                            "'*' (default, unrestricted) or comma-separated hostnames (subdomain-inclusive)."
+                        ),
+                    },
+                    "read": {"type": "string", "default": "*"},
+                    "on_unknown": {
+                        "type": "string",
+                        "enum": ["allow", "gate", "deny"],
+                        "default": "allow",
+                    },
+                    "redeem": {"type": "string", "enum": ["agent", "out_of_band"], "default": "agent"},
+                    "unattended": {"type": "boolean", "default": False},
+                },
+            },
+            establish_session_runner,
+        ),
+        _HubTool(
+            "browser_narrow_scope",
+            "Narrow an EXISTING session's scope -- NEVER widens (docs/designs/confirmation-gate.md "
+            "section 11.2). write/read may only shrink to a strict subset of the current grant, "
+            "on_unknown may only move allow -> gate -> deny, redeem only agent -> out_of_band, "
+            "unattended only False -> True. Only the parameters you pass are touched. Once the "
+            "session has ingested any page content (a browser_read/browser_snapshot/browser_tabs "
+            "result), the hub SEALS it and every subsequent call -- including this one -- is rejected "
+            "outright, no matter how narrow the request.",
+            {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "write": {"type": "string", "description": "Comma-separated hostnames to narrow to."},
+                    "read": {"type": "string", "description": "Comma-separated hostnames to narrow to."},
+                    "on_unknown": {"type": "string", "enum": ["allow", "gate", "deny"]},
+                    "redeem": {"type": "string", "enum": ["agent", "out_of_band"]},
+                    "unattended": {"type": "boolean", "default": False},
+                },
+                "required": ["session_id"],
+            },
+            narrow_scope_runner,
         ),
     ]
 

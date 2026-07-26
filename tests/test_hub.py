@@ -120,6 +120,205 @@ def test_two_tabs_on_one_device_do_not_cross_contaminate(tmp_path: Any) -> None:
     assert targets_sent[0] != targets_sent[1]
 
 
+def test_establish_session_mints_a_fresh_id_never_caller_supplied(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    scope = hub.establish_session(write=["github.com"])
+    assert scope.session_id
+    # The wire handler ignores any session_id the caller might try to pass --
+    # SCOPE_FIELDS never includes it, so a smuggled one is simply dropped.
+    result = hub._handle_establish_session({"session_id": "attacker-chosen", "write": ["evil.com"]})
+    assert result["ok"] is True
+    assert result["session_id"] != "attacker-chosen"
+
+
+def test_command_with_session_id_enforces_write_scope(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    record.touch()
+    scope = hub.establish_session(write=["github.com"])
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1),
+            "navigate",
+            {"url": "https://repos.opensource.microsoft.com/foo"},
+            session_id=scope.session_id,
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert result["reason_code"] == "out_of_scope"
+    assert "github.com" in result["error"]
+
+
+def test_command_with_in_scope_origin_reaches_the_device(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record, canned_result={"ok": True, "result": {"ref": "e1"}})
+    record.ws = fake_ws
+    record.touch()
+    scope = hub.establish_session(write=["github.com"])
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1),
+            "navigate",
+            {"url": "https://github.com/foo"},
+            session_id=scope.session_id,
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is True
+    assert len(fake_ws.sent) == 1
+
+
+def test_unknown_session_id_fails_loud_rather_than_falling_back_permissive(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1), "click", {"ref": "e1"}, session_id="never-established"
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert result["reason_code"] == "unknown_session"
+
+
+def test_narrow_scope_wire_handler_rejects_widening(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    scope = hub.establish_session(write=["github.com"])
+    result = hub._handle_narrow_scope({"session_id": scope.session_id, "write": ["github.com", "evil.com"]})
+    assert result["ok"] is False
+    assert "strict subset" in result["error"]
+    assert scope.write == ("github.com",)
+
+
+class _IngestingFakeDeviceSocket:
+    """Unlike the plain `FakeDeviceSocket` above (which resolves the pending
+    future directly, bypassing `Hub._ingest_result`), this fake routes the
+    canned result through `_ingest_result` first -- exactly what
+    `Hub._handle_device_message`'s `result` branch does for a REAL device
+    message (same pattern as `tests/test_ref_hints.py`'s fake). Required
+    here because seal-on-first-read (`Hub._maybe_seal_session`) is invoked
+    from inside `_ingest_result`, not from the raw future-resolution path."""
+
+    def __init__(self, hub: Hub, record: Any, canned_result: dict[str, Any]) -> None:
+        self.hub = hub
+        self.record = record
+        self.canned_result = canned_result
+
+    async def send_json(self, data: dict[str, Any], /) -> None:
+        fut = self.record.pending.get(data["id"])
+        if fut is not None and not fut.done():
+            raw_env = {**self.canned_result, "id": data["id"]}
+            env = self.hub._ingest_result(self.record.device_id, data["id"], raw_env)
+            fut.set_result(env)
+
+
+def test_read_snapshot_seals_the_session_and_blocks_further_narrowing(tmp_path: Any) -> None:
+    """The load-bearing anti-injection property, exercised end-to-end through
+    the hub: a `snapshot` result reaching the caller seals the session, and
+    every subsequent narrow_scope call for it -- even a further-narrowing one
+    -- is rejected outright."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = _IngestingFakeDeviceSocket(
+        hub, record, canned_result={"ok": True, "result": {"url": "https://github.com/x", "nodes": []}}
+    )
+    record.ws = fake_ws
+    record.touch()
+    scope = hub.establish_session(write=["github.com", "contoso.com"])
+    assert not scope.sealed
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1), "snapshot", {}, session_id=scope.session_id
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is True
+    assert scope.sealed
+
+    narrowed = hub._handle_narrow_scope({"session_id": scope.session_id, "write": ["github.com"]})
+    assert narrowed["ok"] is False
+    assert "sealed" in narrowed["error"]
+    assert scope.write == ("github.com", "contoso.com")  # unchanged
+
+
+def test_session_scope_survives_device_disconnect_and_reconnect(tmp_path: Any) -> None:
+    """A session is hub-process state, not device-connection state -- mobile
+    devices drop and re-attach by design (the three-tier connectivity model),
+    and a scope that evaporated on reconnect would defeat its own purpose."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    record.touch()
+    scope = hub.establish_session(write=["github.com"])
+
+    # Simulate a disconnect (unbind, as `_handle_device_ws` does on socket
+    # close) followed by a reconnect (a fresh `hello`/bind).
+    record.unbind()
+    assert record.tier is not Tier.LIVE
+    new_ws = FakeDeviceSocket(record)
+    record.bind(new_ws, {"device_id": "d1"})
+    record.touch()
+    assert record.tier is Tier.LIVE
+
+    # The session established before the reconnect is still there, and still
+    # enforces its original scope.
+    assert hub._sessions[scope.session_id] is scope
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1),
+            "navigate",
+            {"url": "https://repos.opensource.microsoft.com/foo"},
+            session_id=scope.session_id,
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert result["reason_code"] == "out_of_scope"
+
+
+def test_confirm_replay_is_rechecked_against_the_original_sessions_scope(tmp_path: Any) -> None:
+    """Scope enforcement runs BEFORE skip_gate (design doc section 12) -- a
+    gate fired under one session's scope must be re-checked against that
+    SAME scope on redemption, not dispatched scope-free."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record, canned_result={"ok": True, "result": {"ref": "e1"}})
+    record.ws = fake_ws
+    record.touch()
+    # In scope for github.com; the classifier fires on the elevate label
+    # regardless (label-alone gate, case 1's exact configuration).
+    scope = hub.establish_session(write=["github.com"])
+
+    async def gate() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1, ref="e1"),
+            "click",
+            {"ref": "e1", "label": "Elevate bkrabach to Administrator", "page_url": "https://github.com/x"},
+            session_id=scope.session_id,
+        )
+
+    gated = asyncio.run(gate())
+    assert gated["status"] == "needs_confirmation"
+    token = gated["confirmation_token"]
+
+    async def confirm() -> dict[str, Any]:
+        return await hub._handle_agent_confirm({"confirmation_token": token})
+
+    confirmed = asyncio.run(confirm())
+    # In-scope origin -> the confirmed replay reaches the device.
+    assert confirmed["ok"] is True
+
+
 def test_auth_rejects_wrong_token(tmp_path: Any) -> None:
     store = TokenStore(default_token="secret")
     assert store.validate("secret") is True

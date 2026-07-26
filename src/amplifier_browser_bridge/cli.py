@@ -44,7 +44,12 @@ def _print(obj: Any) -> None:
 
 
 def _run_command(
-    target_str: str, command: str, args: dict[str, Any], *, timeout: float | None = None
+    target_str: str,
+    command: str,
+    args: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    session_id: str | None = None,
 ) -> None:
     try:
         target = parse_target(target_str)
@@ -55,10 +60,27 @@ def _run_command(
     if timeout is not None:
         args = {**args, "timeout_s": timeout}
     try:
-        result = asyncio.run(_client().command(target, command, args))
+        result = asyncio.run(_client().command(target, command, args, session_id=session_id))
     except HubError as e:
         raise click.ClickException(str(e)) from e
     _print(result)
+
+
+# Shared --session option for the state-changing commands (click/type/navigate,
+# and the generic `cmd` escape hatch, which also reaches `key`) -- enforces
+# that session's declared write scope (scope.py, docs/designs/confirmation-gate.md
+# section 11.2). Not on read-only commands (snapshot/read/tabs/...): scope
+# enforcement only ever applies to STATE_CHANGING_COMMANDS (see policy.py).
+SESSION_OPTION = click.option(
+    "--session",
+    "session_id",
+    default=None,
+    help=(
+        "Session id from a prior `abb session-establish` call. If given, the hub enforces "
+        "that session's declared write scope against this command before it reaches the "
+        "device. Omit for the existing, fully-permissive default."
+    ),
+)
 
 
 # Shared --timeout option for every subcommand that ends up in `_run_command` --
@@ -183,30 +205,33 @@ def read(target: str, wake: bool, activate: bool, timeout: float | None) -> None
 @main.command(name="click")
 @click.argument("target")
 @click.argument("ref")
+@SESSION_OPTION
 @TIMEOUT_OPTION
-def click_cmd(target: str, ref: str, timeout: float | None) -> None:
+def click_cmd(target: str, ref: str, session_id: str | None, timeout: float | None) -> None:
     """Click an element by ref (from a prior snapshot). A frame-qualified ref
     (e.g. "f3.e7") routes the click to that exact frame."""
-    _run_command(target, "click", {"ref": ref}, timeout=timeout)
+    _run_command(target, "click", {"ref": ref}, timeout=timeout, session_id=session_id)
 
 
 @main.command(name="type")
 @click.argument("target")
 @click.argument("ref")
 @click.argument("text")
+@SESSION_OPTION
 @TIMEOUT_OPTION
-def type_cmd(target: str, ref: str, text: str, timeout: float | None) -> None:
+def type_cmd(target: str, ref: str, text: str, session_id: str | None, timeout: float | None) -> None:
     """Type text into an element by ref."""
-    _run_command(target, "type", {"ref": ref, "text": text}, timeout=timeout)
+    _run_command(target, "type", {"ref": ref, "text": text}, timeout=timeout, session_id=session_id)
 
 
 @main.command()
 @click.argument("target")
 @click.argument("url")
+@SESSION_OPTION
 @TIMEOUT_OPTION
-def navigate(target: str, url: str, timeout: float | None) -> None:
+def navigate(target: str, url: str, session_id: str | None, timeout: float | None) -> None:
     """Navigate a tab to a URL."""
-    _run_command(target, "navigate", {"url": url}, timeout=timeout)
+    _run_command(target, "navigate", {"url": url}, timeout=timeout, session_id=session_id)
 
 
 @main.command(name="tab-open")
@@ -490,8 +515,11 @@ def wait_text(target: str, text: str, timeout_ms: int, timeout: float | None) ->
 @click.argument("target")
 @click.argument("command")
 @click.option("--arg", "raw_args", multiple=True, help="key=value, repeatable")
+@SESSION_OPTION
 @TIMEOUT_OPTION
-def cmd(target: str, command: str, raw_args: tuple[str, ...], timeout: float | None) -> None:
+def cmd(
+    target: str, command: str, raw_args: tuple[str, ...], session_id: str | None, timeout: float | None
+) -> None:
     """Escape hatch: run any vocabulary command with free-form args."""
     if command not in COMMANDS:
         raise click.ClickException(f"unknown command: {command}. Valid: {sorted(COMMANDS)}")
@@ -501,7 +529,101 @@ def cmd(target: str, command: str, raw_args: tuple[str, ...], timeout: float | N
             raise click.ClickException(f"--arg must be key=value, got: {kv}")
         k, v = kv.split("=", 1)
         args[k] = v
-    _run_command(target, command, args, timeout=timeout)
+    _run_command(target, command, args, timeout=timeout, session_id=session_id)
+
+
+@main.command(name="session-establish")
+@click.option("--read", default="*", show_default=True, help="Comma-separated read-scope hostnames, or '*'.")
+@click.option(
+    "--write",
+    default="*",
+    show_default=True,
+    help=(
+        "Comma-separated write-scope hostnames (subdomain-inclusive, e.g. 'github.com' also "
+        "covers 'gist.github.com'), or '*' for unrestricted."
+    ),
+)
+@click.option(
+    "--on-unknown", type=click.Choice(["allow", "gate", "deny"]), default="allow", show_default=True
+)
+@click.option("--redeem", type=click.Choice(["agent", "out_of_band"]), default="agent", show_default=True)
+@click.option("--unattended", is_flag=True, default=False)
+def session_establish(read: str, write: str, on_unknown: str, redeem: str, unattended: bool) -> None:
+    """Create a new session with a caller-declared write scope
+    (docs/designs/confirmation-gate.md, Candidate C). Prints the new
+    session_id -- pass it via --session on click/type/navigate/cmd to
+    enforce this scope, or as the first argument to `abb session-narrow` to
+    shrink it further later.
+
+    The hub ALWAYS mints a fresh session_id and never accepts one you
+    supply -- this is what stops re-running this command from silently
+    resetting an EXISTING session's scope back to broad. To change an
+    existing session, use `abb session-narrow` instead, which can only ever
+    narrow, never widen.
+    """
+    read_scope = "*" if read == "*" else [o.strip() for o in read.split(",") if o.strip()]
+    write_scope = "*" if write == "*" else [o.strip() for o in write.split(",") if o.strip()]
+    try:
+        result = asyncio.run(
+            _client().establish_session(
+                read=read_scope,
+                write=write_scope,
+                on_unknown=on_unknown,
+                redeem=redeem,
+                unattended=unattended,
+            )
+        )
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    _print(result)
+
+
+@main.command(name="session-narrow")
+@click.argument("session_id")
+@click.option("--read", default=None, help="Comma-separated origins to narrow READ scope to.")
+@click.option("--write", default=None, help="Comma-separated origins to narrow WRITE scope to.")
+@click.option("--on-unknown", type=click.Choice(["allow", "gate", "deny"]), default=None)
+@click.option("--redeem", type=click.Choice(["agent", "out_of_band"]), default=None)
+@click.option(
+    "--unattended", is_flag=True, default=False, help="Set unattended=true (one-way: False -> True only)."
+)
+def session_narrow(
+    session_id: str,
+    read: str | None,
+    write: str | None,
+    on_unknown: str | None,
+    redeem: str | None,
+    unattended: bool,
+) -> None:
+    """Narrow an EXISTING session's scope -- NEVER widens
+    (docs/designs/confirmation-gate.md section 11.2): write/read may only
+    shrink to a strict subset of the current grant, on_unknown may only
+    move allow -> gate -> deny, redeem only agent -> out_of_band, unattended
+    only False -> True. Only the options you pass are touched.
+
+    Once the session has ingested any page content (a read/snapshot/tabs
+    result), the hub SEALS it and every subsequent call to this command --
+    including this one -- is rejected outright, no matter how narrow the
+    request. This is the property that makes the scope page-immune: by the
+    time a page-injected instruction could exist, the session that read it
+    has already sealed.
+    """
+    kwargs: dict[str, Any] = {}
+    if write is not None:
+        kwargs["write"] = [o.strip() for o in write.split(",") if o.strip()]
+    if read is not None:
+        kwargs["read"] = [o.strip() for o in read.split(",") if o.strip()]
+    if on_unknown is not None:
+        kwargs["on_unknown"] = on_unknown
+    if redeem is not None:
+        kwargs["redeem"] = redeem
+    if unattended:
+        kwargs["unattended"] = True
+    try:
+        result = asyncio.run(_client().narrow_scope(session_id, **kwargs))
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    _print(result)
 
 
 @main.command(name="policy-explain")

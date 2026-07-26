@@ -142,6 +142,33 @@ actionable, not generic.
 
 ---
 
+## "I want a boundary the page itself can't talk me out of"
+
+Everything else in this guide -- classification, effects, flow elevation -- is derived from
+signals a page can influence, one way or another (see the next section). If your task can
+name, up front, the origin(s) it legitimately needs to write to, declare that as a **session
+scope** instead of relying on any of them:
+
+```
+abb session-establish --write github.com,contoso.com
+# -> {"session_id": "9f2c...hex", ...}
+abb click d1/7 e12 --session 9f2c...hex
+```
+
+(MCP: `browser_establish_session(write="github.com,contoso.com")` then pass the returned
+`session_id` to `browser_click`/`browser_type`/`browser_key`/`browser_navigate`.)
+
+A `click`/`type`/`key`/`navigate` outside the declared write scope is **denied outright**,
+before classification even runs -- this is prevention, not detection, and it is the one
+pre-execution signal a page cannot touch at all (`docs/designs/confirmation-gate.md` section 2's
+lemma; `scope.py`). The cost is real: you declare the scope once, up front, and it can only ever
+narrow afterward (`abb session-narrow`/`browser_narrow_scope`), never widen -- see that doc's
+section 11.2 for why a strictly-narrowing, seal-on-first-read design is what keeps a
+prompt-injected instruction from ever using a follow-up call to reset its own grant. If your
+task's origins aren't known ahead of time, or you want the maintainer's own broad-by-default
+stance, skip this and rely on classification/effects/flow elevation instead -- scope is opt-in,
+not a required step.
+
 ## "The action I'm about to take might be consequential"
 
 Every `click`/`type`/`key`/`navigate` result carries a `classification` block (deterministic

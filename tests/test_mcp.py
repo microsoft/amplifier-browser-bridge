@@ -26,7 +26,9 @@ class _FakeHubClient:
         self.list_devices_calls = 0
         self.poll_calls: list[tuple[str, str]] = []
 
-    async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def command(
+        self, target: Target, command: str, args: dict[str, Any], *, session_id: str | None = None
+    ) -> dict[str, Any]:
         self.command_calls.append((target, command, args))
         return self.response
 
@@ -65,6 +67,8 @@ def test_all_expected_tools_are_registered():
         "browser_wait_text",
         "browser_poll",
         "browser_confirm",
+        "browser_establish_session",
+        "browser_narrow_scope",
         "browser_fetch_bytes",
         "browser_grab_image",
         "browser_downloads_list",

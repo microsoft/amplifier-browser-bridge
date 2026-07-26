@@ -7,33 +7,44 @@ GitHub repository, and no gate fired.
 This file exists specifically to prove that failure is fixed. It is
 deliberately kept separate from `test_policy.py` (design doc section 14.1).
 
-**Evidence status (design doc section 14.2 -- read before trusting this file
-as a live reproduction):**
+**Evidence status (design doc section 14.2/9 -- read before trusting this
+file as a live reproduction):**
 
 `ELEVATE_LABEL` and `BLAND_LABEL` are the maintainer's own measured, verbatim
 transcription of the incident (design doc section 1). Cases built ONLY from
-these two labels (1, 6, 7, 8, 9) are grounded in a directly measured fact.
+these two labels (1, 6, 7) are grounded in a directly measured fact.
 
-Cases 2-5 additionally depend on facts about the real page that were NEVER
-independently verified for this PR -- the exact flow URL, whether the
-elevation click issues an observable non-GET request, and the page's real
-`<title>`/heading text. The design doc's own `FLOW_URL` constant is `"https://
-repos.opensource.microsoft.com/..."` -- literally elided, meaning even the
-design doc does not have it. Live verification would require driving the
-maintainer's real Edge profile through the actual JIT-elevation flow with the
-effects collector enabled and capturing the real page's title/headings --
-which this implementation run deliberately did NOT do, per the explicit
-operational instruction not to touch the maintainer's live hub or browser
-during this task. See docs/designs/confirmation-gate.md section 9 (updated by
-this PR) for the honest, undischarged limits list this leaves behind.
+**`FLOW_URL` and `PAGE_TITLE` are now OBSERVED, not synthetic** (updated by
+the phase-5 PR that added `scope.py`): a read-only `snapshot` of a live tab on
+the maintainer's real, already-connected browser -- a DIFFERENT repository
+than the incident (`amplifier-app-wiki-weaver`, not the incident's
+`amplifier-app-simulated-user-research`), taken without clicking or otherwise
+changing any state -- recorded:
 
-Every fixture below that depends on an unverified fact uses an explicitly
-synthetic, clearly-labeled placeholder (`FLOW_URL`, `SYNTHETIC_*`) rather than
-asserting a specific real value nobody observed. Cases 2 and 3 prove the
-MECHANISM (flow elevation from an observed effect, and from page context)
-using synthetic triggers -- they do not claim the maintainer's real flow
-triggers it this specific way. See each test's docstring for exactly what is
-and is not proven.
+    url:   https://repos.opensource.microsoft.com/orgs/microsoft/repos/amplifier-app-wiki-weaver/jit
+    title: microsoft/amplifier-app-wiki-weaver repository | Microsoft Open Source
+
+This establishes the URL *shape* (`.../orgs/{org}/repos/{repo}/jit`) and the
+page-title *template* (`{org}/{repo} repository | Microsoft Open Source`) as
+real, observed facts -- not guesses -- even though the specific repo observed
+differs from the incident repo. `FLOW_URL`/`PAGE_TITLE` below substitute a
+neutral placeholder org/repo (`contoso`/`sample-repo`) for the real names seen
+during capture: this project is headed for public release and the real names
+carry no test-relevant signal beyond the shape itself.
+
+Two facts remain genuinely unverified, and are NOT claimed by anything below:
+whether the elevation click itself issues an observable non-GET request, and
+the page's exact heading (`<h1>`/`<h2>`) structure. Both require actually
+clicking through the flow, which the operational instructions for this task
+explicitly prohibited. See docs/designs/confirmation-gate.md section 9 for the
+full, current honest-limits accounting.
+
+Cases 2 and 4 (flow elevation) prove the MECHANISM (an observed effect, or a
+page-context match, elevates a tab) using the now-observed URL shape and
+title template, plus a synthetic (not-yet-verified) elevation request/heading
+detail -- they do not claim the maintainer's real flow issues that exact
+request or renders that exact heading. See each test's docstring for exactly
+what is and is not proven.
 """
 
 from __future__ import annotations
@@ -44,17 +55,18 @@ from amplifier_browser_bridge.addressing import Target
 from amplifier_browser_bridge.audit import AuditLog
 from amplifier_browser_bridge.effects import EffectsReport, ObservedRequest
 from amplifier_browser_bridge.policy import PolicyEngine
+from amplifier_browser_bridge.scope import ScopeError, SessionScope
 
 # Measured, verbatim (docs/designs/confirmation-gate.md section 1).
 ELEVATE_LABEL = "Elevate bkrabach to Administrator"
 BLAND_LABEL = "Next"
 
-# NOT measured -- the design doc's own FLOW_URL constant is elided
-# ("https://repos.opensource.microsoft.com/...") because the real URL was
-# never captured. This is a synthetic placeholder on the real host, used only
-# so `evaluate()` has SOME url_context to reason about; no assertion in this
-# file depends on this being the real path.
-FLOW_URL = "https://repos.opensource.microsoft.com/orgs/microsoft/repos/example-repo/permissions"
+# OBSERVED (read-only snapshot, see module docstring above) URL shape and
+# title template, with a neutral placeholder org/repo standing in for the
+# real names captured -- the shape is what's load-bearing for these tests,
+# not the specific repository identity.
+FLOW_URL = "https://repos.opensource.microsoft.com/orgs/contoso/repos/sample-repo/jit"
+PAGE_TITLE = "contoso/sample-repo repository | Microsoft Open Source"
 
 
 def _engine(tmp_path: Any) -> PolicyEngine:
@@ -88,11 +100,13 @@ def test_elevate_to_administrator_gates_on_label_alone(tmp_path: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Case 2 -- SYNTHETIC trigger. Proves the mechanism (a browser-asserted
-# observed effect elevates a tab's flow, which then gates a bland click that
-# has zero label-based signal of its own). Does NOT claim the real elevation
-# click on repos.opensource.microsoft.com issues this specific request --
-# that fact was never observed (design doc section 14.2/9).
+# Case 2 -- URL shape OBSERVED, request SYNTHETIC. Proves the mechanism (a
+# browser-asserted observed effect elevates a tab's flow, which then gates a
+# bland click that has zero label-based signal of its own) using the
+# now-observed FLOW_URL shape. Does NOT claim the real elevation click on
+# repos.opensource.microsoft.com issues this specific request -- whether it
+# issues ANY observable non-GET request remains unverified (design doc
+# section 9).
 # ---------------------------------------------------------------------------
 
 
@@ -128,17 +142,17 @@ def test_bland_next_gates_when_flow_elevated_by_observed_effect(tmp_path: Any) -
 
 
 # ---------------------------------------------------------------------------
-# Case 3 -- SYNTHETIC trigger. Proves the page-context mechanism. Does NOT
-# claim the real page's actual <title>/headings contain these terms -- that
-# fact was never observed either.
+# Case 3 -- title template OBSERVED (PAGE_TITLE, see module docstring),
+# heading text SYNTHETIC. Proves the page-context mechanism using the real,
+# observed title shape. Does NOT claim the real page's actual headings
+# contain these terms -- heading structure was never observed (design doc
+# section 9).
 # ---------------------------------------------------------------------------
 
 
 def test_bland_next_gates_when_flow_elevated_by_page_context(tmp_path: Any) -> None:
     engine = _engine(tmp_path)
-    engine.note_page_context(
-        "d1", 1, FLOW_URL, "Just-in-time Administrator access request", ["Elevate your role"]
-    )
+    engine.note_page_context("d1", 1, FLOW_URL, PAGE_TITLE, ["Elevate your role"])
     decision = engine.evaluate(
         Target(device_id="d1", tab_id=1, ref="e95"),
         "click",
@@ -292,19 +306,92 @@ def test_no_descriptor_is_unknown_not_clear(tmp_path: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Case 9 (case 8, out-of-scope/scope.py, is deferred -- see the design doc's
-# build-order and this PR's report) -- sealed-session scope widening. NOT
-# implemented in this phase (scope.py is deferred, design doc section 15
-# step 5). Recorded as an explicit skip, not silently dropped.
+# Case 8 -- scope.py (Candidate C), now implemented (design doc section 15
+# step 5). A session narrowed to a DIFFERENT origin than FLOW_URL's host
+# denies the elevate click outright, before classification even runs --
+# page-immune prevention, not detection.
 # ---------------------------------------------------------------------------
 
 
-def test_out_of_scope_and_sealed_session_deferred_to_scope_py() -> None:
-    """Placeholder documenting an intentional scope decision: `scope.py`
-    (Candidate C -- caller-declared write scope, narrow-only, seal-on-first-
-    read) is NOT implemented in this pass (docs/designs/confirmation-gate.md
-    section 15 lists it as step 5, after the critical path of steps 1-3).
-    `test_out_of_scope_click_is_denied_with_specific_error` and
-    `test_sealed_session_cannot_widen_scope` from the design doc's required
-    case list are therefore not present -- see this PR's report for what
-    remains and why."""
+def test_out_of_scope_click_is_denied_with_specific_error(tmp_path: Any) -> None:
+    engine = _engine(tmp_path)
+    scope = SessionScope(session_id="sess-1", write=("github.com",))
+    decision = engine.evaluate(
+        Target(device_id="d1", tab_id=1, ref="e101"),
+        "click",
+        {"ref": "e101", "label": ELEVATE_LABEL, "page_url": FLOW_URL},
+        scope=scope,
+    )
+    assert decision.status == "deny"
+    assert decision.reason_code == "out_of_scope"
+    assert decision.reason is not None
+    # Specific, unlike the denylist's deliberately generic DENY_REASON (the
+    # caller's OWN declared constraint being read back to it -- design doc
+    # section 7.4, docs/POLICY.md's "Invisibility, both directions").
+    assert "repos.opensource.microsoft.com" in decision.reason
+    assert "github.com" in decision.reason
+    # Denied BEFORE classification ever ran -- this is prevention, not
+    # detection (design doc section 4: "C is the only page-immune
+    # prevention"). No classification is attached to a scope-denied decision.
+    assert decision.classification is None
+
+
+def test_in_scope_click_still_gates_normally(tmp_path: Any) -> None:
+    """A session scoped to the flow's OWN host is unaffected -- scope only
+    ever adds a constraint, never changes classification for an in-scope
+    origin."""
+    engine = _engine(tmp_path)
+    scope = SessionScope(session_id="sess-2", write=("repos.opensource.microsoft.com",))
+    decision = engine.evaluate(
+        Target(device_id="d1", tab_id=1, ref="e102"),
+        "click",
+        {"ref": "e102", "label": ELEVATE_LABEL, "page_url": FLOW_URL},
+        scope=scope,
+    )
+    assert decision.status == "gate"
+    assert decision.classification is not None
+    assert "permission_change" in decision.classification.categories
+
+
+# ---------------------------------------------------------------------------
+# Case 9 -- the load-bearing anti-injection property: once a session has
+# ingested page content (sealed), NO further scope change is accepted, not
+# even one that would narrow it further. This is what stops a prompt
+# injected FROM a page the agent already read from using a subsequent
+# narrow_scope/establish_session call to reset its own grant -- see
+# scope.py's module docstring for the full argument.
+# ---------------------------------------------------------------------------
+
+
+def test_sealed_session_cannot_widen_scope() -> None:
+    scope = SessionScope(session_id="sess-3", write=("github.com", "contoso.com"))
+    scope.seal()  # Hub calls this on the first read/snapshot/tabs result.
+    try:
+        scope.narrow(write=("github.com",))  # a NARROWING request -- still rejected once sealed.
+    except ScopeError as e:
+        assert "sealed" in str(e)
+    else:
+        raise AssertionError("narrow() must reject ANY change once sealed, narrowing included")
+    # Confirm nothing actually changed -- the rejected call must not have
+    # partially mutated the scope.
+    assert scope.write == ("github.com", "contoso.com")
+
+
+def test_narrow_before_seal_cannot_widen_either() -> None:
+    """Even before sealing, `narrow()` never accepts a widening request --
+    the seal is the second of two independent guarantees (scope.py's module
+    docstring), not the only one."""
+    scope = SessionScope(session_id="sess-4", write=("github.com",))
+    try:
+        scope.narrow(write="*")
+    except ScopeError:
+        pass
+    else:
+        raise AssertionError("narrow() must never re-widen write back to '*'")
+    try:
+        scope.narrow(write=("github.com", "contoso.com"))
+    except ScopeError:
+        pass
+    else:
+        raise AssertionError("narrow() must reject adding an origin to the write set")
+    assert scope.write == ("github.com",)
