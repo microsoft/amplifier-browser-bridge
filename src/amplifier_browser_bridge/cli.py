@@ -109,6 +109,20 @@ def tabs(target: str, timeout: float | None) -> None:
     _run_command(target, "tabs", {}, timeout=timeout)
 
 
+ACTIVATE_OPTION = click.option(
+    "--activate",
+    is_flag=True,
+    default=False,
+    help=(
+        "Activate (foreground) the tab before running this command. Never automatic -- steals "
+        "the human's focus, same co-working-etiquette exception as tab-activate -- but DOM "
+        "injection/traversal on a heavy page is measured to be dramatically faster (or to "
+        "outright time out) while backgrounded. Result reports 'activated': true when this "
+        "actually changed the tab's active state."
+    ),
+)
+
+
 @main.command()
 @click.argument("target")
 @click.option(
@@ -121,13 +135,22 @@ def tabs(target: str, timeout: float | None) -> None:
         "position, ephemeral JS state) -- opt-in only; the result reports 'woke': true."
     ),
 )
+@ACTIVATE_OPTION
 @TIMEOUT_OPTION
-def snapshot(target: str, wake: bool, timeout: float | None) -> None:
+def snapshot(target: str, wake: bool, activate: bool, timeout: float | None) -> None:
     """Accessibility-style snapshot of a tab: stable element refs for click/type.
 
     Refs are frame-qualified (e.g. "f0.e12") -- see docs/PROTOCOL.md's "Frames" section.
+    Each node also carries a `generation` -- refs are only valid from the MOST RECENT
+    snapshot; a ref from a superseded snapshot fails loud on click/type/key rather than
+    silently resolving (see docs/PROTOCOL.md's "Snapshot generations" section).
     """
-    _run_command(target, "snapshot", {"wake": True} if wake else {}, timeout=timeout)
+    args: dict[str, Any] = {}
+    if wake:
+        args["wake"] = True
+    if activate:
+        args["activate"] = True
+    _run_command(target, "snapshot", args, timeout=timeout)
 
 
 @main.command()
@@ -142,11 +165,17 @@ def snapshot(target: str, wake: bool, timeout: float | None) -> None:
         "position, ephemeral JS state) -- opt-in only; the result reports 'woke': true."
     ),
 )
+@ACTIVATE_OPTION
 @TIMEOUT_OPTION
-def read(target: str, wake: bool, timeout: float | None) -> None:
+def read(target: str, wake: bool, activate: bool, timeout: float | None) -> None:
     """Read the visible text of a tab, gathered across all frames -- see
     docs/PROTOCOL.md's "Frames" section for the combine strategy."""
-    _run_command(target, "read", {"wake": True} if wake else {}, timeout=timeout)
+    args: dict[str, Any] = {}
+    if wake:
+        args["wake"] = True
+    if activate:
+        args["activate"] = True
+    _run_command(target, "read", args, timeout=timeout)
 
 
 @main.command(name="click")
