@@ -183,6 +183,19 @@ structure would violate the project's "library vs custom code" judgment (IMPLEME
 
 ## 3. Confirmation gates -- only for irreversible/world-visible actions
 
+**This section describes the pre-confirmation-gate-redesign behavior and is
+retained for historical/migration context only.** The gate's actual current
+behavior -- deterministic multi-signal scoring (`classify.py`), browser-
+asserted effects attribution and flow elevation (`effects.py`), and the
+`unknown`/`clear`/`elevated` classification outcome -- is specified in
+`docs/designs/confirmation-gate.md`, which supersedes everything below in
+this section (§2, the denylist, and §5/§6, the kill switch and audit, are
+untouched by that redesign and remain current). Read the design doc for:
+what fired (or didn't) on the measured "Elevate bkrabach to Administrator"
+incident, the scoring table and family lexicon, flow elevation, and the
+honest, itemized limits list (§9) -- rather than the narrower "label + URL
+pattern, `combine=any`/`all`" model this section originally documented.
+
 The canonical seven categories (confirmed by the user, design doc §6.2):
 
 `purchase` · `send` · `delete` · `oauth_grant` · `file_upload` · `account_creation` ·

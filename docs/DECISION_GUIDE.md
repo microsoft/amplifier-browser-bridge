@@ -142,6 +142,32 @@ actionable, not generic.
 
 ---
 
+## "The action I'm about to take might be consequential"
+
+Every `click`/`type`/`key`/`navigate` result carries a `classification` block (deterministic
+scoring, `docs/designs/confirmation-gate.md`) and an `effects` block (what the browser actually
+observed happen) -- read them before assuming a plain `{ok: true}` means "nothing worth noting
+happened":
+
+- **`classification.status == "elevated"`** means the command was gated -- you already know this
+  from `status: "needs_confirmation"` on the response itself.
+- **`classification.status == "unknown"`** means the bridge could not classify the action at all
+  (an un-snapshotted ref, a stale hint, a canvas-rendered page) -- the command still ran (under
+  the default `on_unknown: "allow"`), but you got no signal either way. If you're driving toward
+  something you suspect might be consequential and get `unknown`, take a fresh `snapshot` (or call
+  `describe` on the specific ref) before proceeding, rather than treating silence as "safe."
+- **`effects.state_changing == true`** on an action whose `classification.status` was `"clear"`
+  is the single most actionable combination in this system: the classifier saw nothing
+  concerning in the label/URL/page context, but the browser observed a real non-GET request,
+  form submission, download, or new tab. This is exactly the failure mode `docs/designs/
+  confirmation-gate.md` was written to close (a bland "Next" button that turns out to submit a
+  privilege-elevation step) -- read the `effects.requests`/`.navigations` list before assuming
+  a "clear" classification means the action was inert.
+- **`classification.advisory` is always `true`.** Every page-asserted signal (label, form,
+  heading text) is forgeable by the page itself -- do not build automation that trusts a
+  `"clear"` classification as a security guarantee. `effects` (browser-asserted) is the one
+  page-immune signal; it is still post-hoc, not preventive.
+
 ## Quick reference table
 
 | You want... | Try first | Falls back to | Because |

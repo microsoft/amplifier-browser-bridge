@@ -75,7 +75,7 @@ Claude Desktop-style `mcp_servers.json`:
   "mcpServers": {
     "amplifier-browser-bridge": {
       "command": "abb-mcp",
-      "env": { "ABB_HUB_URL": "ws://100.124.126.19:8900/agent" }
+      "env": { "ABB_HUB_URL": "ws://<this machine's tailnet IP>:8900/agent" }
     }
   }
 }

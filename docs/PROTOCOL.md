@@ -251,7 +251,8 @@ denied tab must stay invisible; naming *why* a target was refused reveals as muc
 in a `tabs` listing would. Full detail (category, matched domain) goes to the audit log only.
 
 Response -- the command matched a **confirmation gate** (an irreversible/world-visible action;
-see docs/POLICY.md for the full category list and the honest limits of detection):
+see `docs/designs/confirmation-gate.md` for the classification mechanism, the scoring table, and
+the honest limits of detection -- this supersedes docs/POLICY.md §3's older label+URL model):
 ```json
 {
   "v": 1,
@@ -260,12 +261,49 @@ see docs/POLICY.md for the full category list and the honest limits of detection
   "status": "needs_confirmation",
   "confirmation_token": "9f2c...hex",
   "category": "delete",
-  "detected": {"category": "delete", "label_match": "\\bdelete\\b", "url_match": null}
+  "detected": {"category": "delete", "score": 3, "matched": ["delete"]},
+  "classification": {
+    "status": "elevated", "score": 3, "threshold": 3, "categories": ["delete"],
+    "advisory": true, "reason_code": null,
+    "signals": [{"channel": "label", "provenance": "page", "value": "Delete",
+                 "matched": ["delete"], "weight": 3}]
+  },
+  "redeem": "agent",
+  "confirm_scope": "action",
+  "expires_at": "2026-07-26T18:45:18.417996+00:00"
 }
 ```
 The command was **not** dispatched to the device. Re-submit it via `confirm` (below) with the
 same `confirmation_token` to execute it, or let the token expire (5 minutes by default) to
 abandon it.
+
+**`classification`** is attached to every `STATE_CHANGING_COMMANDS` (`click`/`type`/`key`/
+`navigate`) result -- gated or not, `unknown` or `clear` or `elevated` -- never only on the gated
+path. `advisory: true` is not decoration: every signal here except the `url`/`flow` channels is
+page-asserted and therefore forgeable (design doc §2) -- never treat this block as a security
+boundary on its own. `status: "unknown"` (distinct from `"clear"`) means no page semantics were
+observable at all (an unobserved ref, a stale hint, a canvas-rendered page) -- see
+`reason_code`, one of `ref_not_observed` · `hint_stale` · `descriptor_unavailable` ·
+`device_capability_missing` · `no_page_semantics`.
+
+**`effects`** is also attached to every `STATE_CHANGING_COMMANDS` result -- what the browser
+actually did (non-GET requests, navigations, downloads, tabs opened) in a bounded window after
+dispatch. This is **browser-asserted**, not page-asserted: a page can add decoy effects but
+cannot suppress a real one.
+```json
+{"effects": {"tier": "webrequest", "window_ms": 1500, "attribution": "time_window",
+             "state_changing": true,
+             "requests": [{"method": "POST", "url": "https://.../elevate",
+                           "type": "xmlhttprequest", "cross_origin": false}],
+             "navigations": [], "downloads": [], "tabs_opened": []}}
+```
+`tier` is one of `cdp` · `webrequest` · `navigation` · `none` -- honest degradation, never a
+silent gap: `tier: "none"` means nothing could be observed, not that nothing happened. A tab
+observed to be `state_changing` enters **flow elevation** (design doc §11.4): subsequent
+state-changing commands in that tab gate until its committed origin changes, a flow-scoped
+confirmation is redeemed (`confirm_scope: "flow"` above), or 15 minutes elapse -- this is how a
+bland-labeled button (e.g. "Next" in a multi-step flow) becomes catchable without any label
+signal of its own.
 
 ### `confirm` (agent -> hub) / `result` (hub -> agent)
 
@@ -529,7 +567,7 @@ shadow-DOM traversal, not a replacement for it.
 ### Content-extraction mechanisms
 
 `read`/`snapshot` only ever see text that's actually present in the DOM. Real-world finding,
-live against the SharePoint policy page above: `Global-Travel-Policy.docx` is embedded in a
+live against the SharePoint policy page above: `Quarterly-Report.docx` is embedded in a
 Word Online viewer, which renders the document to `<canvas>` -- the viewer frame's entire DOM
 text is a page-chrome string (`"PAGE 1 OF 5 | CONFIDENTIAL\INTERNAL ONLY | ..."`), not the
 document body. **There is no DOM text there to read, full stop.** Two mechanisms reach that
@@ -547,11 +585,11 @@ docs/designs/browser-bridge.md's "Mechanism, not policy" section):
   mechanism from `screenshot`: `screenshot` never calls a model; `vision_read` always does.
 
 ```json
-{"v": 1, "id": "...", "type": "command", "command": "fetch_bytes", "target": {"device_id": "..."}, "args": {"url": "https://.../Global-Travel-Policy.docx", "max_bytes": 10485760}, "token": "..."}
+{"v": 1, "id": "...", "type": "command", "command": "fetch_bytes", "target": {"device_id": "..."}, "args": {"url": "https://.../Quarterly-Report.docx", "max_bytes": 10485760}, "token": "..."}
 ```
 
 ```json
-{"ok": true, "result": {"url": "https://.../Global-Travel-Policy.docx", "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "byte_length": 47213, "base64": "UEsDBBQ..."}}
+{"ok": true, "result": {"url": "https://.../Quarterly-Report.docx", "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "byte_length": 47213, "base64": "UEsDBBQ..."}}
 ```
 
 Refuses past `args.max_bytes` (default 25MB) with an actionable error naming the limit --
@@ -608,7 +646,7 @@ exclusive modes:
 {"v": 1, "id": "...", "type": "command", "command": "wait_download", "target": {"device_id": "..."}, "args": {"since_id": 41, "pattern": "\\.docx$", "timeout_ms": 30000}, "token": "..."}
 ```
 ```json
-{"ok": true, "result": {"download_id": 43, "filename": "Global-Travel-Policy.docx", "url": "https://ppc-word-view.../download", "mime": "application/vnd...", "byte_length": 47213, "state": "complete"}}
+{"ok": true, "result": {"download_id": 43, "filename": "Quarterly-Report.docx", "url": "https://ppc-word-view.../download", "mime": "application/vnd...", "byte_length": 47213, "state": "complete"}}
 ```
 
 Neither `args.download_id` nor `args.since_id` given fails loud immediately (`"wait_download

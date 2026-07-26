@@ -64,7 +64,7 @@ are present but silently non-functional, and one (`sidePanel.getLayout()`) crash
 ## 3. Architecture
 
 ```
-┌─ device A: agent host (spark-1) ────────────────┐
+┌─ device A: agent host ───────────────────────────┐
 │                                                  │
 │   Agent(s) ──► Agent Surface (lib/CLI/MCP/tool)  │
 │                        │                         │
@@ -369,15 +369,15 @@ the "richest" frame's text as *the* result, demoting everything else to an `othe
 manifest. That is a policy decision -- "which frame's content does the caller actually want" --
 baked into a mechanism layer that has no business making it.
 
-It was also, provably, a *bad* policy decision. Live against a real SharePoint policy page
-(`Global-Travel-Policy.docx` embedded in a Word Online viewer), multi-frame `read` returned:
+It was also, provably, a *bad* policy decision. Live against a real SharePoint document page
+(`Quarterly-Report.docx` embedded in a Word Online viewer), multi-frame `read` returned:
 
 ```
 frames=7
   frame 0    2874 chars  page chrome
   frame 860  3608 chars  O365 token-factory bootstrap JS   <- heuristic picked THIS
-  frame 862   108 chars  Global-Travel-Policy.docx (ppc-word-view.officeapps.live.com)
-  frame 861     0 chars  Global-Travel-Policy.docx (sharepoint /:w:/r/...)
+  frame 862   108 chars  Quarterly-Report.docx (ppc-word-view.officeapps.live.com)
+  frame 861     0 chars  Quarterly-Report.docx (sharepoint /:w:/r/...)
   frame 864     6 chars  WacOAuth
 ```
 
