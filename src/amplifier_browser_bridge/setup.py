@@ -55,20 +55,27 @@ class ExtensionSourceNotFoundError(RuntimeError):
 
 
 def find_extension_source() -> Path:
-    """Locate the repo's `extension/` directory to stage from.
+    """Locate the `extension/` directory to stage from.
 
     Resolution order:
-        1. `ABB_EXTENSION_SRC` environment variable, if set.
-        2. Relative to this installed package's file -- works for the editable
-           source install this project documents today (`uv pip install -e .` from
-           inside a clone; see README.md/CONTRIBUTING.md). `src/amplifier_browser_bridge/
-           setup.py` -> parents[2] is the repo root.
+        1. `ABB_EXTENSION_SRC` environment variable, if set -- always wins, for the
+           rare case of a moved/custom extension source.
+        2. Packaged alongside the installed module: `pyproject.toml` force-includes
+           the whole `extension/` tree into the wheel at
+           `amplifier_browser_bridge/extension/` (see `[tool.hatch.build.targets.
+           wheel.force-include]`), so `Path(__file__).resolve().parent / "extension"`
+           finds it for ANY install made from that wheel -- `uv tool install .`,
+           `pip install .`, a published PyPI release, all of them. This is the path
+           real (non-editable) installs take.
+        3. Dev checkout fallback: `src/amplifier_browser_bridge/setup.py` ->
+           `parents[2]` is the repo root, so `parents[2] / "extension"` finds the
+           real source tree directly. This is the path an editable install
+           (`uv pip install -e .` from inside a clone) takes -- editable installs
+           import straight from the checkout, so `__file__` points at the actual
+           source file, not a copy, and the packaged copy from step 2 doesn't apply.
 
-    Raises `ExtensionSourceNotFoundError` (never guesses) if neither resolves to a
-    real directory containing `manifest.json` -- this project is not yet published as
-    a wheel bundling extension assets (see docs/AGENT_SURFACES.md's "Local development
-    note" for the same honest caveat about the sibling Amplifier tool module), so a
-    non-source install has no other way to find these files.
+    Raises `ExtensionSourceNotFoundError` (never guesses) if none of these resolve to
+    a real directory containing `manifest.json`.
     """
     override = os.environ.get("ABB_EXTENSION_SRC")
     if override:
@@ -79,16 +86,20 @@ def find_extension_source() -> Path:
             f"ABB_EXTENSION_SRC={override!r} does not contain manifest.json -- check the path."
         )
 
-    inferred = Path(__file__).resolve().parents[2] / "extension"
-    if (inferred / "manifest.json").is_file():
-        return inferred
+    packaged = Path(__file__).resolve().parent / "extension"
+    if (packaged / "manifest.json").is_file():
+        return packaged
+
+    dev_checkout = Path(__file__).resolve().parents[2] / "extension"
+    if (dev_checkout / "manifest.json").is_file():
+        return dev_checkout
 
     raise ExtensionSourceNotFoundError(
-        "Could not locate the extension/ source directory. This project is not yet "
-        "published as a standalone package with bundled extension assets -- `abb init` "
-        "expects to run from an editable install of a git checkout "
-        "(`uv pip install -e .` from inside the clone). If you've moved the extension "
-        "source elsewhere, set ABB_EXTENSION_SRC to its path."
+        f"Could not locate the extension/ source directory. Looked for a packaged "
+        f"copy at {packaged} and a dev checkout at {dev_checkout}, and found neither. "
+        "This should not happen for a normal `pip install`/`uv tool install` of this "
+        "package -- if you've moved the extension source elsewhere (or are running "
+        "from a nonstandard layout), set ABB_EXTENSION_SRC to its path."
     )
 
 

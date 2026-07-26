@@ -43,6 +43,17 @@ abb-mcp = "amplifier_browser_bridge.mcp_server:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/amplifier_browser_bridge"]
 
+# Ship the extension/ source tree inside the wheel so `abb init` can stage it from a
+# real (non-editable) install, not just an editable checkout -- see setup.py's
+# find_extension_source(). The whole directory is force-included (not a curated file
+# list) so the packaged set can never drift from what's actually needed: adding a new
+# extension file automatically ships, and the *.test.mjs dev-only files tag along as
+# harmless extra bytes rather than a second hardcoded list to keep in sync with
+# setup.py's _EXTENSION_FILES. tests/test_packaging.py builds a real wheel and asserts
+# every file _EXTENSION_FILES needs is actually present in it.
+[tool.hatch.build.targets.wheel.force-include]
+"extension" = "amplifier_browser_bridge/extension"
+
 [tool.ruff]
 line-length = 110
 target-version = "py311"
