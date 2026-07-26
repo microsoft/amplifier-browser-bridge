@@ -621,6 +621,18 @@ One test keeps passing but changes meaning and needs a companion:
 9. **A caller that declares broad scope, or a hub operator who disables the classifier.** The
    bridge supplies mechanism. It cannot supply judgment on the caller's behalf — which is the
    point of §5, and also its cost.
+9a. **FIX 3 (product review panel), `classify.ESCALATION_CATEGORIES`** (`permission_change` today
+   -- see `docs/POLICY.md` §3.1): a session's write scope covering an origin never implicitly
+   grants self-attestation for an escalation-classified action there -- `PolicyEngine.evaluate`
+   forces `redeem="unredeemable"` unless the session explicitly opted in via
+   `allow_self_attested_escalation=True`. This closes the specific gap named by two independent
+   review panels ("scope is the boundary" does not by itself prevent recurrence, since the
+   origin will almost always be in scope). **It is still bounded by item 1 above**: the signal
+   that assigns the `permission_change` category is the same page-asserted label/page-context
+   scoring (plus a browser-asserted URL pattern), so a page that disguises its elevation button's
+   label and avoids the URL pattern is never tagged into the category at all, and this mechanism
+   never engages. This raises the bar against the measured incident's own shape; it does not
+   close the hole a sufficiently disguised page can still walk through.
 10. **`scope.py` (Candidate C) is now implemented** (a later PR than the one that originally wrote
     this section). Session establishment, narrow-only/seal-on-first-read enforcement, and
     write-scope denial are wired into `PolicyEngine.evaluate`/`Hub.send_command` and surfaced on
@@ -1132,6 +1144,41 @@ to issue **no** observable request, case 2's synthetic fixture still proves the 
 design doc's §9 limits list must be amended to say so, and case 3 becomes the only live trigger
 for the bland-label path. **Do not paper over this with a fixture that asserts a fact nobody
 observed.**
+
+**Update (post-implementation review panel, priority finding): the "front door" replay, added.**
+`FLOW_URL`/`PAGE_TITLE` above were captured (see `tests/test_gate_elevation.py`'s module
+docstring); the remaining two facts (elevation click's request, page heading structure) were
+never observed and clicking through the flow to observe them is explicitly out of bounds for this
+project (it would re-trigger the real Administrator-elevation flow on the maintainer's actual,
+connected browser). What *was* still missing after cases 1-9 above: every one of them calls
+`PolicyEngine.evaluate` directly. None of them exercises `Hub.send_command` -- the single choke
+point (`hub.py`'s module docstring) an agent actually calls, which additionally resolves a click's
+label from its own snapshot cache (`_resolve_ref_hint`), enforces the gate before `_dispatch_live`
+ever runs, and attributes effects via `_ingest_result`. Two reviewers independently flagged this
+gap: *"you proved the escape hatch doesn't hold [scope.py denies out-of-scope actions]; you
+haven't shown me the front door holds [the gate itself, driven end-to-end]."*
+
+`tests/test_incident_replay.py` closes this, grounded ONLY in the same measured/observed facts as
+above (verbatim labels, observed URL shape and title template) with no new fabrication:
+
+- `test_incident_replay_gates_the_elevation_through_the_full_hub_pipeline` -- drives `snapshot`
+  -> `click` (BLAND_LABEL, allowed, reaches the device) -> `click` (ELEVATE_LABEL, gated) through
+  `Hub.send_command`, asserting the elevation click never reaches `_dispatch_live`/the device at
+  all (the front door holds) and is audited (`policy_gated`).
+- `test_confirmed_elevation_replay_is_attributed_end_to_end_through_the_full_hub_SYNTHETIC` --
+  extends this with an explicitly-labeled SYNTHETIC effects fixture (a POST, standing in for the
+  unverified real fact) to prove the confirm-then-redispatch path (D2) and effects attribution
+  (D3) are wired correctly through the full hub, not just through `PolicyEngine` in isolation.
+
+**A real, previously-undiscovered bug was found and fixed while building this replay**: `Hub.
+_send_and_await` filtered a device's result envelope down to `("ok", "result", "error")` before
+returning it on the immediate/live-dispatch path -- silently dropping the `effects` block
+`_ingest_result` had just attached. Attribution survived only on the `poll` path (`record.
+results[cmd_id]` stores the unfiltered envelope), never on the path an agent actually calls
+synchronously. This is exactly the "no indication anything happened" defect §1 exists to close,
+one layer further down than anyone had tested. Fixed by including `"effects"` in the retained key
+set (`hub.py`, `_send_and_await`); see git history for the exact diff. This is a direct, in-scope
+consequence of building the full-pipeline replay -- the replay is what surfaced it.
 
 ### 14.3 Other gates
 

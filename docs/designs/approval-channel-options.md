@@ -1,7 +1,9 @@
 # Options brief: the human-approval channel for `redeem: "out_of_band"`
 
-**Status:** **CANCELLED (2026-07-26, same day).** Phase 6 (a dedicated human-approval channel) will
-not be built. See §0 below for the decision, the evidence that forced it, and what would reopen it.
+**Status:** **CANCELLED FOR NOW (2026-07-26, same day).** Phase 6 (a dedicated human-approval
+channel) will not be built at this time -- this is a deliberate current decision, not a permanent
+architectural guarantee. See §0 below for the decision, the evidence that forced it, and the
+specific conditions that would reopen it.
 The remainder of this document is preserved as-written — the candidate analysis, the reachability
 measurements, and the residual-risk accounting are still the most complete record of why this is
 hard, and a future reader considering the same idea should read them before re-deriving this
@@ -73,9 +75,11 @@ session. **An unreachable human means a narrower session, not new infrastructure
 
 `redeem: "out_of_band"` is renamed to `redeem: "unredeemable"` — the honest name for what this
 value has done since the review-panel FAIL was closed (`docs/designs/confirmation-gate.md` §16.1):
-since no channel exists to redeem it, and per this cancellation none ever will, a confirmation
-declared this way cannot be redeemed at all, by any route, ever. This is not a temporary gap
-pending Phase 6; it is the permanent, correct behavior. It remains genuinely useful: declaring it
+since no channel exists to redeem it today, a confirmation declared this way cannot be redeemed at
+all, by any route that exists right now. This is not a temporary gap pending Phase 6 specifically
+(Phase 6 is cancelled for now, per §0 above) -- it is the correct behavior for as long as no
+channel exists, which is the current, deliberate state of this project, not a claim that no
+channel will ever exist. It remains genuinely useful regardless of that: declaring it
 is how an operator says "this session is unattended; a gate firing here means stop, not wait" —
 distinct from `redeem: "agent"`'s self-attestation, which is a real (if narrow) defense against an
 *accidental* click and no defense at all against an *injected* one. See `docs/PROTOCOL.md`,

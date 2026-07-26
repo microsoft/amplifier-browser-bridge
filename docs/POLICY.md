@@ -206,6 +206,41 @@ audited. A gate that fires returns `needs_confirmation` (see docs/PROTOCOL.md) i
 dispatching; the command reaches the device only after an explicit `confirm` call redeems the
 token.
 
+### 3.1 Escalation categories -- what a write scope can never implicitly include
+
+**FIX 3, product review panel (the most concrete ask against this design): "name and enforce an
+explicit deny-list of privilege/permission-escalating actions that no declared session scope can
+implicitly include."** The gap it closes: the measured incident happened while browsing
+`github.com`, and `github.com` will almost always be *in* a broadly-scoped session's `write` set,
+given the maintainer's own stated preference for broad access. So "the origin is in scope" cannot,
+by itself, be read as "and therefore this session may also confirm its own Administrator grant."
+
+`classify.ESCALATION_CATEGORIES` names the subset of the canonical seven that gets this extra
+guarantee -- today, just `permission_change` (the incident's own category; extend only when a
+second, real incident motivates it, per the two-implementation rule). When a classification lands
+in this set, `PolicyEngine.evaluate` forces the confirmation's redemption mode to
+`redeem="unredeemable"` -- **regardless of write scope, and regardless of the session's own
+declared `redeem`** -- unless the session was explicitly established with
+`allow_self_attested_escalation=True` (`abb session-establish --allow-self-attested-escalation`;
+`browser_establish_session(allow_self_attested_escalation=True)`). This field is structurally
+separate from `write`: `write` answers "what origins may this session mutate"; this field answers
+"may this session confirm its OWN privilege escalations," and the two are never conflatable. Like
+every other scope field, it can only narrow (`True -> False`) after establishment, never widen back.
+
+**Honest limit -- read this before treating the category assignment as a boundary.** The signal
+that assigns an action to `permission_change` is the SAME `classify.py` scoring already documented
+above as advisory: mostly the label/page-context channels (page-asserted, forgeable), plus the
+`/settings/permissions` URL pattern (browser-asserted). An adversarial page that labels its
+elevation button something bland ("Continue", "Cancel") and avoids the URL pattern is not
+classified as `permission_change` at all, and this mechanism never engages -- the category-tagging
+step inherits `classify.py`'s pre-existing limitation, it does not fix it. What this DOES
+change: for every action the classifier DOES correctly tag as `permission_change` (which now
+includes the measured incident's own label, `combine="all"` no longer required), self-attestation
+is no longer available by default, closing the specific "scope alone looks like protection but
+isn't" gap. **This raises the bar; it does not close the hole a sufficiently disguised page can
+still walk through** -- the same honest accounting §9 of `docs/designs/confirmation-gate.md`
+already gives the rest of this design.
+
 ### How detection works
 
 Two signal channels, defined in `policy.GATE_RULES`:

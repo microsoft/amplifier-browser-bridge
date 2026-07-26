@@ -342,17 +342,21 @@ by the agent's own process. This is enforced in `PolicyEngine.consume_confirmati
 a wrong-channel attempt does not consume the token (marking it "used" would claim a redemption that
 never happened), and is separately audited as `policy_confirmation_wrong_channel`.
 
-**There is no human-approval channel in this system, and there will not be one.** A dedicated
-out-of-band channel (the extension's own UI, pushed over the `/device` socket) was designed in
-detail in `docs/designs/approval-channel-options.md` and then **cancelled**: a live CDP experiment
+**There is no human-approval channel in this system today.** This is a deliberate current
+decision, not a permanent architectural guarantee. A dedicated out-of-band channel (the
+extension's own UI, pushed over the `/device` socket) was designed in detail in
+`docs/designs/approval-channel-options.md` and then **cancelled for now**: a live CDP experiment
 showed the strongest candidate could be driven by the very agent it needed to exclude (see that
-doc's cancellation note), and the simpler fix -- a narrower session `write` scope, already built
-via `establish_session`/`narrow_scope` below -- was available the whole time. `redeem:
-"unredeemable"` is the honest name for what declaring it does: a session that declares it is
-saying "this session is unattended; a gate here is a permanent stop, not a wait." Its gated actions
-can never be confirmed, by any route, ever -- not a temporary gap pending a future channel. **If an
-action must not happen unattended, the way to prevent it is to not grant it in the session's write
-scope** (see `establish_session` below), not to rely on a gate firing and a human approving it.
+doc's cancellation note, section 0), and the simpler fix -- a narrower session `write` scope,
+already built via `establish_session`/`narrow_scope` below -- was available the whole time. That
+same section names what would reopen the decision: a channel whose security property is measured
+against every capability the agent holds (not just the one this experiment tested), or a
+per-session way to deny `chrome.debugger` entirely. `redeem: "unredeemable"` is the honest name for
+what declaring it does today: a session that declares it is saying "this session is unattended; a
+gate here is a permanent stop, not a wait." Its gated actions can never be confirmed, by any route
+that exists right now. **If an action must not happen unattended, the way to prevent it today is
+to not grant it in the session's write scope** (see `establish_session` below), not to rely on a
+gate firing and a human approving it.
 
 ### `establish_session` (agent -> hub) / `result` (hub -> agent)
 
@@ -365,7 +369,7 @@ fully permissive (matching every caller that predates sessions):
 {
   "v": 1, "id": "...", "type": "establish_session",
   "read": "*", "write": ["github.com"], "on_unknown": "allow", "redeem": "agent",
-  "unattended": false, "token": "..."
+  "unattended": false, "allow_self_attested_escalation": false, "token": "..."
 }
 ```
 
@@ -374,9 +378,20 @@ fully permissive (matching every caller that predates sessions):
   "v": 1, "id": "...", "type": "result",
   "ok": true, "session_id": "9f2c...hex",
   "scope": {"session_id": "9f2c...hex", "read": "*", "write": ["github.com"],
-            "on_unknown": "allow", "redeem": "agent", "unattended": false, "sealed": false}
+            "on_unknown": "allow", "redeem": "agent", "unattended": false,
+            "allow_self_attested_escalation": false, "sealed": false}
 }
 ```
+
+**`allow_self_attested_escalation` (FIX 3, product review panel) defaults to `false`.** Even
+when `write` covers the origin, an action `classify.py` scores into `ESCALATION_CATEGORIES`
+(today, just `permission_change` -- the measured incident's own category) is forced to
+`redeem: "unredeemable"` regardless of write scope and regardless of this session's own
+`redeem` value, unless this field was explicitly `true` here at establishment. `write` is an
+origin allowlist; it never implies "and may also self-attest its own escalations there" -- see
+`docs/POLICY.md` §3.1 for the full reasoning and its honest limits. Like every other scope
+field, this narrows one-way (`true -> false`) via `narrow_scope` and can never be turned back on
+for an existing session.
 
 The hub **always** mints a fresh `session_id` (a `uuid4`) and never accepts a caller-supplied
 one -- this is what stops `establish_session` from ever being replayed against an existing

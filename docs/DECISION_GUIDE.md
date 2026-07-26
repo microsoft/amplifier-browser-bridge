@@ -158,6 +158,19 @@ abb click d1/7 e12 --session 9f2c...hex
 (MCP: `browser_establish_session(write="github.com,contoso.com")` then pass the returned
 `session_id` to `browser_click`/`browser_type`/`browser_key`/`browser_navigate`.)
 
+**Declaring a broad (or even narrow-but-including-the-right-origin) write scope does NOT, by
+itself, let this session confirm its own privilege escalations there.** `permission_change` --
+the measured incident's own category -- is an "escalation category"
+(`classify.ESCALATION_CATEGORIES`): even when the origin is in scope, a gate on this category is
+forced to `redeem="unredeemable"` unless you separately, explicitly pass
+`--allow-self-attested-escalation` / `allow_self_attested_escalation=True` at
+`session-establish` time. This closes a gap named by two independent review panels: the incident
+happened while browsing `github.com`, and `github.com` will almost always be in scope for a task
+that needs to be there at all -- so "I declared a scope" must not be mistaken for "and therefore
+I can also grant myself Administrator." See `docs/POLICY.md` §3.1 for the honest limits of the
+signal that assigns this category (it raises the bar; it does not close the hole a sufficiently
+disguised page can still walk through).
+
 A `click`/`type`/`key`/`navigate` outside the declared write scope is **denied outright**,
 before classification even runs -- this is prevention, not detection, and it is the one
 pre-execution signal a page cannot touch at all (`docs/designs/confirmation-gate.md` section 2's
@@ -169,15 +182,17 @@ task's origins aren't known ahead of time, or you want the maintainer's own broa
 stance, skip this and rely on classification/effects/flow elevation instead -- scope is opt-in,
 not a required step.
 
-**There is no human-in-the-loop approval anywhere in this system, and there will not be one.**
-`redeem: "agent"` (the default confirmation mode) is self-attestation -- it makes the *agent*
-double-check itself, and defends against an accidental click, never an injected one. A dedicated
-human-approval channel was designed in detail and then deliberately cancelled (see
+**There is no human-in-the-loop approval anywhere in this system today.** This is a deliberate
+current decision, not a permanent architectural guarantee -- see `docs/designs/
+approval-channel-options.md` section 0 for what would reopen it. `redeem: "agent"` (the default
+confirmation mode) is self-attestation -- it makes the *agent* double-check itself, and defends
+against an accidental click, never an injected one. A dedicated human-approval channel was
+designed in detail and then deliberately cancelled for now (see
 `docs/designs/approval-channel-options.md`); `redeem: "unredeemable"` names what's left honestly --
 a session declaring it is choosing "a gate here is a permanent stop, nobody redeems it," not "a
-human will be asked." **If an action must not happen unattended, the only real lever is scope: do
-not grant write access to the origin it needs.** Confirmation gates are a safety net against
-mistakes, not a substitute for declaring what a session may do.
+human will be asked." **If an action must not happen unattended, the only real lever today is
+scope: do not grant write access to the origin it needs.** Confirmation gates are a safety net
+against mistakes, not a substitute for declaring what a session may do.
 
 ## "The action I'm about to take might be consequential"
 

@@ -289,15 +289,20 @@ Read [docs/POLICY.md](docs/POLICY.md) in full before relying on this for anythin
 threat model it targets -- it documents, plainly, what the denylist cannot see and which
 confirmation gates have no real detection signal wired up yet in this phase.
 
-**There is no human-in-the-loop approval in this system, and there will not be one.** A
-confirmation gate's default redemption mode (`redeem: "agent"`) is self-attestation -- the agent
-makes a second, separately-audited decision, which defends against an accidental action and
-nothing else. A dedicated human-approval channel was designed in detail and then deliberately
-cancelled (see [docs/designs/approval-channel-options.md](docs/designs/approval-channel-options.md)):
+**There is no human-in-the-loop approval in this system today.** This is a deliberate current
+decision, not a permanent architectural guarantee -- the maintainer's own words: *"I can live with
+`redeem: agent` for now."* A confirmation gate's default redemption mode (`redeem: "agent"`) is
+self-attestation -- the agent makes a second, separately-audited decision, which defends against an
+accidental action and nothing else. A dedicated human-approval channel was designed in detail and
+then deliberately cancelled for now (see
+[docs/designs/approval-channel-options.md](docs/designs/approval-channel-options.md) section 0):
 a live experiment showed the strongest candidate could be driven by the very agent it needed to
-exclude. **If an action must not happen unattended, the only real lever is session scope** --
-declare a narrow `write` scope up front (`abb session-establish`) so the action is denied outright,
-rather than relying on a gate that a human will never actually see.
+exclude. That same section names the two conditions that would reopen it: a channel whose
+security property is measured against every capability the agent holds (not just the one this
+experiment tested), or a per-session way to deny `chrome.debugger` entirely so an agent can't reach
+CDP at all. Absent either, **the only real lever today is session scope** -- declare a narrow
+`write` scope up front (`abb session-establish`) so the action is denied outright, rather than
+relying on a gate that a human will never actually see.
 
 ## Platform support
 
