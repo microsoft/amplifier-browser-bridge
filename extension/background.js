@@ -10,7 +10,7 @@
 // executed exactly as the hub asked; denylists/consent gates are a later phase and
 // belong in the hub, not here.
 
-import { HUB_URL, HUB_TOKEN } from "./config.js";
+import { validateHubUrl, isConfigured } from "./config_validate.mjs";
 import { parseQualifiedRef, qualifyRef, qualifySnapshotResult } from "./frame_refs.mjs";
 import { combineRead, combineSnapshot } from "./combine_frames.mjs";
 import { DEFAULT_MAX_FETCH_BYTES, checkSizeCap, bytesToBase64 } from "./fetch_utils.mjs";
@@ -36,6 +36,58 @@ let reconnecting = false; // single-flight guard -- see scheduleReconnect()
 let reconnectAttempt = 0;
 let heartbeatTimer = null;
 let heartbeatSeq = 0;
+
+// ---------------------------------------------------------------------------
+// Runtime configuration -- hub URL + shared token, read from chrome.storage.local
+// (keys: abb_hub_url, abb_hub_token), entered once through options.html/options.js.
+//
+// This used to be a tracked source file (extension/config.js) with a real-looking
+// placeholder credential (HUB_TOKEN = "dev-local-token-change-me") that a user had to
+// hand-edit, and that every `git pull` / file-copy update silently overwrote -- see
+// SCRATCH.md and the README's "Setup" section for the incident that motivated this.
+// chrome.storage.local is keyed to the extension's install identity (stable as long as
+// an unpacked install is loaded from the same directory path -- see `abb init`'s staging
+// directory), not to any file on disk, so re-copying extension/*.js over an existing
+// install can never destroy a configured token/hub-url the way overwriting config.js did.
+//
+// `configured` gates whether connect() ever attempts a WebSocket at all (see connect()
+// below and this module's "fail loud when unconfigured" section) -- this is deliberately
+// NOT the same thing as "the hub will accept it"; that's `token_match`, checked by
+// `abb doctor`, not something the extension can know in advance of trying.
+let hubUrl = null;
+let hubToken = null;
+let configured = false;
+
+async function loadConfig() {
+  const stored = await chrome.storage.local.get(["abb_hub_url", "abb_hub_token"]);
+  const validation = validateHubUrl(stored.abb_hub_url);
+  configured = isConfigured({ hubUrl: stored.abb_hub_url });
+  hubUrl = validation.valid ? validation.normalized : null;
+  hubToken = typeof stored.abb_hub_token === "string" ? stored.abb_hub_token : "";
+  return { configured, hubUrl, hubToken, error: validation.error };
+}
+
+// ---------------------------------------------------------------------------
+// Status badge -- the extension's only UI surface besides options.html. Exists so
+// "unconfigured" and "connection error" are LEGIBLE at a glance instead of a silent
+// connect loop the user has no way to diagnose (the specific failure mode a real
+// deployment hit: auth silently failed and the only symptom was the extension simply
+// never showing up in `abb devices`, with nothing in the UI explaining why).
+// ---------------------------------------------------------------------------
+
+const BADGE_STATE = {
+  unconfigured: { text: "!", color: "#d9534f", title: "Amplifier Browser Bridge: NOT CONFIGURED -- click the toolbar icon to set the hub URL and token." },
+  connecting: { text: "\u2026", color: "#f0ad4e", title: "Amplifier Browser Bridge: connecting..." },
+  connected: { text: "", color: "#5cb85c", title: "Amplifier Browser Bridge: connected." },
+  error: { text: "\u00d7", color: "#d9534f", title: "Amplifier Browser Bridge: connection error -- click the toolbar icon for options." },
+};
+
+function setBadge(state) {
+  const spec = BADGE_STATE[state] || BADGE_STATE.error;
+  chrome.action.setBadgeText({ text: spec.text });
+  chrome.action.setBadgeBackgroundColor({ color: spec.color });
+  chrome.action.setTitle({ title: spec.title });
+}
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -180,18 +232,39 @@ async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return; // already connected/connecting -- connect() itself is also single-flight
   }
+
+  await loadConfig();
+  if (!configured) {
+    // Fail loud and legibly, never a silent connect loop against an undefined/invalid
+    // URL. The real incident this guards against: auth silently failed and the only
+    // symptom was the extension never appearing in `abb devices`, with nothing in the
+    // UI explaining why. See this module's "Runtime configuration" section above --
+    // storage.onChanged (wired at the bottom of this file) re-triggers connect() the
+    // moment the options page saves a valid config, so no manual reload is needed.
+    console.warn(
+      "amplifier-browser-bridge: not configured (no valid Hub URL in chrome.storage.local). " +
+        "Click the extension's toolbar icon to open its options page and set the Hub URL/token."
+    );
+    setBadge("unconfigured");
+    return;
+  }
+
+  setBadge("connecting");
   await ensureIdentity();
   if (!capabilities) capabilities = await probeCapabilities();
 
   try {
-    ws = new WebSocket(HUB_URL);
-  } catch {
+    ws = new WebSocket(hubUrl);
+  } catch (err) {
+    console.error("amplifier-browser-bridge: failed to open WebSocket to", hubUrl, err);
+    setBadge("error");
     scheduleReconnect();
     return;
   }
 
   ws.addEventListener("open", () => {
     reconnectAttempt = 0;
+    setBadge("connected");
     sendHello();
     startHeartbeat();
   });
@@ -202,6 +275,7 @@ async function connect() {
 
   ws.addEventListener("close", () => {
     stopHeartbeat();
+    setBadge("error");
     scheduleReconnect();
   });
 
@@ -222,7 +296,7 @@ function sendHello() {
     platform: navigator.platform || "unknown",
     capabilities,
     protocol_version: PROTOCOL_VERSION,
-    token: HUB_TOKEN,
+    token: hubToken,
   });
 }
 
@@ -1593,11 +1667,56 @@ if (typeof chrome.debugger !== "undefined" && chrome.debugger.onDetach) {
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+  // First-run UX: open the options page immediately so a fresh install's very first
+  // screen is "set the hub URL/token", not a silently-failing connection attempt.
+  // Harmless on a re-install/update of an already-configured install -- an extra tab
+  // the user can close; it never touches the config already sitting in
+  // chrome.storage.local (see this file's "Runtime configuration" section).
+  chrome.runtime.openOptionsPage();
   connect();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   connect();
+});
+
+// The toolbar icon has no default_popup (see manifest.json's "action" key) specifically
+// so a click always reaches this handler -- the options page IS the extension's only UI.
+chrome.action.onClicked.addListener(() => {
+  chrome.runtime.openOptionsPage();
+});
+
+// Saving valid config on the options page re-triggers connect() immediately, rather than
+// waiting for the next alarm tick (up to 30s) -- see options.js's save handler.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if ("abb_hub_url" in changes || "abb_hub_token" in changes) {
+    reconnectAttempt = 0;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        // already closed/closing -- connect() below handles re-establishing either way
+      }
+    }
+    connect();
+  }
+});
+
+// Status query for options.js -- never echoes the token back (options.js reads that
+// directly from chrome.storage.local itself for prefill; this is purely "are we
+// connected right now" for the options page's live status line).
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message && message.type === "abb_get_status") {
+    sendResponse({
+      configured,
+      connected: !!(ws && ws.readyState === WebSocket.OPEN),
+      hubUrl,
+      deviceId,
+    });
+    return true;
+  }
+  return false;
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {

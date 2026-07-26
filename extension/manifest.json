@@ -7,6 +7,13 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "action": {
+    "default_title": "Amplifier Browser Bridge -- click to configure"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
   "permissions": [
     "scripting",
     "tabs",
