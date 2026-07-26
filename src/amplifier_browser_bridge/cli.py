@@ -23,9 +23,11 @@ from .addressing import TargetError, parse_target
 from .audit import AuditLog
 from .auth import load_token_store
 from .client import HubClient, HubError
+from .doctor import run_doctor
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
+from .setup import DEFAULT_STAGE_DIR, ExtensionSourceNotFoundError, ensure_token_file, stage_extension
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
@@ -697,6 +699,112 @@ def reload(device: str) -> None:
     into a version that understands it.
     """
     _run_command(device, "reload", {})
+
+
+@main.command()
+@click.option(
+    "--dest",
+    default=None,
+    help=f"Directory to stage the extension into (default: {DEFAULT_STAGE_DIR}). Stable across "
+    "re-runs -- an unpacked extension's identity (and its chrome.storage.local config) is tied "
+    "to this exact path, so re-running `abb init` after a `git pull` overwrites the JS/HTML/"
+    "manifest files here WITHOUT disturbing a previously-configured token/hub-url.",
+)
+@click.option("--token-file", default=None, help="Path to the hub token file (see auth.py docstring).")
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Regenerate the token even if one already exists at --token-file. Rotating a token "
+    "requires re-pasting it into the extension's options page afterward.",
+)
+@click.option(
+    "--hub-host", default="0.0.0.0", show_default=True, help="Host to print in the printed `abb hub` command."
+)
+@click.option(
+    "--hub-port",
+    default=DEFAULT_PORT,
+    show_default=True,
+    help="Port to print in the printed `abb hub` command.",
+)
+def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, hub_port: int) -> None:
+    """First-run setup: generate a hub token, stage the extension, print next steps.
+
+    Does three things, each idempotent (safe to re-run, e.g. after `git pull`):
+
+    \b
+    1. Ensures a hub token exists (generates one on first run; reuses it on later
+       runs unless --force).
+    2. Stages the extension's runtime files into a stable directory (default under
+       ~/.local/share) -- NOT this repo checkout, so re-running after an update
+       never changes the path an already-loaded extension was loaded from, which is
+       what lets its saved chrome.storage.local config survive the update.
+    3. Prints the exact remaining manual steps. Loading an unpacked extension in
+       edge://extensions IS a manual step (Edge has no CLI/API for it) -- this command
+       does not pretend otherwise.
+    """
+    try:
+        token_result = ensure_token_file(token_file, force=force)
+    except OSError as e:
+        raise click.ClickException(f"could not write token file: {e}") from e
+
+    try:
+        staged_dir = stage_extension(dest)
+    except ExtensionSourceNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+
+    action = "Generated new" if token_result.created_new else "Reusing existing"
+    click.echo(f"{action} hub token (stored in {token_result.token_file}).")
+    click.echo(f"Staged extension -> {staged_dir}")
+    click.echo("")
+    click.echo("Remaining steps (manual -- Edge has no CLI for these):")
+    click.echo("")
+    click.echo("  1. Start the hub:")
+    click.echo(f"       ABB_TOKEN_FILE={token_result.token_file} abb hub --host {hub_host} --port {hub_port}")
+    click.echo("")
+    click.echo("  2. Load the extension:")
+    click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
+    click.echo(f"       select: {staged_dir}")
+    click.echo("")
+    click.echo("  3. Configure it:")
+    click.echo("       Click the extension's toolbar icon (its only UI) to open the options page.")
+    click.echo("       Hub URL: ws://<this machine's tailnet IP>:" + f"{hub_port}/device")
+    click.echo(f"       Token:   {token_result.token}")
+    click.echo("       Click Save.")
+    click.echo("")
+    click.echo("  4. Confirm it worked:")
+    click.echo(f"       ABB_TOKEN={token_result.token} abb doctor --hub-url ws://127.0.0.1:{hub_port}/agent")
+
+
+@main.command()
+@click.option(
+    "--hub-url",
+    default=None,
+    help="Hub agent-route URL to check (default: $ABB_HUB_URL or ws://127.0.0.1:8900/agent).",
+)
+@click.option("--token", default=None, help="Token to check (default: $ABB_TOKEN).")
+@click.option("--token-file", default=None, help="Path to the hub's token file, for the local-only checks.")
+def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> None:
+    """Diagnose the setup chain: token file, hub reachability, token match, device connected.
+
+    Each check reports ok/fail; once a check fails, checks that depend on it report
+    'skipped' with a reason rather than a confusing second failure -- fix the first
+    failure and re-run.
+    """
+    effective_url = hub_url or DEFAULT_HUB_URL
+    effective_token = token if token is not None else DEFAULT_TOKEN
+    checks = asyncio.run(run_doctor(effective_url, effective_token, token_file))
+
+    any_failed = False
+    for check in checks:
+        icon = {"ok": "[ok]  ", "fail": "[FAIL]", "skipped": "[skip]"}[check.status]
+        click.echo(f"{icon} {check.name}: {check.message}")
+        if check.status == "fail":
+            any_failed = True
+
+    if any_failed:
+        raise click.ClickException("one or more checks failed -- see above.")
+    click.echo("\nAll checks passed.")
 
 
 @main.command()
