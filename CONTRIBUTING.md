@@ -99,10 +99,23 @@ At minimum, verify syntax before submitting a change:
 node --input-type=module --check < extension/background.js
 node --input-type=module --check < extension/config.js
 node --input-type=module --check < extension/injected.js
+node --input-type=module --check < extension/frame_refs.mjs
+node --input-type=module --check < extension/combine_frames.mjs
+node --input-type=module --check < extension/download_claim.mjs
+node --input-type=module --check < extension/fetch_utils.mjs
 ```
 
 (`--input-type=module` is required because these files use ES module `import`/`export` syntax
 without a `package.json` declaring `"type": "module"`.)
+
+Pure logic extracted for testability (frame-ref qualification, frame-combine strategy,
+download-claiming, byte-cap/base64 helpers) lives in dependency-free `.mjs` modules with
+ZERO `chrome.*` usage, each with a companion `*.test.mjs` -- run with Node's built-in test
+runner:
+
+```bash
+node --test extension/*.test.mjs
+```
 
 ## Engineering conventions this project holds you to
 

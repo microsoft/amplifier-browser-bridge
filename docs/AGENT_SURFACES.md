@@ -5,15 +5,15 @@ Phase 1. This doc covers the two Phase 2 surfaces -- both are thin adapters over
 the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
-Both surfaces expose the same sixteen tools, named `browser_<command>` (mirroring
+Both surfaces expose the same twenty-two tools, named `browser_<command>` (mirroring
 Playwright MCP's vocabulary, design doc section 9):
 
 | Tool | Command | Notes |
 |---|---|---|
 | `browser_devices` | `list_devices` | Entry point -- call first |
-| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values |
-| `browser_snapshot` | `snapshot` | Accessibility-style tree with element `ref`s |
-| `browser_read` | `read` | Full visible text |
+| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status` |
+| `browser_snapshot` | `snapshot` | Accessibility-style tree with element `ref`s; optional `wake` (see Discarded tabs, docs/PROTOCOL.md) |
+| `browser_read` | `read` | Full visible text; optional `wake` |
 | `browser_click` | `click` | `ref` |
 | `browser_type` | `type` | `ref`, `text` |
 | `browser_key` | `key` | `key`, optional `ref` |
@@ -26,6 +26,7 @@ Playwright MCP's vocabulary, design doc section 9):
 | `browser_wait_for` | `wait_for` | `selector`, `timeout_ms` |
 | `browser_wait_text` | `wait_text` | `text`, `timeout_ms` |
 | `browser_poll` | (agent-only `poll`) | check on / retrieve a previously queued command |
+| `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) |
 
 See `docs/PROTOCOL.md` for the exact command semantics and `docs/designs/browser-bridge.md`
 for the addressing model (`device_id` -> `window_id`/`tab_id` -> `ref`) and the

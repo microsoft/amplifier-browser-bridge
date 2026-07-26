@@ -23,6 +23,14 @@ class QueuedCommand:
     command: str
     args: dict[str, Any] = field(default_factory=dict)
     enqueued_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # Per-command override of the hub's device-round-trip wait (see hub.py's
+    # DEFAULT_COMMAND_TIMEOUT / MIN_COMMAND_TIMEOUT / MAX_COMMAND_TIMEOUT and
+    # protocol.py's HUB_ONLY_ARGS["timeout_s"]). `None` means "use the hub's
+    # configured default". Stored on the command itself (not just consulted at
+    # enqueue time) so a command that queues on a non-live device and drains
+    # later still honors the caller's requested timeout instead of silently
+    # reverting to the hub default on drain.
+    timeout: float | None = None
 
 
 class DeviceCommandQueue:

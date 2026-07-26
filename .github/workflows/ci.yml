@@ -62,7 +62,10 @@ jobs:
       - name: Syntax-check every extension script
         run: |
           set -e
-          for f in extension/*.js; do
+          for f in extension/*.js extension/*.mjs; do
             echo "Checking $f"
             node --input-type=module --check < "$f"
           done
+
+      - name: Run extension unit tests (pure, chrome-free modules)
+        run: node --test extension/*.test.mjs

@@ -19,6 +19,16 @@ This is the single log both dispatch events and policy decisions are recorded to
     policy_denied                a target matched the denylist; command refused
     policy_tab_hidden            a `tabs` result entry was filtered out (response-
                                   path invisibility -- see policy.py)
+    policy_tab_shown_despite_match  an `auth`-category match was NOT hidden because
+                                  the tab is discarded (no live renderer -- see
+                                  policy.py's `_tab_discarded` docstring, Bug 2 case
+                                  study: background tabs frozen mid-way through a
+                                  first-party app's silent OAuth session-refresh
+                                  redirect through an identity-provider host)
+    policy_allowed_despite_match  request-path symmetric case of the above -- a
+                                  command targeting a discarded `auth`-category tab
+                                  was allowed to reach the device (which still
+                                  refuses to act on it unless `wake=true`)
     policy_gated                 an irreversible/world-visible action was detected;
                                   a confirmation token was issued instead of dispatching
     policy_confirmed             a confirmation token was redeemed; the original
