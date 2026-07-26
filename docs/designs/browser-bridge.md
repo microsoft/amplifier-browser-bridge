@@ -353,6 +353,65 @@ Steps 1–3 are the critical path. Everything else is additive.
 5. **Android reach:** sideload-on-Canary (works today, proven) vs. applying to Microsoft's
    Edge Android allowlist (requires submitting QA test cases).
 
+## 13. Mechanism, not policy
+
+This system is a substrate, not a decision-maker. Different agents, in different situations,
+will want different extraction strategies for the same page. The bridge's job is to expose
+capabilities with honest, predictable semantics -- never to choose on the caller's behalf, and
+never to silently substitute one capability for another. Concretely, this rules out: silent
+fallbacks, automatic escalation between materially different paths, and heuristics that pick a
+"best" answer when the caller could have picked better with the raw facts.
+
+### The worked example of getting it wrong
+
+`read`'s frame-combine logic originally ranked every frame by character count and returned only
+the "richest" frame's text as *the* result, demoting everything else to an `other_frames`
+manifest. That is a policy decision -- "which frame's content does the caller actually want" --
+baked into a mechanism layer that has no business making it.
+
+It was also, provably, a *bad* policy decision. Live against a real SharePoint policy page
+(`Global-Travel-Policy.docx` embedded in a Word Online viewer), multi-frame `read` returned:
+
+```
+frames=7
+  frame 0    2874 chars  page chrome
+  frame 860  3608 chars  O365 token-factory bootstrap JS   <- heuristic picked THIS
+  frame 862   108 chars  Global-Travel-Policy.docx (ppc-word-view.officeapps.live.com)
+  frame 861     0 chars  Global-Travel-Policy.docx (sharepoint /:w:/r/...)
+  frame 864     6 chars  WacOAuth
+```
+
+The richest frame by character count was an auth/bootstrap iframe's inlined JS config blob, not
+the actual policy document. A char-count heuristic has no way to distinguish "verbose bootstrap
+JS" from "the document that matters" -- it isn't equipped to, and it was never going to be,
+because that judgment depends on what the *caller* is looking for, which this layer cannot
+know. `read` now returns every frame's content uniformly (see docs/PROTOCOL.md's "Frames"
+section) -- the caller decides which frame's text matters.
+
+### The Word Online finding
+
+Frame 862's entire DOM text, in the case above, was `"PAGE 1 OF 5 | CONFIDENTIAL\INTERNAL
+ONLY | OUTER RING (PPE) : TUS1 | 88%"`. Word Online renders the document to `<canvas>` --
+**there is no document text in the DOM at all.** No combine strategy, however clever, can
+surface content that was never placed in the DOM as text. This is a structural limit, not a
+tuning problem: getting that content requires either fetching the underlying file directly
+(`fetch_bytes`/`grab_image`) or capturing pixels (`screenshot`). Both are documented in
+docs/PROTOCOL.md's "Content-extraction mechanisms" section as distinct, named commands -- not
+as an automatic fallback `read` reaches for when its own result looks thin. Judging "this
+result looks thin, canvas-rendered content is likely" is itself exactly the kind of heuristic
+substitution this principle forbids; the discoverability lives in documentation and in error
+text that names the alternative on genuine failure, never in silent automatic escalation.
+
+### The test to apply going forward
+
+Before adding any combine/selection/fallback logic to this codebase, ask: "could two reasonable
+agents, in two different situations, want different behavior here?" If yes, it is policy, and
+it does not belong in the mechanism layer -- expose the raw facts (every frame, every
+capability, every error) and let the caller decide. Where two materially different mechanisms
+solve overlapping problems (`fetch_bytes` vs. `grab_image`; `all_frames=true` vs. `frame_id`
+targeting), keep them as distinct, separately-invokable commands rather than folding one into
+the other's internals.
+
 ## 12. Known unknowns
 
 - Occlusion behavior on **Windows** — different code path (`CalculateNativeWinOcclusion`) than

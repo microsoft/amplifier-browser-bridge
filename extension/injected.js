@@ -20,10 +20,12 @@ if (!window.__abb) {
     const elementToRef = new WeakMap(); // Element -> ref string
 
     // Depth-first traversal that pierces shadow roots (open shadow DOM only -- closed
-    // shadow roots are, by design, unreachable from any script). Same-origin iframes
-    // are not descended into here; cross-frame traversal is a documented limitation of
-    // this phase, not a silent gap -- executeScript's `allFrames` option is the
-    // extension-side complement for callers that need it.
+    // shadow roots are, by design, unreachable from any script). Does NOT descend into
+    // iframes -- injected.js runs independently in every frame chrome.scripting's
+    // `allFrames: true` targets (background.js's `runInPage`/`runMultiFrame`), so
+    // cross-frame traversal happens by injecting into each frame separately, not by
+    // reaching across frame boundaries from here. See frame_refs.js for how refs
+    // produced by different frames are kept unambiguous.
     function deepQueryAll(root) {
       const out = [];
       const walk = (node) => {
@@ -119,6 +121,20 @@ if (!window.__abb) {
       "SUMMARY",
     ]);
 
+    // Best-effort manifest of this frame's OWN direct <iframe>/<frame> children --
+    // used by background.js's multi-frame combine (runMultiFrame/combineRead/
+    // combineSnapshot) to report which declared child frames never produced a
+    // result (sandboxed without allow-scripts, opaque/cross-origin-blocked, not
+    // yet loaded, or removed mid-call). This is NOT a cross-frame reach: it only
+    // ever looks at elements in THIS frame's own document, same as everything
+    // else in this file.
+    function listChildFrames() {
+      return Array.from(document.querySelectorAll("iframe, frame")).map((f) => ({
+        src: f.src || f.getAttribute("src") || null,
+        name: f.getAttribute("name") || null,
+      }));
+    }
+
     function snapshot() {
       const elements = deepQueryAll(document.body);
       const nodes = [];
@@ -134,7 +150,11 @@ if (!window.__abb) {
         if (el.tagName === "INPUT") node.input_type = el.type;
         nodes.push(node);
       }
-      return { url: location.href, title: document.title, nodes };
+      // child_frames is frame-local (this frame's own iframe children); refs in
+      // `nodes` are frame-local too (background.js qualifies them with this
+      // frame's frameId when combining results from allFrames:true -- see
+      // frame_refs.js and background.js's combineSnapshot()).
+      return { url: location.href, title: document.title, nodes, child_frames: listChildFrames() };
     }
 
     // Resolve a ref to its viewport-space bounding rect, WITHOUT dispatching
