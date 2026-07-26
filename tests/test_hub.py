@@ -289,7 +289,15 @@ def test_session_scope_survives_device_disconnect_and_reconnect(tmp_path: Any) -
 def test_confirm_replay_is_rechecked_against_the_original_sessions_scope(tmp_path: Any) -> None:
     """Scope enforcement runs BEFORE skip_gate (design doc section 12) -- a
     gate fired under one session's scope must be re-checked against that
-    SAME scope on redemption, not dispatched scope-free."""
+    SAME scope on redemption, not dispatched scope-free.
+
+    `allow_self_attested_escalation=True` is declared explicitly here (FIX 3,
+    product review panel): the elevate label classifies as `permission_change`,
+    an ESCALATION_CATEGORIES member, which is now forced to
+    `redeem="unredeemable"` regardless of write scope UNLESS a session opts in
+    -- this test's purpose is the scope-recheck-on-redeem property, not the
+    escalation lock itself (see `tests/test_escalation_category.py` for that).
+    """
     hub = _hub(tmp_path)
     record = hub.registry.get_or_create("d1")
     fake_ws = FakeDeviceSocket(record, canned_result={"ok": True, "result": {"ref": "e1"}})
@@ -297,7 +305,7 @@ def test_confirm_replay_is_rechecked_against_the_original_sessions_scope(tmp_pat
     record.touch()
     # In scope for github.com; the classifier fires on the elevate label
     # regardless (label-alone gate, case 1's exact configuration).
-    scope = hub.establish_session(write=["github.com"])
+    scope = hub.establish_session(write=["github.com"], allow_self_attested_escalation=True)
 
     async def gate() -> dict[str, Any]:
         return await hub.send_command(

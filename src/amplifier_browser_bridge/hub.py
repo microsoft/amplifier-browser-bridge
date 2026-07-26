@@ -1164,7 +1164,17 @@ class Hub:
             self._inflight.pop(cmd.id, None)
             return {"ok": False, "error": str(e)}
 
-        return {k: v for k, v in result_env.items() if k in ("ok", "result", "error")}
+        # "effects" (D3 attribution, effects.py) must survive this filter --
+        # discovered by the incident-replay test (tests/test_incident_replay.py,
+        # FIX 2): `_ingest_result` attaches it to `result_env` for every
+        # STATE_CHANGING_COMMANDS result, but this method was dropping it again
+        # on the immediate/live-dispatch response path (it survived only on the
+        # `poll` path, via `record.results[cmd_id]` storing the full env before
+        # this filter ever runs). Silently losing attribution on the path an
+        # agent actually calls synchronously is exactly the "no indication
+        # anything happened" defect docs/designs/confirmation-gate.md section
+        # 1 exists to close -- it must not reappear one layer down.
+        return {k: v for k, v in result_env.items() if k in ("ok", "result", "error", "effects")}
 
     # ------------------------------------------------------------------
     # Kill switch -- design doc §6.2: "Revocation: disable the extension, or a
