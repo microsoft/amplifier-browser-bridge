@@ -31,6 +31,12 @@ class QueuedCommand:
     # later still honors the caller's requested timeout instead of silently
     # reverting to the hub default on drain.
     timeout: float | None = None
+    # The session_id (if any) this command was dispatched under -- carried
+    # through so `Hub._ingest_result` can seal that session's SessionScope
+    # the moment a `read`/`snapshot`/`tabs` result yields page content back
+    # to the caller (design doc section 11.2/15 step 5, scope.py). `None`
+    # for every call site that predates sessions -- additive, not required.
+    session_id: str | None = None
 
 
 class DeviceCommandQueue:

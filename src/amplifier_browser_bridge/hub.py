@@ -53,6 +53,7 @@ import json
 import logging
 import math
 import signal
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -70,6 +71,7 @@ from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
 from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
+from .scope import SCOPE_FIELDS, ScopeError, SessionScope
 from .tiers import Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
@@ -98,6 +100,16 @@ DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS = 30.0
 # intake" section). `tabs` is handled separately since its result is a *list* of
 # per-tab entries rather than one url -- see `_ingest_result` below.
 _URL_BEARING_RESULT_COMMANDS = frozenset({"navigate", "snapshot", "read"})
+
+# Commands whose successful result hands PAGE CONTENT back to the caller --
+# the seal-on-first-read trigger for SessionScope (design doc section 11.2:
+# "Hub calls seal() the first time a session receives page content
+# (read/snapshot/vision_read/tabs result)"). Deliberately narrower than
+# `_URL_BEARING_RESULT_COMMANDS`: `navigate` only reports the URL it landed
+# on, never the page's own content, so it does not seal a session by itself.
+# `vision_read` is agent-surface-only (not a wire command -- see protocol.py)
+# and is not yet wired to this; see this PR's report for that open item.
+_PAGE_CONTENT_RESULT_COMMANDS = frozenset({"read", "snapshot", "tabs"})
 
 
 class HubBindError(RuntimeError):
@@ -195,6 +207,15 @@ class Hub:
         # than per-device, since that's what the device `result` handler has on
         # hand without needing to search every device's own bookkeeping.
         self._inflight: dict[str, QueuedCommand] = {}
+        # session_id -> SessionScope (design doc section 11.2/15 step 5,
+        # Candidate C). Hub-owned, not PolicyEngine-owned, because a session
+        # outlives any one WebSocket connection -- the same reason the
+        # per-device command queue outlives a device's connection (this
+        # module's own docstring, reason 2). A session survives a device
+        # disconnect/reconnect for exactly that reason: nothing here is keyed
+        # by, or torn down by, a device's `/device`-route connection. See
+        # "Sessions" section below for the full establish/narrow/seal wiring.
+        self._sessions: dict[str, SessionScope] = {}
         if not token_store.auth_enabled:
             logger.warning(
                 "No hub token configured (ABB_HUB_TOKEN / token file) -- running with "
@@ -424,6 +445,14 @@ class Hub:
         if not env.get("ok"):
             return env
 
+        if cmd.command in _PAGE_CONTENT_RESULT_COMMANDS:
+            # Seal-on-first-read (design doc section 11.2/15 step 5): a
+            # `read`/`snapshot`/`tabs` result is page content reaching the
+            # caller. From this point on, `cmd.session_id`'s SessionScope
+            # (if any) can only narrow, never widen -- see scope.py's module
+            # docstring for why this is the property that actually matters.
+            self._maybe_seal_session(cmd.session_id)
+
         result = env.get("result")
         if cmd.command == "tabs" and isinstance(result, list):
             filtered = self.policy.filter_tabs_result(device_id, result)
@@ -565,6 +594,12 @@ class Hub:
                 elif rtype == "confirm":
                     result = await self._handle_agent_confirm(req)
                     await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
+                elif rtype == "establish_session":
+                    result = self._handle_establish_session(req)
+                    await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
+                elif rtype == "narrow_scope":
+                    result = self._handle_narrow_scope(req)
+                    await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
                 else:
                     await ws.send_json(
                         {
@@ -587,7 +622,9 @@ class Hub:
             return {"ok": False, "error": str(e)}
         command = req.get("command", "")
         args = req.get("args") or {}
-        return await self.send_command(target, command, args)
+        raw_session_id = req.get("session_id")
+        session_id = raw_session_id if isinstance(raw_session_id, str) and raw_session_id else None
+        return await self.send_command(target, command, args, session_id=session_id)
 
     async def _handle_agent_confirm(self, req: dict[str, Any]) -> dict[str, Any]:
         """Handle a `confirm` request: consume a single-use confirmation token
@@ -595,7 +632,10 @@ class Hub:
         re-submit the original gated command with `skip_gate=True`. The denylist
         check still runs (a confirmation is not a denylist bypass) -- only the
         gate itself is skipped, since a human has already explicitly approved
-        this exact action."""
+        this exact action. The ORIGINAL session's scope (if any) is re-resolved
+        and re-checked too -- see `PolicyEngine.evaluate`'s docstring on why
+        scope enforcement runs before `skip_gate`, and `PendingConfirmation.
+        session_id`."""
         token = req.get("confirmation_token")
         if not token or not isinstance(token, str):
             return {"ok": False, "error": "confirm requires 'confirmation_token'"}
@@ -610,8 +650,91 @@ class Hub:
             command=pending.command,
             category=pending.category,
             token=token,
+            session_id=pending.session_id,
         )
-        return await self.send_command(pending.target, pending.command, pending.args, skip_gate=True)
+        return await self.send_command(
+            pending.target, pending.command, pending.args, skip_gate=True, session_id=pending.session_id
+        )
+
+    # ------------------------------------------------------------------
+    # Sessions -- caller-declared write scope (design doc section 11.2/15
+    # step 5, Candidate C). See scope.py's module docstring for the full
+    # "why a prompt-injected model can't use this to widen its own grant"
+    # argument; this section is the wire-level half of that argument.
+    #
+    # `establish_session` ALWAYS mints a fresh session_id (uuid4) and never
+    # accepts a caller-supplied one -- this is deliberate and load-bearing:
+    # it is what stops `establish_session` from ever being replayed against
+    # an EXISTING (possibly already-sealed) session to silently reset its
+    # scope back to broad. To change an existing session, the ONLY path is
+    # `narrow_scope`, which can only narrow (scope.py's SessionScope.narrow)
+    # and is refused outright once the session is sealed.
+    #
+    # A session's scope is intentionally NOT torn down when its device
+    # disconnects/reconnects -- see `self._sessions`'s declaration in
+    # `__init__`. Mobile devices drop and re-attach by design (this
+    # project's own three-tier connectivity model); a scope that evaporated
+    # on every reconnect would defeat its own purpose the moment the
+    # human's phone went to sleep. A session is torn down ONLY by hub
+    # process restart (in-memory, like `_confirmations` and `_flow_elevated`
+    # in policy.py) -- there is no idle-expiry sweep for sessions in this
+    # phase, matching those two precedents.
+    # ------------------------------------------------------------------
+
+    def establish_session(self, **scope_kwargs: Any) -> SessionScope:
+        """Create a brand-new session with a caller-declared initial scope.
+        Returns the new `SessionScope` (its `session_id` is the hub-minted
+        one -- never accepted from the caller)."""
+        session_id = uuid.uuid4().hex
+        scope = SessionScope.from_wire(session_id, scope_kwargs)
+        self._sessions[session_id] = scope
+        self.audit.record("session_established", session_id=session_id, scope=scope.to_wire())
+        return scope
+
+    def narrow_session_scope(self, session_id: str, **kwargs: Any) -> SessionScope:
+        """Narrow an EXISTING session's scope. Raises `ScopeError` for an
+        unknown session_id, any widening attempt, or any change at all once
+        the session is sealed (`SessionScope.narrow`'s own guarantees)."""
+        scope = self._sessions.get(session_id)
+        if scope is None:
+            raise ScopeError(f"unknown session_id: {session_id!r}")
+        scope.narrow(**kwargs)
+        self.audit.record("policy_scope_narrowed", session_id=session_id, scope=scope.to_wire())
+        return scope
+
+    def _handle_establish_session(self, req: dict[str, Any]) -> dict[str, Any]:
+        try:
+            scope = self.establish_session(**{k: v for k, v in req.items() if k in SCOPE_FIELDS})
+        except ScopeError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "session_id": scope.session_id, "scope": scope.to_wire()}
+
+    def _handle_narrow_scope(self, req: dict[str, Any]) -> dict[str, Any]:
+        session_id = req.get("session_id")
+        if not session_id or not isinstance(session_id, str):
+            return {"ok": False, "error": "narrow_scope requires 'session_id'"}
+        try:
+            scope = self.narrow_session_scope(
+                session_id, **{k: v for k, v in req.items() if k in SCOPE_FIELDS}
+            )
+        except ScopeError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "session_id": scope.session_id, "scope": scope.to_wire()}
+
+    def _maybe_seal_session(self, session_id: str | None) -> None:
+        """Seal a session the first time any of its commands yields page
+        content back to the caller (design doc section 11.2: "Hub calls
+        seal() the first time a session receives page content"). Idempotent
+        at the call site too (checks `sealed` first) purely to avoid a
+        redundant audit event on every subsequent read -- `SessionScope.seal`
+        itself is already safe to call repeatedly."""
+        if session_id is None:
+            return
+        scope = self._sessions.get(session_id)
+        if scope is None or scope.sealed:
+            return
+        scope.seal()
+        self.audit.record("policy_scope_sealed", session_id=session_id)
 
     def _poll(self, device_id: str, command_id: str) -> dict[str, Any]:
         record = self.registry.get(device_id)
@@ -631,7 +754,13 @@ class Hub:
     # ------------------------------------------------------------------
 
     async def send_command(
-        self, target: Target, command: str, args: dict[str, Any], *, skip_gate: bool = False
+        self,
+        target: Target,
+        command: str,
+        args: dict[str, Any],
+        *,
+        skip_gate: bool = False,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """The single choke point: every command, from every caller (the agent
         route, tests driving the Hub directly, and the post-confirmation
@@ -643,9 +772,27 @@ class Hub:
         already explicitly approved this exact (target, command, args) via a
         single-use confirmation token. It skips the *gate* check only -- the
         denylist/kill-switch checks in `PolicyEngine.evaluate` always run.
+
+        `session_id`, if given, must name a session already created via
+        `establish_session` -- an unknown id fails loud (`unknown_session`)
+        rather than silently falling back to scope-free behavior, which would
+        let a typo'd or expired session_id quietly defeat the caller's own
+        declared scope. Omitting `session_id` entirely is the existing,
+        fully-permissive default every call site that predates `scope.py`
+        keeps getting (design doc section 8, "Migration").
         """
         if command not in COMMANDS:
             return {"ok": False, "error": f"unknown command: {command!r}. Valid: {sorted(COMMANDS)}"}
+
+        scope: SessionScope | None = None
+        if session_id is not None:
+            scope = self._sessions.get(session_id)
+            if scope is None:
+                return {
+                    "ok": False,
+                    "error": f"unknown session_id: {session_id!r} (establish_session first)",
+                    "reason_code": "unknown_session",
+                }
 
         # `_cdp` is a hub-internal wire signal (see cdp.py, `_dispatch_live`)
         # that authorizes the DEVICE to use CDP dispatch for this specific
@@ -664,7 +811,7 @@ class Hub:
         if timeout_error is not None:
             return {"ok": False, "error": timeout_error}
 
-        decision = self.policy.evaluate(target, command, args, skip_gate=skip_gate)
+        decision = self.policy.evaluate(target, command, args, skip_gate=skip_gate, scope=scope)
         if decision.status == "deny":
             deny_response: dict[str, Any] = {"ok": False, "error": decision.reason}
             if decision.reason_code:
@@ -690,7 +837,14 @@ class Hub:
         if record is None:
             return {"ok": False, "error": f"unknown device: {target.device_id!r}"}
 
-        cmd = QueuedCommand(id=new_id(), target=target, command=command, args=args, timeout=timeout_override)
+        cmd = QueuedCommand(
+            id=new_id(),
+            target=target,
+            command=command,
+            args=args,
+            timeout=timeout_override,
+            session_id=session_id,
+        )
 
         # D1 (docs/designs/confirmation-gate.md section 7): attach the
         # classification to the returned envelope on EVERY state-changing

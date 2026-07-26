@@ -168,6 +168,7 @@ from .classify import classify as _classify
 # hub.py share one canonical set; `hub.py` imports `STATE_CHANGING_COMMANDS`
 # from `policy`, not `effects`, for that reason.
 from .effects import STATE_CHANGING_COMMANDS, EffectsReport
+from .scope import SessionScope
 
 # How long a tab's flow-elevated status survives with no new triggering
 # observation, before it lapses on its own (design doc section 11.4:
@@ -492,6 +493,12 @@ class PendingConfirmation:
     created_at: float
     expires_at: float
     used: bool = False
+    # The session_id (if any) whose SessionScope was in effect when this gate
+    # fired -- design doc section 12: scope enforcement (step 5) runs BEFORE
+    # skip_gate (step 6), so a confirmed replay must be re-checked against the
+    # SAME scope, not dispatched scope-free. `Hub._handle_agent_confirm` reads
+    # this back and passes it into the re-dispatch `send_command` call.
+    session_id: str | None = None
 
 
 @dataclass
@@ -877,6 +884,7 @@ class PolicyEngine:
         args: dict[str, Any],
         *,
         skip_gate: bool = False,
+        scope: SessionScope | None = None,
     ) -> PolicyDecision:
         """The single entry point. See Hub.send_command (hub.py) for the choke
         point that guarantees every command passes through here exactly once,
@@ -888,20 +896,32 @@ class PolicyEngine:
             2. resolve url_context / host
             3. denylist match (discarded-auth exception)? -> deny
             4. command not state-changing?              -> allow, classification=None
-            5. skip_gate (post-confirmation re-dispatch)? -> allow (denylist already ran)
-            6. build ActionDescriptor (caller args win; else hub's own
+            5. scope.permits_write(origin)?              -> deny, reason_code=out_of_scope
+            6. skip_gate (post-confirmation re-dispatch)? -> allow (denylist AND
+               scope already ran above -- see the ordering note below)
+            7. build ActionDescriptor (caller args win; else hub's own
                observations: ref hint cache, tab-host cache, flow state)
-            7. classify(descriptor, profile)
-            8. status == "unknown" -> on_unknown handling
-            9. status == "elevated" -> gate
-            10. otherwise -> allow, classification attached
+            8. classify(descriptor, profile)
+            9. status == "unknown" -> on_unknown handling
+            10. status == "elevated" -> gate
+            11. otherwise -> allow, classification attached
 
-        `scope.py` (caller-declared write scope, Candidate C) is not
-        implemented in this phase -- see this module's docstring and
-        docs/designs/confirmation-gate.md's build-order section 15. Step 5 of
-        the design doc's flow (session write-scope enforcement) is therefore
-        absent; `on_unknown` is a hub-wide constructor setting standing in for
-        a per-session one until scope.py exists.
+        `scope` (caller-declared write scope, Candidate C -- `scope.py`) is
+        `None` by default: fully permissive, matching every existing call
+        site that never passes one (design doc section 8, "Migration":
+        additive, non-breaking) and the maintainer's own broad-by-default
+        stance. `Hub` resolves a `SessionScope` from a wire request's
+        `session_id` and passes it in here -- this class never looks up or
+        stores session state itself, the same separation `note_effects`/
+        `note_page_context` observation intake keeps from confirmation-token
+        bookkeeping.
+
+        Step 5 (scope) deliberately runs BEFORE step 6 (skip_gate): a
+        post-confirmation replay is re-checked against the ORIGINAL session's
+        scope (see `PendingConfirmation.session_id` and
+        `Hub._handle_agent_confirm`), so redeeming a gate token can never be
+        used to route around a write-scope restriction that was in effect
+        when the gate fired.
         """
         if self.kill_switch_active:
             return PolicyDecision(status="deny", reason=KILL_SWITCH_REASON)
@@ -951,6 +971,37 @@ class PolicyEngine:
             # state (design doc section 11.4's STATE_CHANGING_COMMANDS).
             return PolicyDecision(status="allow", classification=None)
 
+        if scope is not None and not scope.permits_write(host):
+            # The one page-immune PREVENTION this design has (design doc
+            # section 4: "C is the only page-immune prevention"). Runs before
+            # skip_gate -- see this method's docstring's ordering note -- so
+            # a post-confirmation replay cannot use a redeemed token to route
+            # around a write-scope restriction that was in effect when the
+            # gate fired.
+            write_desc: Any = "*" if scope.write == "*" else sorted(scope.write)
+            self._audit.record(
+                "policy_scope_denied",
+                device_id=target.device_id,
+                tab_id=target.tab_id,
+                command=command,
+                origin=host,
+                session_id=scope.session_id,
+                write_scope=write_desc,
+            )
+            # Specific, unlike DENY_REASON's deliberate vagueness -- this is
+            # the caller's OWN declared constraint being enforced back to it,
+            # not a hidden-tab category that must stay invisible (see
+            # docs/POLICY.md's "Invisibility, both directions" for why those
+            # two cases take opposite specificity choices).
+            return PolicyDecision(
+                status="deny",
+                reason=(
+                    f"write scope does not permit {command!r} on origin {host!r} -- "
+                    f"session write scope: {write_desc}"
+                ),
+                reason_code="out_of_scope",
+            )
+
         if skip_gate:
             # Post-confirmation re-dispatch: a human already explicitly
             # approved this exact (target, command, args) via a single-use
@@ -978,7 +1029,9 @@ class PolicyEngine:
                     classification=classification,
                 )
             if self.on_unknown == "gate":
-                pending = self._create_confirmation(target, command, args, None, {})
+                pending = self._create_confirmation(
+                    target, command, args, None, {}, session_id=scope.session_id if scope else None
+                )
                 return PolicyDecision(
                     status="gate",
                     category=None,
@@ -1008,7 +1061,9 @@ class PolicyEngine:
                 "score": classification.score,
                 "matched": [m for s in classification.signals for m in s.matched],
             }
-            pending = self._create_confirmation(target, command, args, category, detected)
+            pending = self._create_confirmation(
+                target, command, args, category, detected, session_id=scope.session_id if scope else None
+            )
             self._audit.record(
                 "policy_gated",
                 device_id=target.device_id,
@@ -1134,6 +1189,8 @@ class PolicyEngine:
         args: dict[str, Any],
         category: str | None,
         detected: dict[str, Any],
+        *,
+        session_id: str | None = None,
     ) -> PendingConfirmation:
         now = time.time()
         token = uuid.uuid4().hex
@@ -1146,6 +1203,7 @@ class PolicyEngine:
             detected=detected,
             created_at=now,
             expires_at=now + self.confirmation_ttl,
+            session_id=session_id,
         )
         self._confirmations[token] = pending
         return pending
