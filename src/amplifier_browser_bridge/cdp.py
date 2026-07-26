@@ -48,12 +48,24 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-# ~10 minutes, per design doc §6.3/§7: long enough that a human actively
-# co-working with the agent doesn't see the yellow debugger banner flicker on
-# and off between commands, short enough that an abandoned session doesn't
-# leave the banner up indefinitely. Configurable per-Hub (see hub.py's
+from .args_bool import truthy
+
+# 20 seconds. Revised down from 600s after real-world use on a human's live
+# browser.
+#
+# The original 10-minute value optimised for "don't let the banner flicker
+# between commands" and assumed the banner was a minor cosmetic artifact. That
+# assumption was wrong. The Edge debugger infobar is persistent, occupies real
+# vertical screen space, and pushes page content down for as long as it is up.
+# Ten minutes of that after a single CDP-requiring command is a serious
+# imposition on someone who is trying to work in that browser -- a direct
+# violation of the co-working etiquette in design doc §6.3.
+#
+# 20s is long enough to absorb a burst of CDP commands without re-raising the
+# banner between them, and short enough that the banner disappears on its own
+# very shortly after the agent stops. Configurable per-Hub (see hub.py's
 # `cdp_idle_seconds` constructor arg) -- this is a default, not a mandate.
-DEFAULT_SOFT_DETACH_IDLE_SECONDS: float = 600.0
+DEFAULT_SOFT_DETACH_IDLE_SECONDS: float = 20.0
 
 # Args that express CALLER INTENT for CDP-backed dispatch (see protocol.py's
 # CDP_INTENT_ARGS, kept in sync here as the single source of truth for what
@@ -79,9 +91,9 @@ def requires_cdp(command: str, args: dict[str, Any]) -> bool:
           window, which `chrome.tabs.captureVisibleTab` cannot do (design doc
           §7: "screenshotting a non-active tab is desktop-only [via CDP]").
     """
-    if command in _TRUSTED_INPUT_COMMANDS and args.get("trusted") is True:
+    if command in _TRUSTED_INPUT_COMMANDS and truthy(args.get("trusted")):
         return True
-    return command == "screenshot" and args.get("capture_hidden") is True
+    return command == "screenshot" and truthy(args.get("capture_hidden"))
 
 
 @dataclass

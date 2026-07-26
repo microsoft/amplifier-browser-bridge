@@ -42,7 +42,69 @@ categories."*):
 Host/domain-based with subdomain support: `sub.chase.com` and `chase.com` both match a
 `chase.com` rule; `notchase.com` does **not** (suffix-with-dot-boundary matching, not substring
 matching -- see `host_matches_domain` in policy.py for the exact logic and the substring-matching
-bug it deliberately avoids).
+bug it deliberately avoids). This matching logic itself is correct and covered by
+`tests/test_policy.py`'s exact/subdomain/similar-but-different/suffix-of-unrelated-host cases --
+if you're debugging an over-broad match, it is very unlikely to be here (see the case study below,
+where the real cause turned out to be something else entirely).
+
+### Case study: 49 ordinary tabs hidden as "auth" on a real 531-tab profile
+
+Investigated against a real, heavily-used Edge profile (2026-07-26): `abb tabs` on a device with
+531 visible tabs also produced 49 `policy_tab_hidden` audit events, **all** category `auth`, **all**
+matching `login.microsoftonline.com`. 49/580 (~8%) hidden under one identity-provider host is not
+implausible on its face for a Microsoft-365-heavy user -- but the actual URLs told a different
+story once the audit log was extended to include the matched host (see "Audit detail" below): every
+one was a path like `/{tenant}/oauth2/(v2.0/)authorize` or `/common/oauth2/v2.0/authorize`, and
+their `redirect_uri` query parameters pointed at ordinary first-party content --
+`*.sharepoint.com`, `coreidentity.microsoft.com`, `ms.portal.azure.com`, internal
+`*.microsoft.com`/`eng.ms` engineering tools, and `localhost` dev servers.
+
+**Root cause:** Microsoft-365-integrated web apps (SharePoint, OneDrive, internal engineering
+portals, MSAL-based SPAs using the "redirect" interaction type) routinely perform a **top-level,
+full-page** OAuth redirect through `login.microsoftonline.com/.../authorize` to silently refresh a
+session -- normally invisible, completing in well under a second, and never rendering any
+credential UI (a valid SSO session cookie means the IdP just 302s straight back to
+`redirect_uri`). A **backgrounded tab that Edge discards** (unloads its renderer to reclaim memory
+-- see the tabs `discarded` field, added for Bug 1 in this same investigation) can freeze mid-round-
+trip, with the intermediate `authorize` URL left as its last-known `url` forever -- it never gets a
+chance to finish redirecting back to the real app page. The tab is not, and was never, showing the
+user a login prompt; it is an ordinary SharePoint/Azure/internal-tool tab that happens to be stuck
+displaying IdP plumbing because nothing ever ran again to complete the hop while it sat discarded.
+
+This is **not** the substring/subdomain-matching bug that was the leading hypothesis
+going in (`host_matches_domain` is, and was, correct -- see above), and it is **not** an over-broad
+denylist entry (`login.microsoftonline.com` is exactly the identity-provider host the design
+intends to cover). The bug is a missing distinction: the `auth` category's actual rationale is "the
+agent must not read a **live** credential-entry screen" (design doc §6.2: "structurally blind to
+live credential/session material") -- but a **discarded** tab has no live renderer at all, so that
+rationale does not apply to it. Hiding it anyway was over-hiding an ordinary content tab, directly
+contradicting the stated design intent: "hide identity-provider credential-entry hosts, not
+ordinary content hosts."
+
+### The fix: a narrow, `auth`-only, discarded-tab exception
+
+`PolicyEngine` now tracks each observed tab's `discarded` state (`_tab_discarded`, fed the same way
+as `_tab_hosts` -- from `tabs` results, via `note_tab_discarded`). When a tab matches the `auth`
+category **and** is currently known-discarded:
+
+- **Response path** (`filter_tabs_result`): the tab is **shown**, not hidden -- but a
+  `policy_tab_hidden`-adjacent audit event (`policy_tab_shown_despite_match`, full detail) is still
+  recorded, so this exception itself stays fully auditable.
+- **Request path** (`evaluate`): the command is **allowed** to reach the device instead of denied
+  (`policy_allowed_despite_match` audited) -- but this does **not** bypass Bug 1's own fail-loud
+  discarded-tab check at the extension layer (`background.js`'s `ensureAwake()`): the device still
+  refuses to act on a discarded tab unless the caller explicitly passes `wake=true`, and any content
+  actually read only happens after that explicit, audited, state-destroying wake. If the session
+  genuinely expired and waking lands on a real interactive login form, the *next* observation
+  (the same command's own result, or any later `tabs`/`snapshot`) records the fresh, non-discarded
+  state and the ordinary `auth` denylist applies again from that point on.
+
+**Scoped to `auth` only** -- `financial`/`healthcare`/`password_managers` are NOT given this
+exception. Their rationale is not renderer-liveness ("don't show a live password box"); it's
+not-revealing-which-services-the-user-uses-at-all ("don't let the agent learn the user banks with
+Chase"), which holds regardless of whether the tab is currently rendered. Only identity-provider
+hosts are used as ambient authentication *infrastructure* by countless unrelated first-party apps,
+which is what creates this specific stuck-redirect failure mode at scale.
 
 ### Invisibility, both directions
 

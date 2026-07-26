@@ -50,17 +50,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from dataclasses import replace
 from typing import Any
 
 from aiohttp import WSMsgType, web
 
 from .addressing import Target, TargetError
+from .args_bool import truthy
 from .audit import AuditLog
 from .auth import TokenStore
 from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .policy import PolicyEngine, PolicyError
-from .protocol import COMMANDS, PROTOCOL_VERSION, new_id
+from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .tiers import Tier
@@ -68,7 +70,22 @@ from .tiers import Tier
 logger = logging.getLogger("amplifier_browser_bridge.hub")
 
 DEFAULT_PORT = 8900
-DEFAULT_COMMAND_TIMEOUT = 30.0
+# Real-world finding (real Edge profile, 532 open tabs): `read` on a heavy SPA
+# (repos.opensource.microsoft.com's Open Source Management Portal) timed out
+# at the prior default of 30.0s even though the tab was awake and
+# `status: "complete"` -- injection + shadow-DOM-piercing traversal on a large
+# hydrated SPA genuinely needs more than 30s sometimes. 120s is a generous
+# default for real-world pages while still bounding the worst case; a caller
+# with an even heavier page can raise it further per-command via
+# `args.timeout_s` (see protocol.py's HUB_ONLY_ARGS) up to MAX_COMMAND_TIMEOUT,
+# or the hub operator can change the default via `abb hub --command-timeout`.
+DEFAULT_COMMAND_TIMEOUT = 120.0
+# Accepted range for a caller-supplied `args.timeout_s` override (see
+# `Hub._extract_timeout_override`). Floor prevents a mistaken `0`/negative
+# value from producing an unusable hair-trigger timeout; ceiling keeps a
+# single command from being able to hang a caller indefinitely.
+MIN_COMMAND_TIMEOUT = 1.0
+MAX_COMMAND_TIMEOUT = 600.0
 DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS = 30.0
 
 # Commands whose successful device result carries a `url` field directly usable
@@ -539,6 +556,10 @@ class Hub:
         if "_cdp" in args:
             args = {k: v for k, v in args.items() if k != "_cdp"}
 
+        timeout_override, args, timeout_error = self._extract_timeout_override(args)
+        if timeout_error is not None:
+            return {"ok": False, "error": timeout_error}
+
         decision = self.policy.evaluate(target, command, args, skip_gate=skip_gate)
         if decision.status == "deny":
             return {"ok": False, "error": decision.reason}
@@ -554,7 +575,7 @@ class Hub:
         if record is None:
             return {"ok": False, "error": f"unknown device: {target.device_id!r}"}
 
-        cmd = QueuedCommand(id=new_id(), target=target, command=command, args=args)
+        cmd = QueuedCommand(id=new_id(), target=target, command=command, args=args, timeout=timeout_override)
 
         if record.tier is Tier.LIVE:
             return await self._dispatch_live(record, cmd)
@@ -575,6 +596,68 @@ class Hub:
             "last_seen": record.last_seen.isoformat() if record.last_seen else None,
             "queue_position": position,
         }
+
+    @staticmethod
+    def _extract_timeout_override(args: dict[str, Any]) -> tuple[float | None, dict[str, Any], str | None]:
+        """Pop and validate `args.timeout_s` (see protocol.py's HUB_ONLY_ARGS).
+
+        Returns `(timeout_override, remaining_args, error)`. `timeout_override`
+        is `None` if the caller didn't supply one (meaning: use the hub's
+        configured `command_timeout`). `error` is a human-readable message if
+        the caller supplied a value that isn't usable -- fail loud rather than
+        silently clamping or ignoring a bad value (design doc \u00a78).
+
+        This never forwards `timeout_s` to the device: it is a hub-only
+        knob (how long the HUB waits for a device reply), not something
+        `injected.js`/`background.js` have any use for.
+        """
+        if "timeout_s" not in args:
+            return None, args, None
+        raw = args["timeout_s"]
+        remaining = {k: v for k, v in args.items() if k not in HUB_ONLY_ARGS}
+        try:
+            value = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None, remaining, f"args.timeout_s must be a number (seconds), got: {raw!r}"
+        if not math.isfinite(value):
+            return None, remaining, f"args.timeout_s must be a finite number, got: {raw!r}"
+        if not (MIN_COMMAND_TIMEOUT <= value <= MAX_COMMAND_TIMEOUT):
+            error = (
+                f"args.timeout_s must be between {MIN_COMMAND_TIMEOUT} and {MAX_COMMAND_TIMEOUT} "
+                f"seconds, got: {value}"
+            )
+            return None, remaining, error
+        return value, remaining, None
+
+    @staticmethod
+    def _timeout_hint(command: str, args: dict[str, Any]) -> str:
+        """A trailing sentence naming a DIFFERENT mechanism the caller may choose
+        when a command's own device round trip times out -- discoverability, not
+        decision-making (design doc's "Mechanism, not policy" section): this never
+        retries the command differently or substitutes one mechanism for another
+        itself, it only names what exists so the caller can pick.
+
+        Returns an empty string for commands with no relevant alternative to name.
+        """
+        if command in ("read", "snapshot"):
+            if truthy(args.get("all_frames")):
+                return (
+                    " This request already used args.all_frames=true (every frame is instrumented "
+                    "before any result returns, which is slower) -- if you know which frame you need "
+                    "from a prior result's `frames` entry, args.frame_id=<id> targets just that one "
+                    "frame and skips the rest."
+                )
+            return (
+                " If the content you need lives inside an embedded frame (e.g. a SharePoint/M365 "
+                "document viewer) rather than the top frame, args.all_frames=true gathers every frame "
+                "-- slower, so raise args.timeout_s alongside it."
+            )
+        if command in ("click", "type", "key"):
+            return (
+                " If the page ignores untrusted synthetic events, args.trusted=true escalates to "
+                "CDP-backed isTrusted input (requires the debugger capability on this device)."
+            )
+        return ""
 
     async def _dispatch_live(self, record: DeviceRecord, cmd: QueuedCommand) -> dict[str, Any]:
         """The single choke point for CDP escalation (see this module's
@@ -614,7 +697,11 @@ class Hub:
                     f"capability unavailable on this device ({record.label}): chrome.debugger/CDP is "
                     "not present here (e.g. Edge Android) -- cannot satisfy trusted input or "
                     "hidden-tab capture; refusing rather than silently falling back to the "
-                    "injection-only path"
+                    "injection-only path the caller didn't ask for. This device can still run "
+                    "untrusted injected click/type/key (drop args.trusted) and capture the ACTIVE "
+                    "tab only via chrome.tabs.captureVisibleTab (drop args.capture_hidden) -- use "
+                    "those directly if isTrusted input or hidden/background-tab capture isn't "
+                    "strictly required."
                 ),
             }
         if self.cdp.is_attached(record.device_id, tab_id):
@@ -635,6 +722,7 @@ class Hub:
         CDP escalation -- `_dispatch_live` is the only caller for real
         commands; tests may call this directly to bypass escalation."""
         assert record.ws is not None  # only called when record.tier is LIVE
+        effective_timeout = cmd.timeout if cmd.timeout is not None else self.command_timeout
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         record.pending[cmd.id] = fut
@@ -669,11 +757,30 @@ class Hub:
             return {"ok": False, "error": f"device connection lost while sending command: {e}"}
 
         try:
-            result_env = await asyncio.wait_for(fut, timeout=self.command_timeout)
+            result_env = await asyncio.wait_for(fut, timeout=effective_timeout)
         except TimeoutError:
             record.pending.pop(cmd.id, None)
             self._inflight.pop(cmd.id, None)
-            return {"ok": False, "error": f"timeout waiting {self.command_timeout}s for device result"}
+            # Actionable, not just "timeout" (real-world finding: a heavy SPA's
+            # `read` needed longer than the prior fixed 30s even at
+            # status:"complete" -- see DEFAULT_COMMAND_TIMEOUT's comment and
+            # docs/PROTOCOL.md's "Command timeout" section). Discoverability,
+            # not decision-making (design doc's "Mechanism, not policy"
+            # section): _timeout_hint NAMES an alternative mechanism the
+            # caller may choose -- it never retries or substitutes one for
+            # another itself.
+            return {
+                "ok": False,
+                "error": (
+                    f"timeout waiting {effective_timeout}s for device result on command "
+                    f"'{cmd.command}' (device={record.device_id}, tab_id={cmd.target.tab_id}). "
+                    "The page may still be loading or a heavy SPA may still be hydrating. Raise "
+                    f"the limit for just this command with args.timeout_s=<seconds> (CLI: "
+                    f"--timeout <seconds>; MCP tools: timeout_s param), up to {MAX_COMMAND_TIMEOUT}s, "
+                    "or raise the hub's own default with `abb hub --command-timeout <seconds>`."
+                    f"{self._timeout_hint(cmd.command, cmd.args)}"
+                ),
+            }
         except ConnectionError as e:
             self._inflight.pop(cmd.id, None)
             return {"ok": False, "error": str(e)}

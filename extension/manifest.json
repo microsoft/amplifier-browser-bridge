@@ -14,7 +14,8 @@
     "alarms",
     "downloads",
     "tabGroups",
-    "debugger"
+    "debugger",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"

@@ -330,27 +330,429 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 
 | Command | Executed via | Notes |
 |---|---|---|
-| `snapshot` | injected.js | Accessibility-style tree, stable `eN` refs |
-| `read` | injected.js | Full visible text of the page |
-| `click` | injected.js | `args.ref` |
-| `type` | injected.js | `args.ref`, `args.text` |
-| `key` | injected.js | `args.ref` (optional), `args.key` |
-| `scroll` | injected.js | `args.x`, `args.y` |
-| `back` / `forward` | injected.js | `history.back()`/`forward()` |
-| `wait_for` | injected.js | `args.selector`, `args.timeout_ms`; polls, never sleeps blindly |
-| `wait_text` | injected.js | `args.text`, `args.timeout_ms`; polls, never sleeps blindly |
-| `tabs` | background.js (`chrome.tabs.query`) | optionally scoped by `target.window_id` |
+| `snapshot` | injected.js | Accessibility-style tree, frame-qualified `f<frameId>.eN` refs -- gathered from **every frame** on the page. See "Frames" below. |
+| `read` | injected.js | Full visible text -- gathered from **every frame** on the page; returns the richest frame's text plus a manifest of the rest. See "Frames" below. |
+| `click` | injected.js | `args.ref`; routes to the exact frame the ref was qualified with |
+| `type` | injected.js | `args.ref`, `args.text`; routes to the exact frame the ref was qualified with |
+| `key` | injected.js | `args.ref` (optional), `args.key`; routes to the exact frame ONLY when `args.ref` is given -- a ref-less key press runs against the top frame (frameId 0) |
+| `scroll` | injected.js | `args.x`, `args.y`; top frame only |
+| `back` / `forward` | injected.js | `history.back()`/`forward()`; top frame only |
+| `wait_for` | injected.js | `args.selector`, `args.timeout_ms`; polls, never sleeps blindly; top frame only -- see "Frames" below |
+| `wait_text` | injected.js | `args.text`, `args.timeout_ms`; polls, never sleeps blindly; top frame only -- see "Frames" below |
+| `tabs` | background.js (`chrome.tabs.query`) | optionally scoped by `target.window_id`; each entry now also carries `discarded`/`status` -- see "Discarded tabs" below |
 | `tab_open` | background.js (`chrome.tabs.create`) | target is device-only; `args.url`, `args.active` (default background) |
 | `tab_close` | background.js (`chrome.tabs.remove`) | |
 | `tab_activate` | background.js (`chrome.tabs.update`) | the one command that's explicitly *allowed* to steal focus, because it was asked to |
-| `screenshot` | background.js (`chrome.tabs.captureVisibleTab`, or CDP `Page.captureScreenshot` -- see CDP section below) | Injection-only by default: only works if the target tab is already active. Pass `args.capture_hidden: true` to auto-escalate to CDP for any-tab/hidden capture. |
-| `attach` | background.js (`chrome.debugger.attach`) | Phase 4: explicit CDP attach for a tab. See CDP section below. |
+| `screenshot` | background.js (`chrome.tabs.captureVisibleTab`, or CDP `Page.captureScreenshot` -- see CDP section below) | Injection-only by default: only works if the target tab is already active. Pass `args.capture_hidden: true` to auto-escalate to CDP for any-tab/hidden capture. Returns `base64` image bytes. `args.frame_id` crops to one frame's on-screen region (requires `capture_hidden`); `args.multi_page: true` scrolls and captures repeatedly (`args.max_pages`, `args.scroll_selector`, `args.page_delay_ms`) -- see "Frame-targeted and multi-page screenshot capture" below. |
+| `attach` | background.js (`chrome.debugger.attach`) | Phase 4: explicit CDP attach for a tab. See CDP section below. Also see "Discarded tabs": attaching implicitly wakes a discarded tab. |
 | `detach` | background.js (`chrome.debugger.detach`) | Phase 4: explicit CDP detach for a tab. |
+| `reload` | background.js (`chrome.runtime.reload()`) | Self-service extension reload. Target is device-only. See "Extension self-reload" below. |
+| `fetch_bytes` | background.js (extension-context `fetch`, `credentials: "include"`) | `args.url`, `args.max_bytes` (optional). Target is device-only. See "Content-extraction mechanisms" below. |
+| `grab_image` | background.js (`chrome.scripting.executeScript` into the page's `MAIN` world) | `args.url`, `args.max_bytes` (optional). Requires `target.tab_id`. See "Content-extraction mechanisms" below. |
+| `downloads_list` | background.js (`chrome.downloads.search`) | `args.limit` (optional, default 20). Target is device-only. |
+| `download` | background.js (`chrome.downloads.download`) | `args.url`, `args.filename` (optional). Target is device-only. |
+| `wait_download` | background.js (`chrome.downloads.search`, polled) | `args.download_id` XOR `args.since_id` (+ optional `args.pattern`), `args.timeout_ms`. Target is device-only. See "Content-extraction mechanisms" below. |
+
+Every `PAGE_WORLD_COMMAND` (`snapshot`, `read`, `click`, `type`, `key`, `scroll`, `back`, `forward`,
+`wait_for`, `wait_text`) also accepts an optional `args.wake` -- see "Discarded tabs" below. Every
+command accepts an optional `args.timeout_s` -- see "Command timeout" below.
+
+### Frames
+
+At real-world scale a substantial fraction of a page's actual content can live inside an
+`<iframe>`, not the top frame -- the motivating case: a SharePoint/M365 policy page whose
+document *body* renders inside an embedded viewer frame, while the top frame carries only nav
+chrome, a title, and metadata. Before this fix, `read`/`snapshot` only ever injected into the
+top frame (`injected.js`'s own module docstring documented this honestly as a limitation, not a
+silent gap) -- `chrome.scripting.executeScript` was never called with `allFrames: true`, so an
+embedded document was completely invisible to `read`.
+
+**How it works now:** `read` and `snapshot` inject `injected.js` into, and dispatch against,
+**every frame** `chrome.scripting.executeScript({allFrames: true})` can reach (the extension
+holds `<all_urls>`, so this includes cross-origin frames, not just same-origin ones). Frames
+Chrome could not inject into at all -- sandboxed without `allow-scripts`, an opaque-origin
+`data:`/`about:blank` frame, or one removed mid-call -- are simply absent from the result set;
+Chrome does not report *why* a frame is missing, so the extension cannot always name the exact
+reason, but it never silently pretends a declared child frame doesn't exist: any `<iframe>`/
+`<frame>` element a successfully-injected frame's own DOM declares, that produced no result
+itself, is reported in `unconfirmed_frames` (an array of `src` URLs) on the combined result.
+
+**Combine strategy for `read`** (see `extension/combine_frames.mjs`'s module docstring and
+docs/designs/browser-bridge.md's "Mechanism, not policy" section for the full rationale):
+return **every frame's** content, uniformly, in `frames` (ordered by `frame_id` ascending --
+predictable, not ranked). Each entry carries `frame_id`/`url`/`title`/`chars` (the real,
+untruncated length) and `text` (capped per frame at `READ_FRAME_TEXT_CAP`, 50,000 characters,
+with an honest `truncated` flag -- a payload-size bound, never a content pick). Top-level
+`url`/`title` identify the tab itself (frame 0's own metadata -- deterministic identity, not a
+content judgment), alongside `frame_count` and `unconfirmed_frames`.
+
+This replaces an earlier design that ranked frames by character count and returned only the
+"richest" frame's text as *the* result (with the rest demoted to an `other_frames` manifest).
+That was a policy decision -- "which frame's content does the caller want" -- baked into this
+mechanism layer, and a bad one: live against a real SharePoint/Word Online policy page, the
+richest frame by character count was an O365 auth/bootstrap iframe's inlined JS config blob
+(3,608 characters), not the actual policy document body (108 characters -- Word Online renders
+the document to `<canvas>`, so the DOM text is only viewer chrome; see "Content-extraction
+mechanisms" below for why `read`/`snapshot` cannot reach that content at all). A char-count
+heuristic cannot distinguish "verbose bootstrap JS" from "the document that matters" -- that
+judgment belongs to the calling agent, which has context this layer does not. Blind
+concatenation of every frame's text into one string was also considered and rejected: a real
+page can have 20+ frames of nav chrome/ads/trackers around one substantive embedded document,
+and concatenating them buries the useful content in noise. Returning every frame's content
+**separately** avoids both failure modes: nothing is picked for the caller, and nothing is
+buried.
+
+```json
+{
+  "ok": true,
+  "result": {
+    "url": "https://.../PolicyProcedure.aspx",
+    "title": "Policy Procedure",
+    "frame_count": 5,
+    "frames": [
+      {"frame_id": 0, "url": "https://.../PolicyProcedure.aspx", "title": "Policy Procedure", "chars": 2874, "text": "... nav chrome ...", "truncated": false},
+      {"frame_id": 3, "url": "https://.../viewer-frame", "title": "Policy Document", "chars": 108, "text": "PAGE 1 OF 5 | CONFIDENTIAL...", "truncated": false},
+      {"frame_id": 5, "url": "https://o365.../bootstrap.js", "title": "", "chars": 3608, "text": "... auth bootstrap JS ...", "truncated": false}
+    ],
+    "unconfirmed_frames": []
+  }
+}
+```
+
+**Combine strategy for `snapshot`**: unlike `read`, there is no "pick the richest one" answer --
+an interactive element an agent needs to click/type into can legitimately live in any frame, so
+`nodes` from **every** frame are included, each `ref` qualified with the frame it came from (see
+"Frame-qualified refs" below) and tagged with its own `frame_id`. A `frames` array reports a
+per-frame manifest (`frame_id`/`url`/`title`/`node_count`) alongside `frame_count` and
+`unconfirmed_frames`, for the same "let an agent reason about what it's looking at" reason `read`
+reports `other_frames`.
+
+**Frame-qualified refs:** because `injected.js` runs independently in every frame (each frame
+gets its own `window.__abb` with its own ref counter starting at `e1`), a bare `"e12"` in frame 0
+and `"e12"` in frame 7 are NOT the same element. Every ref this system hands back is qualified as
+`"f<frameId>.<ref>"` (e.g. `"f0.e12"`, `"f7.e3"`) -- see `extension/frame_refs.mjs` (pure,
+independently unit-tested with `node --test`, no `chrome.*` dependency) for `qualifyRef`/
+`parseQualifiedRef`. **This changes the ref format from prior phases** (previously a bare `"e12"`)
+-- refs are already documented as valid only within the page load that produced them (they reset
+on navigation), so this is not a new class of staleness, just a stricter, unambiguous shape.
+`click`/`type`/`key` (when `args.ref` is given) parse the frame id back out and target
+`chrome.scripting.executeScript`'s `frameIds: [frameId]` at the exact frame that owns the ref --
+never frame 0 by default, never a guess. A ref whose frame no longer exists in the tab (navigated
+away, reloaded, or removed) fails loud, naming the frame id, rather than a bare "stale ref".
+
+**Documented narrower limitation:** `scroll`, `back`, `forward`, `wait_for`, `wait_text`, and a
+ref-less `key` press still operate on the top frame (frameId 0) only, in this phase. A
+`wait_for`/`wait_text` selector or text that only exists inside an iframe will not be found. This
+is a scope decision, not an oversight -- these are page/tab-level operations (or, for `key`, have
+no ref to resolve a frame from) where multi-frame semantics are considerably less obviously
+correct (e.g. "scroll which frame?"). Revisit if a real need for frame-scoped waits emerges.
+
+**Shadow DOM piercing is unaffected**: `injected.js`'s `deepQueryAll()` still pierces open shadow
+roots within each frame it runs in -- multi-frame traversal is orthogonal to (and composes with)
+shadow-DOM traversal, not a replacement for it.
+
+### Content-extraction mechanisms
+
+`read`/`snapshot` only ever see text that's actually present in the DOM. Real-world finding,
+live against the SharePoint policy page above: `Global-Travel-Policy.docx` is embedded in a
+Word Online viewer, which renders the document to `<canvas>` -- the viewer frame's entire DOM
+text is a page-chrome string (`"PAGE 1 OF 5 | CONFIDENTIAL\INTERNAL ONLY | ..."`), not the
+document body. **There is no DOM text there to read, full stop.** Two mechanisms reach that
+content instead, and this system deliberately does not pick one for the caller (see
+docs/designs/browser-bridge.md's "Mechanism, not policy" section):
+
+- **`fetch_bytes`** -- fetch a URL from the **extension's own context**, with
+  `credentials: "include"`. This rides the user's real cookies for the target origin (the
+  entire point of this project -- design doc §1), so it can retrieve a file the user is
+  authenticated to see even though the page never rendered its bytes as DOM text.
+- **`screenshot`** -- capture pixels (see the CDP section above for the hidden/background-tab
+  case). Works even when there is no text to extract at all.
+- **`vision_read`** (agent-surface only, not a wire command -- see "Vision-based extraction"
+  below) -- capture pixels AND call a vision-capable LLM over them to extract text. A distinct
+  mechanism from `screenshot`: `screenshot` never calls a model; `vision_read` always does.
+
+```json
+{"v": 1, "id": "...", "type": "command", "command": "fetch_bytes", "target": {"device_id": "..."}, "args": {"url": "https://.../Global-Travel-Policy.docx", "max_bytes": 10485760}, "token": "..."}
+```
+
+```json
+{"ok": true, "result": {"url": "https://.../Global-Travel-Policy.docx", "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "byte_length": 47213, "base64": "UEsDBBQ..."}}
+```
+
+Refuses past `args.max_bytes` (default 25MB) with an actionable error naming the limit --
+never silently truncates the bytes (a truncated `.docx`/`.pdf` is corrupt, not partially
+useful). `args.max_bytes` raises the cap.
+
+**`grab_image`** is a *distinct* mechanism, not a fallback `fetch_bytes` reaches for
+automatically: it runs the fetch inside the **page's own `MAIN`-world script context**
+(`chrome.scripting.executeScript({world: "MAIN"})`), so the request carries the page's real
+`Referer` and cookie context -- exactly what defeats hotlink/Referer-checking protection that
+an extension-context fetch would trip. Requires `target.tab_id` (there is no page context to
+run the fetch in without a live page); `fetch_bytes` has no such requirement. Same
+`args.url`/`args.max_bytes`/result shape as `fetch_bytes`. The caller picks whichever fits the
+target; neither silently retries as the other on failure -- the error each returns explicitly
+names the other as something to try instead (see "Discoverable alternatives, not automatic
+escalation" below).
+
+**`downloads_list`** / **`download`** / **`wait_download`** -- for a file the user reaches by
+triggering a browser download (clicking a page's own Download control, or navigating a URL
+that responds with `Content-Disposition: attachment`) rather than one linked as a fetchable
+URL:
+
+```json
+{"v": 1, "id": "...", "type": "command", "command": "downloads_list", "target": {"device_id": "..."}, "args": {"limit": 20}, "token": "..."}
+```
+```json
+{"ok": true, "result": {"downloads": [{"download_id": 41, "filename": "...", "url": "...", "state": "complete", "mime": "...", "byte_length": 12345, "start_time": "..."}], "max_download_id": 41}}
+```
+
+`download` triggers a download directly (`chrome.downloads.download()`) and returns **its own
+definite** `download_id` -- no ambiguity, since the command itself started the download:
+
+```json
+{"v": 1, "id": "...", "type": "command", "command": "download", "target": {"device_id": "..."}, "args": {"url": "https://.../file.pdf"}, "token": "..."}
+```
+```json
+{"ok": true, "result": {"download_id": 42, "url": "https://.../file.pdf"}}
+```
+
+`wait_download` polls (never sleeps blindly) for a completed download, in one of two mutually
+exclusive modes:
+
+- `args.download_id` -- wait for that **specific** download (from a prior `download` call).
+- `args.since_id` (+ optional `args.pattern`, a filename regex) -- wait for a **NEW** download
+  with an id strictly greater than the baseline. This is the baseline-max-id + filename-pattern
+  approach lifted from the reference implementation this project supersedes (see the design
+  doc's evidence base): a caller calls `downloads_list` **before** the action that triggers an
+  indirect download (e.g. clicking a page's Download button) to capture `max_download_id` as
+  the baseline, then `wait_download` with `since_id=<that baseline>`. This is the mechanism
+  that guarantees a download the human started themselves, in the same window, is **never**
+  mistaken for the agent's own -- id ordering, not "whatever's newest," is the guarantee.
+
+```json
+{"v": 1, "id": "...", "type": "command", "command": "wait_download", "target": {"device_id": "..."}, "args": {"since_id": 41, "pattern": "\\.docx$", "timeout_ms": 30000}, "token": "..."}
+```
+```json
+{"ok": true, "result": {"download_id": 43, "filename": "Global-Travel-Policy.docx", "url": "https://ppc-word-view.../download", "mime": "application/vnd...", "byte_length": 47213, "state": "complete"}}
+```
+
+Neither `args.download_id` nor `args.since_id` given fails loud immediately (`"wait_download
+requires args.download_id or args.since_id..."`) -- there is no silent default to "grab
+whatever download is newest," since that default is exactly the unsafe behavior this baseline
+scheme exists to prevent.
+
+### Frame-targeted and multi-page screenshot capture
+
+Two real-world findings motivated these: a SharePoint policy page's actual document body
+renders inside a nested Word Online viewer `<iframe>` (not the top frame), and that document
+is 5 pages -- a single viewport capture only ever shows page 1.
+
+**`args.frame_id`** crops a `screenshot` to one frame's own on-screen region (an integer from a
+prior `read`/`snapshot`'s `frames` entries), instead of the whole tab. Requires
+`args.capture_hidden: true` -- cropping uses CDP's `Page.captureScreenshot` `clip` parameter,
+which `chrome.tabs.captureVisibleTab` has no equivalent for. Computing the region requires
+walking the frame's ANCESTOR chain (`chrome.webNavigation.getAllFrames` gives
+`frameId`/`parentFrameId`/`url` -- the real containment hierarchy) and, at each level, finding
+the `<iframe>`/`<frame>` element in the PARENT's own DOM whose `getBoundingClientRect()` gives
+the on-screen offset/size. `window.frameElement` (read from inside the child frame) was
+considered and rejected: it is `null` for a cross-origin child by design (a browser security
+restriction, not a bug) -- exactly the SharePoint-embeds-officeapps.live.com case this exists
+for. Fails loud (naming the frame id and what went wrong) if the frame can't be found in the
+current tree, or its containing element can't be located in its parent.
+
+**`args.multi_page: true`** scrolls the target frame's own scrollable element (or
+`args.scroll_selector`, a CSS selector for a specific scrollable container) and captures at
+each stop, until it detects the end of the scrollable region or hits `args.max_pages` (default
+10, hard cap 50) -- whichever comes first. `args.page_delay_ms` (default 350) is the settle
+delay between scrolling and capturing, for content that needs a moment to (re-)render.  Returns
+a `pages` array (each with its own `base64`), plus `page_count`, `capped` (true if `max_pages`
+was hit before the real end), and `stopped_reason` -- **honestly reported, never silently
+returning a partial capture as if it were the complete document.**
+
+Combine with `frame_id` to scroll and capture pages of a specific embedded viewer rather than
+the whole tab.
+
+### Vision-based extraction
+
+Two mechanisms exist for turning pixels into something a caller can use, and this system
+deliberately keeps them distinct rather than picking one automatically (design doc §13,
+"Mechanism, not policy"):
+
+1. **Return pixels** -- `screenshot` (above). No model call, ever. A vision-capable MCP client
+   consumes the returned image content block directly with zero extra cost.
+2. **Return text extracted from pixels** -- `vision_read`, an **agent-surface-only** operation
+   (CLI `abb vision-read`, MCP tool `browser_vision_read`, Amplifier tool `browser_vision_read`)
+   -- **not a wire-protocol command**. It composes an ordinary `screenshot` call (with whatever
+   `frame_id`/`multi_page`/etc. args the caller supplies) with a real call to an external
+   vision-capable LLM (`src/amplifier_browser_bridge/vision.py`), and returns the extracted text.
+
+**Why `vision_read` is not a hub/extension command:** the hub and extension's job is mechanism
+-- reliable, capability-scoped pixel capture, with zero knowledge of what happens to the bytes
+afterward. Calling an external model is a policy decision (which model, whether to spend the
+latency/cost at all) that only the calling agent can make correctly. Baking a "if the capture
+looks thin, try vision" heuristic into `screenshot` itself would be exactly the automatic,
+silent-substitution mistake `read`'s original frame-ranking logic made (see the design doc's
+worked example). Keeping the model call in a separate, explicitly-named Python-lib
+composition means the hub/extension never import an LLM SDK or hold a model API key, and
+`screenshot` remains fully useful with zero vision provider configured.
+
+**Provider configuration:** no project-specific model/provider convention exists in this
+standalone repo, so `vision.py` follows the same env-var-configured-provider pattern
+documented in Amplifier's `image-vision` skill: `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` /
+`OPENAI_API_KEY`, checked in that order (first one present wins), or `ABB_VISION_PROVIDER`
+(`gemini`/`anthropic`/`openai`) to pin a specific one, with `ABB_VISION_MODEL` to override the
+default model. **Fails loud** with a message naming exactly which environment variable(s)
+would resolve it if none is configured -- never silently returns empty text.
+
+```json
+{"ok": true, "result": {
+  "text": "...extracted text...",
+  "vision_provider": "anthropic",
+  "vision_model": "claude-3-5-sonnet-latest",
+  "image_count": 5,
+  "page_count": 5,
+  "capped": false,
+  "stopped_reason": "reached end of scrollable content",
+  "frame_id": 862
+}}
+```
+
+If the underlying `screenshot` capture is queued (non-`live` device) or fails, that shape is
+returned unchanged -- the vision model is **never** called without a real captured image in
+hand.
+
+### Discoverable alternatives, not automatic escalation
+
+When a command fails in a way another mechanism would solve, the **error text** names the
+alternative -- it never retries the command a different way itself (see docs/designs/
+browser-bridge.md's "Mechanism, not policy" section):
+
+- A `read`/`snapshot` timeout mentions `args.all_frames=true` (if not already set) or
+  `args.frame_id=<id>` (if it was) as something the caller may choose; a `click`/`type`/`key`
+  timeout mentions `args.trusted=true` (CDP-backed input).
+- A CDP-requiring command (`args.trusted`/`args.capture_hidden`) on a device without
+  `chrome.debugger` (e.g. Edge Android) names the capability as unavailable **and** names what
+  the device can still do instead (untrusted injected input; active-tab-only screenshot).
+- `fetch_bytes` failing with an HTTP/fetch error mentions `grab_image` as the page-context
+  alternative; `grab_image` failing mentions `fetch_bytes` back.
+
+This is discoverability, not decision-making -- the calling agent still chooses.
+
+### Discarded tabs
+
+At real-world scale (hundreds of tabs open), Edge discards (unloads the renderer of) most
+background tabs to reclaim memory. A discarded tab has no live page for
+`chrome.scripting.executeScript` to inject into. Before this fix, a command against a discarded tab
+surfaced Edge's own, genuinely misleading error: `"Cannot access contents of the page. Extension
+manifest must request permission to access the respective host."` -- `<all_urls>` is granted; the
+real cause is "there is no live renderer here right now," not a permissions problem.
+
+- **`tabs` results now include `discarded` (bool) and `status` (`"loading"` / `"complete"` /
+  `"unloaded"`)** on every entry, so a caller can see which tabs are live before acting on one.
+- **A `PAGE_WORLD_COMMAND` against a discarded tab fails loud with a specific, actionable error**
+  naming the real cause, instead of passing through Edge's misleading one.
+- **Waking a discarded tab requires reloading it**, which destroys in-page state (unsaved form
+  data, scroll position, ephemeral JS state) -- co-working etiquette (design doc §6.3) requires this
+  be explicit, never a hidden side effect of an ordinary read. Pass `args.wake: true` to opt in; the
+  extension reloads the tab, waits for it to finish loading, and only then runs the command. The
+  result carries `"woke": true` and a `"wake_reason"` string so the caller can tell its own read
+  triggered a reload rather than reading the tab's pre-existing state.
+- **A tab the agent is actively engaged with is marked `autoDiscardable: false`** (best-effort,
+  never fails the calling command) so Edge does not immediately re-discard a tab the agent just woke
+  or acted on. This is applied per-tab, on deliberate engagement (any page-world command,
+  `navigate`, `tab_activate`, `screenshot`, or CDP `attach`) -- never blanket-applied across an
+  entire `tabs` listing.
+- **CDP sidesteps this differently, not for free**: `chrome.debugger.attach()` on a discarded tab
+  was observed (live, against a real discarded tab) to force Edge to instantiate a live renderer for
+  it -- attach succeeded, and a subsequent plain (non-CDP) `read` immediately succeeded where it had
+  failed before attaching, with **no explicit wake/reload call**. This is not free of the same
+  state-loss caveat as an explicit `wake: true` -- a discarded tab has no renderer at all, so making
+  one live is observably equivalent to a reload; it is simply automatic (a side effect of attaching)
+  rather than opt-in. Any command that escalates to CDP (`trusted: true`, `capture_hidden: true`)
+  attaches first via the hub's own pre-flight (`_ensure_cdp_attached`), so this happens before the
+  real command ever reaches the device.
+
+### Extension self-reload
+
+Unpacked extensions do not pick up file changes on disk automatically -- normally this requires a
+human to click Reload in `edge://extensions` after every code update. The `reload` command
+(`chrome.runtime.reload()`) makes this self-service from an already-connected agent surface:
+
+```json
+{"v": 1, "id": "...", "type": "command", "command": "reload", "target": {"device_id": "..."}, "args": {}, "token": "..."}
+```
+
+The extension acks (`{"ok": true, "result": {"reloading": true}}`) *before* actually reloading --
+`chrome.runtime.reload()` terminates the service worker close to immediately, so the ack is sent
+first and the reload is deferred briefly (~250ms) to give it time to flush over the websocket.
+
+**The very first deployment of this command still requires one manual reload.** An extension has to
+already be running code that understands the `reload` command before it can reload itself into a
+version that understands it -- there is no way around that single bootstrap step. Every subsequent
+iteration is self-service via `abb reload <device_id>`.
 
 Commands are partitioned into `PAGE_WORLD_COMMANDS` (dispatched into `injected.js` running in
 the page's isolated world) and `BROWSER_LEVEL_COMMANDS` (handled directly by
 `background.js` against `chrome.tabs`/`chrome.windows`/`chrome.debugger`, which are not
 reachable from page context). See `protocol.py` for the exact partition.
+
+### Command timeout
+
+`Hub._send_and_await` waits for a device's `result` before returning to the caller (or,
+for a queued/non-`live` device, before a drained command's later `poll()` resolves).
+Real-world finding that motivated this section: `read` against a heavy SPA
+(`repos.opensource.microsoft.com`'s Open Source Management Portal) timed out at the prior
+fixed `30.0s` default even though the tab was awake and reporting `status: "complete"` --
+injection + shadow-DOM-piercing traversal on a large, fully hydrated single-page app can
+genuinely take longer than 30s.
+
+**Three coherent, non-overlapping layers** (each a different *scope*, not three ways to say the
+same thing):
+
+1. **Hub default** (`hub.py`'s `DEFAULT_COMMAND_TIMEOUT`, now **120.0s**, was 30.0s) -- applies
+   to every command that doesn't override it. Configurable per hub process via
+   `abb hub --command-timeout <seconds>`.
+2. **Per-command override** -- any command's `args` may include `timeout_s` (a float, seconds).
+   This is a **hub-only** arg (see `protocol.py`'s `HUB_ONLY_ARGS`): `Hub.send_command` pops and
+   validates it *before* building the `QueuedCommand` sent to the device -- it never reaches
+   `injected.js`/`background.js` over the wire. Accepted range: `MIN_COMMAND_TIMEOUT` (1.0s) to
+   `MAX_COMMAND_TIMEOUT` (600.0s); anything else fails loud with `{"ok": false, "error":
+   "args.timeout_s must be between 1.0 and 600.0 seconds, got: ..."}` rather than being silently
+   clamped. A command that queues on a non-`live` device carries its `timeout_s` override with it
+   (`QueuedCommand.timeout`) and still honors it once drained later -- it does not silently revert
+   to the hub default just because dispatch was deferred.
+3. **CLI/MCP/tool-module surface**: the CLI exposes `--timeout <seconds>` on every
+   tab/device-targeting subcommand (translates to `args.timeout_s`); the MCP server and the
+   Amplifier tool module expose the same thing as a `timeout_s` parameter/property. One name
+   (`timeout_s`/`--timeout`), one meaning, everywhere.
+
+**On timeout, the error is actionable, not just "timeout"**:
+
+```json
+{
+  "ok": false,
+  "error": "timeout waiting 120.0s for device result on command 'read' (device=cb8d..., tab_id=1565892316). The page may still be loading or a heavy SPA may still be hydrating. Raise the limit for just this command with args.timeout_s=<seconds> (CLI: --timeout <seconds>; MCP tools: timeout_s param), up to 600.0s, or raise the hub's own default with `abb hub --command-timeout <seconds>`."
+}
+```
+
+**Interaction with `wait_for`/`wait_text`'s `timeout_ms`**: that field is a page-side polling
+deadline (`injected.js` polls every 150ms up to `timeout_ms`), a completely different scope from
+the hub's device-round-trip wait. If a caller raises `timeout_ms` past the hub's configured
+`command_timeout`, the hub will give up on the round trip and return a timeout error *before* the
+in-page poll itself finishes -- raise `--timeout`/`args.timeout_s` to at least
+`timeout_ms / 1000` (plus margin) when using a long `wait_for`/`wait_text`.
+
+**SPA hydration caveat for `wake`/`navigate`**: `chrome.tabs.onUpdated` reports `status:
+"complete"` when the browser finishes loading the document and its static resources -- for a
+heavy client-rendered SPA, this fires well before the app has finished hydrating and rendering
+real content. A `wake: true` reload (see "Discarded tabs" above) that returns as soon as the tab
+reports `status: "complete"` can hand back a mostly-empty shell page rather than the app's actual
+content (observed live: a woken heavy-SPA tab returned only a loading-placeholder string). This
+system does **not** attempt to detect "real" hydration completion -- there is no reliable,
+site-agnostic signal for it. Callers driving a known-heavy SPA should follow a `wake`/`navigate`
+with an explicit `wait_for`/`wait_text` targeting a selector or text string that only appears once
+the app has actually rendered, rather than assuming the immediate `read`/`snapshot` reflects final
+content.
 
 ### Optional policy-hint args
 
@@ -368,6 +770,32 @@ targeting a `ref`: the hub resolves `label`/`input_type` from its own remembered
 section and `Hub._ingest_result`). A caller-supplied value always takes precedence over the
 remembered one. `page_url` was already resolved this way (from the hub's `_tab_hosts` cache) in
 earlier phases. Explicitly supplying any of these is still supported and still wins.
+
+### Boolean argument coercion
+
+Every boolean-intent arg in this system (`args.trusted`, `args.capture_hidden`,
+`args.all_frames`, `args.wake`, `args.multi_page`, `args.active` on `tab_open`) is
+coerced with a shared, tolerant helper -- `truthy()` in
+`src/amplifier_browser_bridge/args_bool.py` (Python side: hub/CLI) and
+`extension/args_bool.mjs` (JS side: extension) -- rather than a strict `is True`/
+`=== true` identity check. This exists because a caller-supplied value can arrive in
+different native shapes depending on which surface sent it:
+
+- The CLI's `cmd` escape hatch (`abb cmd <target> screenshot --arg capture_hidden=true`)
+  parses **every** `--arg key=value` as a plain string -- `"true"`, never the bool `True`.
+- The MCP server / Amplifier tool module pass a real bool from their own typed parameters.
+- A caller scripting the wire protocol directly could send a bare `1`/`0`.
+
+A strict identity check silently treats the first and third cases as `False`. This was a
+real, reported bug: `abb cmd <target> screenshot --arg capture_hidden=true` sent the string
+`"true"`; `cdp.py`'s `requires_cdp()` checked `args.get("capture_hidden") is True`, which is
+`False` for a string; the hub never escalated to CDP, and the device failed loud with
+"screenshot requires the target tab to already be active" -- despite the caller passing
+exactly the flag meant to prevent that. `truthy()` recognizes real `True`/`true`
+(JS)/`False`/`false`, the strings `"true"`/`"1"` (case-insensitive, whitespace-trimmed) as
+true, and everything else (including `None`/missing/`"false"`/`0`) as false -- see
+`tests/test_args_bool.py` and `extension/args_bool.test.mjs`, which enumerate every boolean
+arg in the codebase and assert each accepts `True`, `"true"`, and `1`.
 
 ### CDP escalation args (Phase 4)
 

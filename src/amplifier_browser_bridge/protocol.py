@@ -57,6 +57,41 @@ COMMANDS: frozenset[str] = frozenset(
         # machine and docs/PROTOCOL.md for the wire shape).
         "attach",
         "detach",
+        # Phase 5 (real-profile hardening): explicit extension self-reload,
+        # so an unpacked-extension update on the browser device is
+        # self-service from an already-connected agent surface instead of
+        # requiring a manual click in edge://extensions every iteration --
+        # see docs/PROTOCOL.md and background.js's `reloadExtension()`.
+        # Device-only target, like `tab_open`; no tab_id involved.
+        "reload",
+        # Content-extraction mechanisms (design doc's "Mechanism, not policy"
+        # section). Each is a DISTINCT extraction strategy with different
+        # tradeoffs -- the caller picks, this layer never substitutes one for
+        # another or silently escalates between them:
+        #
+        #   fetch_bytes    -- extension-context fetch, credentials: "include"
+        #                     (rides the user's cookies for the target origin).
+        #                     Device-only target; see background.js's fetchBytes().
+        #   grab_image     -- fetch from the PAGE's own MAIN-world script context,
+        #                     so the request carries the page's real Referer/cookie
+        #                     context -- defeats hotlink protection an
+        #                     extension-context fetch would trip. Needs a tab_id.
+        #   downloads_list -- chrome.downloads.search: recent entries + a precise
+        #                     max_download_id baseline. Device-only target.
+        #   download       -- chrome.downloads.download: trigger a download
+        #                     directly, returning ITS OWN definite download_id.
+        #                     Device-only target.
+        #   wait_download  -- poll (never sleep) for a completed download, either
+        #                     a specific download_id or a NEW one after a baseline
+        #                     since_id (+ optional filename pattern) -- the
+        #                     baseline+pattern approach so a download the human
+        #                     started themselves is never claimed as the agent's.
+        #                     Device-only target.
+        "fetch_bytes",
+        "grab_image",
+        "downloads_list",
+        "download",
+        "wait_download",
     }
 )
 
@@ -75,6 +110,22 @@ BROWSER_LEVEL_COMMANDS: frozenset[str] = COMMANDS - PAGE_WORLD_COMMANDS
 # HOW to satisfy the request (attach bookkeeping, capability check) and is the
 # only writer of the wire-level `_cdp` flag the device actually acts on.
 CDP_INTENT_ARGS: frozenset[str] = frozenset({"trusted", "capture_hidden"})
+
+# Optional args recognized ONLY by the hub, on ANY command -- unlike
+# CDP_INTENT_ARGS (which describe caller intent that the hub translates into a
+# wire-level signal the DEVICE acts on), these never reach the device at all.
+# `Hub.send_command` pops them from `args` before a `QueuedCommand` is built
+# (see hub.py's module docstring, "single choke point") -- the extension has no
+# code path that reads them, so they never appear on the `/device` route wire.
+#
+# `timeout_s` (float, seconds): overrides the hub's default wait for THIS
+# device round trip only -- see hub.py's DEFAULT_COMMAND_TIMEOUT and
+# MIN/MAX_COMMAND_TIMEOUT for the accepted range. Real-world finding that
+# motivated this: a heavy SPA (repos.opensource.microsoft.com's Open Source
+# Management Portal) needed noticeably longer than the prior fixed 30s to
+# finish injection + traversal even once `status: "complete"` -- see
+# docs/PROTOCOL.md's "Command timeout" section.
+HUB_ONLY_ARGS: frozenset[str] = frozenset({"timeout_s"})
 
 # ---------------------------------------------------------------------------
 # Message type vocabularies
