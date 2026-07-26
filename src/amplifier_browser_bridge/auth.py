@@ -66,3 +66,68 @@ def load_token_store(path: str | Path | None = None) -> TokenStore:
                 device_tokens = {str(k): str(v) for k, v in devices.items()}
 
     return TokenStore(default_token=default_token, device_tokens=device_tokens)
+
+
+def resolve_token_file(path: str | Path | None = None) -> Path:
+    """The exact token-file path `load_token_store` would read from, for callers
+    (doctor.py, cli.py) that need to DISPLAY it -- must use the identical resolution
+    order (explicit path, then $ABB_TOKEN_FILE, then the default) or the path shown
+    to a user can silently disagree with the one actually consulted."""
+    return Path(path or os.environ.get("ABB_TOKEN_FILE") or DEFAULT_TOKEN_FILE).expanduser()
+
+
+def find_sibling_token_files(active_path: str | Path) -> list[Path]:
+    """Other files in the same directory as the active token file whose name
+    suggests they might ALSO be a token store (contains "token", case-insensitive).
+
+    This is the concrete failure mode `abb doctor`/`abb init` guard against: a stray
+    file -- hand-created, left over from before this project settled on
+    `tokens.json`, or copied from somewhere else entirely -- sitting unconsulted
+    beside the one `abb init`/`abb hub`/`abb doctor` actually read from. There is no
+    other supported token-file name in this project; any match here is, by
+    definition, not part of the active configuration.
+    """
+    active = Path(active_path).expanduser().resolve()
+    parent = active.parent
+    if not parent.is_dir():
+        return []
+    candidates = []
+    for entry in parent.iterdir():
+        if not entry.is_file():
+            continue
+        if entry.resolve() == active:
+            continue
+        if "token" in entry.name.lower():
+            candidates.append(entry)
+    return sorted(candidates)
+
+
+def extract_token_value(path: str | Path) -> str | None:
+    """Best-effort extraction of a single token-like value from a candidate sibling
+    file, for comparison only -- never raises on unreadable/malformed content.
+    Handles both the JSON shape this project's own token files use
+    (`{"default": "...", "devices": {...}}`) and a bare single-token text file (the
+    shape a hand-created file is likely to have)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        first_line = text.splitlines()[0].strip()
+        return first_line or None
+    if isinstance(data, dict):
+        default = data.get("default")
+        return default if isinstance(default, str) else None
+    if isinstance(data, str):
+        return data
+    return None
+
+
+def mask_token(token: str) -> str:
+    """Truncate a token for display -- doctor/init output should never print a full
+    secret to a terminal (which may be logged, screen-shared, or scrolled back)."""
+    return f"{token[:8]}..." if len(token) > 8 else "***"

@@ -40,6 +40,11 @@ docs/                           design doc, protocol, policy, agent surfaces
 
 This project uses [`uv`](https://docs.astral.sh/uv/) for environment and dependency management.
 
+**This is the CONTRIBUTOR install path** -- an *editable* install that resolves imports straight
+back to this checkout, so edits to `src/amplifier_browser_bridge/` take effect immediately with
+no reinstall. If you just want to USE amplifier-browser-bridge (not develop it), see README.md's
+Quickstart instead: `uv tool install .` is the normal, non-editable user install.
+
 ```bash
 uv pip install -e ".[dev]"   # or: uv pip install -e . pytest ruff pyright
 ```

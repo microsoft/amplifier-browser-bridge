@@ -16,7 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .auth import DEFAULT_TOKEN_FILE, load_token_store
+from .auth import (
+    TokenStore,
+    extract_token_value,
+    find_sibling_token_files,
+    load_token_store,
+    mask_token,
+    resolve_token_file,
+)
 from .client import HubClient, HubError
 
 CheckStatus = Literal["ok", "fail", "skipped"]
@@ -33,6 +40,45 @@ class DoctorCheck:
         return self.status == "ok"
 
 
+def _check_token_file_siblings(active_path: Path, store: TokenStore) -> DoctorCheck:
+    """Detect a stray token-like file sitting beside the active token file, holding
+    a different value than the one actually consulted -- see auth.py's
+    `find_sibling_token_files`/`extract_token_value` docstrings for the exact
+    failure mode this guards against (a hand-created or leftover file that was
+    never read by any command, but that a user might reasonably have pasted into
+    the extension's options page instead of the real token)."""
+    siblings = find_sibling_token_files(active_path)
+    divergent: list[tuple[Path, str]] = []
+    for sibling in siblings:
+        value = extract_token_value(sibling)
+        if value is None:
+            continue
+        if store.default_token is None or value != store.default_token:
+            divergent.append((sibling, value))
+
+    if divergent:
+        names = ", ".join(f"{p} (starts {mask_token(v)})" for p, v in divergent)
+        return DoctorCheck(
+            "token_file_siblings",
+            "fail",
+            f"found token-like file(s) beside {active_path} that are NOT read by abb "
+            f"init/hub/doctor and hold a different value: {names}. Only {active_path} "
+            "(or $ABB_TOKEN_FILE) is consulted -- if one of these is what you pasted "
+            "into the extension's options page, the hub will reject it. Delete the "
+            "stray file or copy its value into the active token file.",
+        )
+    if siblings:
+        return DoctorCheck(
+            "token_file_siblings",
+            "ok",
+            f"other token-like file(s) found alongside {active_path} but they match "
+            f"the active token: {', '.join(str(p) for p in siblings)}",
+        )
+    return DoctorCheck(
+        "token_file_siblings", "ok", f"no other token-like files found alongside {active_path}"
+    )
+
+
 async def run_doctor(
     hub_url: str,
     token: str | None,
@@ -43,7 +89,7 @@ async def run_doctor(
     hub_url) is captured as a `DoctorCheck` with `status="fail"` instead."""
     checks: list[DoctorCheck] = []
 
-    file_path = Path(token_file or DEFAULT_TOKEN_FILE).expanduser()
+    file_path = resolve_token_file(token_file)
     store = load_token_store(token_file)
     if store.auth_enabled:
         checks.append(DoctorCheck("token_store", "ok", f"auth enabled; token file: {file_path}"))
@@ -57,6 +103,7 @@ async def run_doctor(
                 "another device.",
             )
         )
+    checks.append(_check_token_file_siblings(file_path, store))
 
     client = HubClient(hub_url, token=token)
     try:

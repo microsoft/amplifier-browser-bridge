@@ -8,6 +8,7 @@ purely local (no network) and tested directly against a token file.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -126,6 +127,73 @@ async def test_doctor_reports_unreachable_hub_distinctly(tmp_path: Path, token_f
     assert _by_name(checks, "token_match").status == "skipped"
     assert _by_name(checks, "device_connected").status == "skipped"
     assert all_ok(checks) is False
+
+
+def test_doctor_reports_divergent_sibling_token_file(tmp_path: Path) -> None:
+    """Bug C regression: a stray file beside the active token file, holding a
+    DIFFERENT value, must be reported -- not silently ignored the way it was when
+    a hand-created `hub.token` sat next to `tokens.json` and only `tokens.json` was
+    ever consulted."""
+    token_path = tmp_path / "tokens.json"
+    token_path.write_text(json.dumps({"default": "d5112ff3aabbcc", "devices": {}}), encoding="utf-8")
+    stray_value = "eEyFb1ur9nabcdef"
+    stray = tmp_path / "hub.token"
+    stray.write_text(f"{stray_value}\n", encoding="utf-8")
+
+    checks = await_run_doctor_local_only(token_path)
+
+    sibling_check = _by_name(checks, "token_file_siblings")
+    assert sibling_check.status == "fail"
+    assert "hub.token" in sibling_check.message
+    assert stray_value not in sibling_check.message  # only a masked (truncated) prefix, never the full value
+    assert "d5112ff3aabbcc" not in sibling_check.message  # nor the active token, even truncated form
+
+
+def test_doctor_does_not_flag_sibling_with_matching_value(tmp_path: Path) -> None:
+    token_path = tmp_path / "tokens.json"
+    token_path.write_text(json.dumps({"default": "same-token", "devices": {}}), encoding="utf-8")
+    identical = tmp_path / "hub.token"
+    identical.write_text("same-token\n", encoding="utf-8")
+
+    checks = await_run_doctor_local_only(token_path)
+
+    sibling_check = _by_name(checks, "token_file_siblings")
+    assert sibling_check.ok
+
+
+def test_doctor_reports_no_siblings_when_none_present(tmp_path: Path) -> None:
+    token_path = tmp_path / "tokens.json"
+    token_path.write_text(json.dumps({"default": "only-one", "devices": {}}), encoding="utf-8")
+
+    checks = await_run_doctor_local_only(token_path)
+
+    sibling_check = _by_name(checks, "token_file_siblings")
+    assert sibling_check.ok
+    assert "no other token-like files" in sibling_check.message
+
+
+def await_run_doctor_local_only(token_path: Path) -> list:
+    """Run doctor against an unreachable hub, purely to exercise the local-only
+    token_store/token_file_siblings checks without needing a real server."""
+    return asyncio.run(run_doctor("ws://127.0.0.1:1/agent", None, token_path))
+
+
+def test_doctor_token_file_path_honors_env_var_not_just_hardcoded_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for a second Bug-C-adjacent inconsistency: the path doctor
+    DISPLAYS must be the same one `load_token_store` actually reads -- previously
+    the displayed path ignored $ABB_TOKEN_FILE and always showed the hardcoded
+    default, so a user following an env-var-based setup saw the wrong path in every
+    message."""
+    custom_path = tmp_path / "custom-tokens.json"
+    custom_path.write_text(json.dumps({"default": "tok", "devices": {}}), encoding="utf-8")
+    monkeypatch.setenv("ABB_TOKEN_FILE", str(custom_path))
+
+    checks = asyncio.run(run_doctor("ws://127.0.0.1:1/agent", None, None))
+
+    token_check = _by_name(checks, "token_store")
+    assert str(custom_path) in token_check.message
 
 
 def test_doctor_reports_auth_disabled_honestly(tmp_path: Path) -> None:

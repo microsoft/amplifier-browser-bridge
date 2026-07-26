@@ -60,12 +60,17 @@ deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brie
 
 ## Quickstart
 
-Every command below was run verbatim against a fresh clone, in a fresh virtualenv, with no
-prior configuration -- see "Verified clean-room install" below for the full transcript.
+**This is the USER install path.** `uv tool install` is what you run to use this project.
+`uv pip install -e .` (an *editable* install) is the CONTRIBUTOR path for iterating on this
+repo's own source -- see CONTRIBUTING.md's "Dev setup" if that's what you're doing instead.
+
+Every command below was run verbatim against a fresh, non-editable install with no prior
+configuration -- see "Verified clean-room install" below for the full transcript.
 
 ```bash
-# 1. Install
-uv pip install -e .
+# 1. Install (a real, non-editable install -- from PyPI once published, or from a local
+#    checkout via `uv tool install .`; either way, NOT `uv pip install -e .`)
+uv tool install .
 
 # 2. First-run setup: generates a hub token, stages the extension into a stable directory,
 #    and prints the exact remaining manual steps.
@@ -152,20 +157,25 @@ extension's options page) to the CLI, MCP server, or `abb doctor`. See `docs/PRO
 
 ### Verified clean-room install
 
-Run 2026-07-26 in a genuinely fresh environment -- new directory, new Python virtualenv, no
-reuse of any already-configured state on the test machine (a separate hub on port 8910 with its
-own token file, never touching the real deployment's port 8900 hub or its token file):
+Run 2026-07-26 with a genuinely NON-editable install -- the exact `uv tool install .` path a
+real user takes, not `uv pip install -e .` (which resolves straight back to a checkout and
+would silently mask a packaging bug like the one this transcript is proving fixed). New
+virtualenv, `ABB_EXTENSION_SRC` explicitly unset, and a separate hub on port 8901 with its own
+token file and its own `$HOME` -- never touching the real deployment's port 8900 hub or
+`~/.config/amplifier-browser-bridge/`:
 
 ```console
-$ uv venv .venv && source .venv/bin/activate
-$ uv pip install -e /path/to/amplifier-browser-bridge
-Resolved 13 packages in 64ms
-   Built amplifier-browser-bridge
+$ uv venv /tmp/abb-cleanroom/.venv --python 3.12
+$ uv pip install --python /tmp/abb-cleanroom/.venv/bin/python /path/to/amplifier-browser-bridge
+Resolved 13 packages in 86ms
+   Building amplifier-browser-bridge @ file:///path/to/amplifier-browser-bridge
+      Built amplifier-browser-bridge @ file:///path/to/amplifier-browser-bridge
 Installed 13 packages
 
-$ abb init --dest ./extension --token-file ./tokens.json --hub-host 127.0.0.1 --hub-port 8910
-Generated new hub token (stored in ./tokens.json).
-Staged extension -> ./extension
+$ env -u ABB_EXTENSION_SRC HOME=/tmp/abb-cleanroom/home \
+    /tmp/abb-cleanroom/.venv/bin/abb init --hub-host 127.0.0.1 --hub-port 8901
+Generated new hub token (stored in /tmp/abb-cleanroom/home/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /tmp/abb-cleanroom/home/.local/share/amplifier-browser-bridge/extension
 
 Remaining steps (manual -- Edge has no CLI for these):
   1. Start the hub: ...
@@ -173,19 +183,28 @@ Remaining steps (manual -- Edge has no CLI for these):
   3. Configure it: ...
   4. Confirm it worked: ...
 
-$ ABB_TOKEN_FILE=./tokens.json abb hub --host 127.0.0.1 --port 8910 &
-amplifier-browser-bridge hub listening on ws://127.0.0.1:8910/device (extensions) and
-ws://127.0.0.1:8910/agent (agents); audit log -> ./abb-audit.jsonl
+$ ls /tmp/abb-cleanroom/home/.local/share/amplifier-browser-bridge/extension/
+args_bool.mjs  background.js  combine_frames.mjs  config_validate.mjs  download_claim.mjs
+fetch_utils.mjs  frame_refs.mjs  injected.js  manifest.json  options.html  options.js
+ref_registry.mjs
 
-$ ABB_HUB_URL=ws://127.0.0.1:8910/agent ABB_TOKEN=<token> abb devices
-[]
+$ ABB_TOKEN_FILE=.../tokens.json abb hub --host 127.0.0.1 --port 8901
+amplifier-browser-bridge hub listening on ws://127.0.0.1:8901/device (extensions) and
+ws://127.0.0.1:8901/agent (agents); audit log -> ./abb-audit.jsonl
 
-$ ABB_HUB_URL=ws://127.0.0.1:8910/agent ABB_TOKEN=<token> abb doctor --hub-url ws://127.0.0.1:8910/agent
-[ok]   token_store: auth enabled; token file: ./tokens.json
-[ok]   hub_reachable: hub reachable at ws://127.0.0.1:8910/agent
+$ ABB_HUB_URL=ws://127.0.0.1:8901/agent ABB_TOKEN=<token> abb doctor --hub-url ws://127.0.0.1:8901/agent
+[ok]   token_store: auth enabled; token file: .../tokens.json
+[ok]   token_file_siblings: no other token-like files found alongside .../tokens.json
+[ok]   hub_reachable: hub reachable at ws://127.0.0.1:8901/agent
 [ok]   token_match: token accepted by hub
 [FAIL] device_connected: no browser device has ever connected to this hub. ...
 ```
+
+Before this fix, the `abb init` step above raised `ExtensionSourceNotFoundError` on a
+non-editable install -- the wheel didn't contain `extension/` at all (see
+`[tool.hatch.build.targets.wheel.force-include]` in `pyproject.toml` and
+`tests/test_packaging.py`, which builds a real wheel and asserts every file `abb init` needs
+is actually inside it).
 
 The extension was loaded via Playwright's headless Chromium (`--load-extension=./extension
 --user-data-dir=./profile --remote-debugging-port=<port>`). Verified via CDP's `/json/list`:
