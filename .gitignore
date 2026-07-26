@@ -14,6 +14,10 @@ build/
 tokens.json
 *.token
 audit*.jsonl
+# Android CRX signing key (scripts/package-android.sh) -- defense in depth; the
+# default location is already outside the repo (~/.config/...), this guards
+# against ABB_ANDROID_SIGNING_KEY ever pointing inside it by mistake.
+*.pem
 
 # Editors / OS
 .DS_Store
