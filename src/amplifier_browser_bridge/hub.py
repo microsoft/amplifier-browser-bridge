@@ -48,9 +48,12 @@ and docs/PROTOCOL.md's CDP section.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import math
+import signal
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -93,6 +96,61 @@ DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS = 30.0
 # intake" section). `tabs` is handled separately since its result is a *list* of
 # per-tab entries rather than one url -- see `_ingest_result` below.
 _URL_BEARING_RESULT_COMMANDS = frozenset({"navigate", "snapshot", "read"})
+
+
+class HubBindError(RuntimeError):
+    """Raised by `serve_hub` when the hub cannot bind its listening socket -- e.g.
+    the port is already in use. `cli.py` catches this and reports it via
+    `click.ClickException` (a clean message, no raw traceback) -- never a bare
+    `OSError` escaping to the user."""
+
+
+async def serve_hub(
+    app: web.Application, host: str, port: int, *, on_bound: Callable[[], None] | None = None
+) -> None:
+    """Bind `app` to (host, port) and serve until SIGINT/SIGTERM, calling `on_bound`
+    (if given) only once the bind has actually succeeded.
+
+    This is deliberately not `aiohttp.web.run_app` -- that helper hides the bind
+    inside its own call, which is exactly what let the old `cli.py` print a
+    "listening" banner and THEN fail with an unhandled `OSError` when the port was
+    already taken. Binding explicitly, first, via `AppRunner`/`TCPSite` means a
+    caller can announce success only once it is actually true -- this project's
+    fail-loud convention (CONTRIBUTING.md), applied to hub startup itself.
+
+    Raises `HubBindError` (never a raw `OSError`) if the bind fails, with a message
+    that names the port and, for the common case (another hub already running),
+    suggests how to check for it.
+    """
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    try:
+        await site.start()
+    except OSError as e:
+        await runner.cleanup()
+        if e.errno == errno.EADDRINUSE:
+            raise HubBindError(
+                f"port {port} on {host} is already in use -- a hub may already be running there. "
+                f"Check with: ss -ltnp | grep {port} (or lsof -i :{port}). Either stop that hub, "
+                "or start this one on a different --port."
+            ) from e
+        raise HubBindError(f"could not bind {host}:{port}: {e}") from e
+
+    if on_bound is not None:
+        on_bound()
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # signal handlers unsupported on this platform/thread -- best effort
+    try:
+        await stop.wait()
+    finally:
+        await runner.cleanup()
 
 
 class _DeviceAuthError(Exception):

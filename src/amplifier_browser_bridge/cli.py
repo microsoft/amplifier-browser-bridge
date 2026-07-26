@@ -21,10 +21,10 @@ import click
 
 from .addressing import TargetError, parse_target
 from .audit import AuditLog
-from .auth import load_token_store
+from .auth import extract_token_value, find_sibling_token_files, load_token_store, mask_token
 from .client import HubClient, HubError
 from .doctor import run_doctor
-from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub
+from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
 from .setup import DEFAULT_STAGE_DIR, ExtensionSourceNotFoundError, ensure_token_file, stage_extension
@@ -727,6 +727,39 @@ def reload(device: str) -> None:
     show_default=True,
     help="Port to print in the printed `abb hub` command.",
 )
+def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -> None:
+    """Print a loud warning if a file that looks like ANOTHER token store sits next
+    to the one `abb init` just wrote/reused, holding a different value.
+
+    This is the concrete failure mode that made "Reusing existing hub token" a lie
+    in practice: the message was true of the file `abb init` actually uses, while an
+    unrelated file (hand-created, or left over from before this project settled on
+    `tokens.json`) sat right beside it, never consulted, holding a token a user might
+    reasonably have pasted into the extension instead of the real one. Surfacing
+    this HERE -- at the point of first friction -- catches it before a confusing
+    auth failure three commands later (`abb doctor` repeats this same check).
+    """
+    divergent = [
+        (path, value)
+        for path in find_sibling_token_files(active_token_file)
+        for value in [extract_token_value(path)]
+        if value is not None and value != active_token
+    ]
+    if not divergent:
+        return
+    click.echo("")
+    click.echo(
+        "WARNING: found other token-like file(s) that abb does NOT read, holding a "
+        "DIFFERENT value than the token above:"
+    )
+    for path, value in divergent:
+        click.echo(f"  {path}  (starts {mask_token(value)})")
+    click.echo(
+        f"Only the token from {active_token_file} (printed below) is valid -- pasting one of "
+        "the files above into the extension's options page will make the hub reject it."
+    )
+
+
 def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, hub_port: int) -> None:
     """First-run setup: generate a hub token, stage the extension, print next steps.
 
@@ -756,6 +789,9 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, h
     action = "Generated new" if token_result.created_new else "Reusing existing"
     click.echo(f"{action} hub token (stored in {token_result.token_file}).")
     click.echo(f"Staged extension -> {staged_dir}")
+
+    _warn_divergent_token_siblings(token_result.token_file, token_result.token)
+
     click.echo("")
     click.echo("Remaining steps (manual -- Edge has no CLI for these):")
     click.echo("")
@@ -825,20 +861,20 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
 )
 def hub(host: str, port: int, token_file: str | None, audit_log: str | None, command_timeout: float) -> None:
     """Run the hub: device registry, per-device command queue, routing, audit log."""
-    from aiohttp import web
-
     token_store = load_token_store(token_file)
     audit_path = audit_log or os.environ.get("ABB_AUDIT_LOG", "./abb-audit.jsonl")
     hub_instance = Hub(
         token_store=token_store, audit_log=AuditLog(audit_path), command_timeout=command_timeout
     )
     app = hub_instance.build_app()
-    click.echo(
+    banner = (
         f"amplifier-browser-bridge hub listening on ws://{host}:{port}/device (extensions) "
-        f"and ws://{host}:{port}/agent (agents); audit log -> {audit_path}",
-        err=True,
+        f"and ws://{host}:{port}/agent (agents); audit log -> {audit_path}"
     )
-    web.run_app(app, host=host, port=port)
+    try:
+        asyncio.run(serve_hub(app, host, port, on_bound=lambda: click.echo(banner, err=True)))
+    except HubBindError as e:
+        raise click.ClickException(str(e)) from e
 
 
 if __name__ == "__main__":

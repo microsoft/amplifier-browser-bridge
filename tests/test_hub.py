@@ -8,12 +8,17 @@ arrive asynchronously over the wire.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import socket
+import time
 from typing import Any
+
+import pytest
 
 from amplifier_browser_bridge.addressing import Target
 from amplifier_browser_bridge.audit import AuditLog
 from amplifier_browser_bridge.auth import TokenStore
-from amplifier_browser_bridge.hub import Hub
+from amplifier_browser_bridge.hub import Hub, HubBindError, serve_hub
 from amplifier_browser_bridge.tiers import Tier
 
 
@@ -379,3 +384,78 @@ def test_auth_per_device_override(tmp_path: Any) -> None:
     assert store.validate("special-tok", device_id="d1") is True
     assert store.validate("default-tok", device_id="d1") is False  # d1 has its own token
     assert store.validate("default-tok", device_id="d2") is True  # d2 falls back to default
+
+
+# ----------------------------------------------------------------------
+# serve_hub -- Bug B regression: bind THEN announce, and turn a bind failure
+# (e.g. address already in use) into a clean HubBindError, never a raw OSError
+# with a traceback.
+# ----------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_serve_hub_binds_before_calling_on_bound(tmp_path: Any) -> None:
+    """The core regression for Bug B: `on_bound` (where the CLI's "listening"
+    banner gets printed) must fire only AFTER the socket is actually bound and
+    accepting connections -- never before."""
+    hub = _hub(tmp_path)
+    app = hub.build_app()
+    port = _free_port()
+    bound_calls: list[bool] = []
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            serve_hub(app, "127.0.0.1", port, on_bound=lambda: bound_calls.append(True))
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if bound_calls:
+                    break
+                await asyncio.sleep(0.05)
+            assert bound_calls, "on_bound was never called"
+
+            # The port must genuinely be accepting connections BY THE TIME
+            # on_bound fired -- not just "we called TCPSite.start() and hoped".
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+                client.settimeout(2.0)
+                client.connect(("127.0.0.1", port))
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+
+
+def test_serve_hub_raises_hub_bind_error_on_port_already_in_use(tmp_path: Any) -> None:
+    """Second regression for Bug B: binding to a port already held by another
+    listener must raise a clean `HubBindError` (never a bare OSError/traceback),
+    and `on_bound` must NEVER be called -- nothing may claim success for a bind
+    that didn't happen."""
+    hub = _hub(tmp_path)
+    app = hub.build_app()
+    port = _free_port()
+    bound_calls: list[bool] = []
+
+    async def run() -> None:
+        # Occupy the port first, exactly like "a hub is already running there".
+        occupier = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupier.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        occupier.bind(("127.0.0.1", port))
+        occupier.listen(1)
+        try:
+            with pytest.raises(HubBindError) as exc_info:
+                await serve_hub(app, "127.0.0.1", port, on_bound=lambda: bound_calls.append(True))
+            assert str(port) in str(exc_info.value)
+            assert "already in use" in str(exc_info.value)
+        finally:
+            occupier.close()
+
+    asyncio.run(run())
+    assert bound_calls == []
