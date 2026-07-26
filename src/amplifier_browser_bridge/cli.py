@@ -267,14 +267,16 @@ def confirm(confirmation_token: str) -> None:
     "agent"` (the default). A confirmation whose session declared `redeem:
     "unredeemable"` is structurally refused here -- the hub enforces this at
     `PolicyEngine.consume_confirmation`, not merely by convention -- because
-    there is no human-approval channel in this system, by design (a channel
-    was considered and explicitly CANCELLED after a live experiment showed the
-    strongest candidate could be driven by the very agent it needed to
-    exclude -- see docs/designs/approval-channel-options.md). If you see that
-    refusal, it is working as intended: this command is not, and must never be
-    treated as, a substitute for real human-in-the-loop approval. There is no
-    such substitute in this system -- if an action must not happen unattended,
-    the way to prevent it is to not grant it in the session's write scope
+    there is no human-approval channel in this system TODAY, by deliberate
+    current decision (a channel was considered and explicitly cancelled for
+    now, after a live experiment showed the strongest candidate could be
+    driven by the very agent it needed to exclude -- see docs/designs/
+    approval-channel-options.md section 0 for the decision and what would
+    reopen it). If you see that refusal, it is working as intended: this
+    command is not, and must never be treated as, a substitute for real
+    human-in-the-loop approval. There is no such substitute in this system
+    right now -- if an action must not happen unattended, the way to prevent
+    it today is to not grant it in the session's write scope
     (`abb session-establish --write ...`), not to rely on a gate firing.
     """
     try:
@@ -569,7 +571,27 @@ def cmd(
 )
 @click.option("--redeem", type=click.Choice(["agent", "unredeemable"]), default="agent", show_default=True)
 @click.option("--unattended", is_flag=True, default=False)
-def session_establish(read: str, write: str, on_unknown: str, redeem: str, unattended: bool) -> None:
+@click.option(
+    "--allow-self-attested-escalation",
+    is_flag=True,
+    default=False,
+    help=(
+        "FIX 3 (product review panel): by default, an action classified into a privilege/"
+        "permission-escalation category (e.g. permission_change) is forced to "
+        "redeem='unredeemable' regardless of write scope -- write scope alone never implies "
+        "'and may self-attest its own escalations.' Pass this flag to opt back into the old "
+        "self-attestable behavior for this session. Cannot be turned on later via "
+        "session-narrow -- see docs/POLICY.md."
+    ),
+)
+def session_establish(
+    read: str,
+    write: str,
+    on_unknown: str,
+    redeem: str,
+    unattended: bool,
+    allow_self_attested_escalation: bool,
+) -> None:
     """Create a new session with a caller-declared write scope
     (docs/designs/confirmation-gate.md, Candidate C). Prints the new
     session_id -- pass it via --session on click/type/navigate/cmd to
@@ -608,6 +630,15 @@ def session_establish(read: str, write: str, on_unknown: str, redeem: str, unatt
 @click.option(
     "--unattended", is_flag=True, default=False, help="Set unattended=true (one-way: False -> True only)."
 )
+@click.option(
+    "--deny-self-attested-escalation",
+    is_flag=True,
+    default=False,
+    help=(
+        "Narrow allow_self_attested_escalation True -> False (one-way -- FIX 3, product "
+        "review panel). It can never be turned back on for this session."
+    ),
+)
 def session_narrow(
     session_id: str,
     read: str | None,
@@ -615,6 +646,7 @@ def session_narrow(
     on_unknown: str | None,
     redeem: str | None,
     unattended: bool,
+    deny_self_attested_escalation: bool,
 ) -> None:
     """Narrow an EXISTING session's scope -- NEVER widens
     (docs/designs/confirmation-gate.md section 11.2): write/read may only
@@ -728,6 +760,91 @@ def policy_summary(audit_log: str | None) -> None:
             "shown_despite_match_events": shown_despite_match_count,
             "by_category": dict(by_category.most_common()),
             "by_rule": dict(by_rule.most_common()),
+        }
+    )
+
+
+@main.command(name="gate-summary")
+@click.option(
+    "--audit-log",
+    default=None,
+    help="Path to the JSONL audit log (default: $ABB_AUDIT_LOG or ./abb-audit.jsonl).",
+)
+def gate_summary(audit_log: str | None) -> None:
+    """Summarize CONFIRMATION GATE activity from the audit log (FIX 4, product review panel).
+
+    The panel's FAIL: "'a gate that fires often will be disabled' -- presented as the deciding
+    rationale for cancelling Phase 6, with zero cited firing-rate or disablement data. ... That
+    same rigor is never applied to the security outcome." This is the instrument: a cheap,
+    read-only summary over the existing audit log (no metrics pipeline, no new storage), so the
+    next person deciding whether the gate is too noisy or too quiet has a number instead of an
+    aphorism.
+
+    Reports: how often the gate fires overall and per category, how often a fired gate is
+    redeemed vs. left to expire (abandoned) vs. refused via the wrong channel, how often the NEW
+    escalation lock (FIX 3, docs/POLICY.md section 3.1) is what forced a gate unredeemable, and
+    how often a command was denied outright by session write scope. Covers `policy_gated`,
+    `policy_confirmed`, `policy_confirmation_expired`, `policy_confirmation_wrong_channel`, and
+    `policy_scope_denied` events -- see audit.py's module docstring for the full event table.
+    """
+    path = Path(audit_log or os.environ.get("ABB_AUDIT_LOG", "./abb-audit.jsonl")).expanduser()
+    if not path.is_file():
+        raise click.ClickException(f"audit log not found: {path}")
+
+    gated_by_category: Counter[str] = Counter()
+    gated_total = 0
+    escalation_locked_count = 0
+    confirmed_count = 0
+    expired_count = 0
+    wrong_channel_count = 0
+    scope_denied_count = 0
+    unclassified_count = 0
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = rec.get("event")
+        if event == "policy_gated":
+            gated_total += 1
+            category = rec.get("category")
+            gated_by_category[category if isinstance(category, str) else "(none)"] += 1
+            if rec.get("escalation_locked") is True:
+                escalation_locked_count += 1
+        elif event == "policy_confirmed":
+            confirmed_count += 1
+        elif event == "policy_confirmation_expired":
+            expired_count += 1
+        elif event == "policy_confirmation_wrong_channel":
+            wrong_channel_count += 1
+        elif event == "policy_scope_denied":
+            scope_denied_count += 1
+        elif event == "policy_unclassified":
+            unclassified_count += 1
+
+    # "Abandoned" = fired but neither confirmed nor yet counted as expired --
+    # still-pending at the moment this summary was run (a token not yet past
+    # its TTL). Not double-counted against expired_count, which only counts
+    # tokens the hub has ALREADY swept.
+    outstanding = gated_total - confirmed_count - expired_count - wrong_channel_count
+    outstanding = max(outstanding, 0)
+
+    _print(
+        {
+            "audit_log": str(path),
+            "gate_fired_total": gated_total,
+            "gate_fired_by_category": dict(gated_by_category.most_common()),
+            "escalation_locked_count": escalation_locked_count,
+            "redeemed_count": confirmed_count,
+            "expired_unredeemed_count": expired_count,
+            "wrong_channel_refused_count": wrong_channel_count,
+            "outstanding_or_abandoned_count": outstanding,
+            "scope_denied_count": scope_denied_count,
+            "unclassified_count": unclassified_count,
         }
     )
 
