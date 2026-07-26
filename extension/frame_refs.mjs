@@ -65,3 +65,31 @@ export function parseQualifiedRef(qualifiedRef) {
   }
   return { frameId, ref: rawRef };
 }
+
+/**
+ * Qualify every node's bare `ref` in a single-frame `snapshot` result with the
+ * frame it came from (Bug 2: snapshot/click disagreed on ref format).
+ *
+ * injected.js's plain `snapshot()` has no notion of frameId, so it returns bare
+ * per-frame refs (e.g. "e29") in `result.nodes`. background.js's single-frame
+ * dispatch paths (the common no-`all_frames` case, and the explicit
+ * `args.frame_id` case) previously only qualified a top-level `result.ref`
+ * (present on e.g. `wait_for`) -- `nodes[].ref` was handed back unqualified,
+ * and `click`/`type`/`key` (which REQUIRE a frame-qualified "f<frameId>.<ref>")
+ * rejected it outright. This mirrors combineSnapshot's per-node shape
+ * (combine_frames.mjs) so a caller sees the same node shape regardless of
+ * which snapshot path served it -- copying a ref straight out of any
+ * `snapshot` result and passing it to `click` always works.
+ *
+ * @param {object|null} result
+ * @param {number} frameId
+ */
+export function qualifySnapshotResult(result, frameId) {
+  if (!result || typeof result !== "object" || !Array.isArray(result.nodes)) return result;
+  return {
+    ...result,
+    nodes: result.nodes.map((node) =>
+      typeof node.ref === "string" ? { ...node, ref: qualifyRef(frameId, node.ref), frame_id: frameId } : node
+    ),
+  };
+}

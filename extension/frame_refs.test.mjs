@@ -11,7 +11,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseQualifiedRef, qualifyRef } from "./frame_refs.mjs";
+import { parseQualifiedRef, qualifyRef, qualifySnapshotResult } from "./frame_refs.mjs";
 
 test("qualifyRef produces the documented f<frameId>.<ref> shape", () => {
   assert.equal(qualifyRef(0, "e12"), "f0.e12");
@@ -79,6 +79,60 @@ test("parseQualifiedRef rejects a qualified ref with no ref after the separator"
 test("parseQualifiedRef rejects non-string input", () => {
   assert.throws(() => parseQualifiedRef(undefined), /not a frame-qualified ref/);
   assert.throws(() => parseQualifiedRef(42), /not a frame-qualified ref/);
+});
+
+// ---------------------------------------------------------------------------
+// Bug 2 (snapshot and click disagree on ref format): qualifySnapshotResult()
+// is what makes copying a ref straight out of a `snapshot` result into
+// `click`/`type`/`key` always work, for the single-frame paths (the common
+// no-`all_frames` case, and the explicit `args.frame_id` case). The
+// multi-frame (`all_frames: true`) path is covered separately by
+// combine_frames.test.mjs's combineSnapshot tests.
+// ---------------------------------------------------------------------------
+
+test("qualifySnapshotResult qualifies every node's bare ref, matching combineSnapshot's shape", () => {
+  const raw = {
+    url: "https://example/admin",
+    title: "Admin",
+    nodes: [
+      { ref: "e29", role: "button", name: "Revoke" },
+      { ref: "e30", role: "link", name: "Docs" },
+    ],
+    child_frames: [],
+    generation: 3,
+  };
+  const result = qualifySnapshotResult(raw, 0);
+  assert.deepEqual(
+    result.nodes.map((n) => n.ref),
+    ["f0.e29", "f0.e30"]
+  );
+  // The qualified ref is IMMEDIATELY usable by click/type/key -- parseQualifiedRef
+  // must accept it with no hand-editing (this is the exact bug: snapshot's bare
+  // "e29" was previously rejected by click's parseQualifiedRef call).
+  for (const node of result.nodes) {
+    assert.doesNotThrow(() => parseQualifiedRef(node.ref));
+  }
+  assert.equal(result.nodes[0].frame_id, 0);
+  // Non-ref fields (generation, title, url, ...) pass through unmodified.
+  assert.equal(result.generation, 3);
+  assert.equal(result.title, "Admin");
+});
+
+test("qualifySnapshotResult works for a non-zero explicit frame_id too", () => {
+  const raw = { url: "u", title: "t", nodes: [{ ref: "e5", role: "button", name: "Go" }] };
+  const result = qualifySnapshotResult(raw, 7);
+  assert.equal(result.nodes[0].ref, "f7.e5");
+  assert.equal(result.nodes[0].frame_id, 7);
+});
+
+test("qualifySnapshotResult is a safe no-op for results with no nodes array (e.g. read/wait_for)", () => {
+  assert.deepEqual(qualifySnapshotResult({ url: "u", title: "t", text: "hi" }, 0), {
+    url: "u",
+    title: "t",
+    text: "hi",
+  });
+  assert.equal(qualifySnapshotResult(null, 0), null);
+  assert.equal(qualifySnapshotResult(undefined, 0), undefined);
 });
 
 test("qualifyRef/parseQualifiedRef round-trip through many frames without collision", () => {
