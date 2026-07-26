@@ -13,6 +13,7 @@ build/
 .abb/
 tokens.json
 *.token
+abb-audit.jsonl
 audit*.jsonl
 # Android CRX signing key (scripts/package-android.sh) -- defense in depth; the
 # default location is already outside the repo (~/.config/...), this guards
