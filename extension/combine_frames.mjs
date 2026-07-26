@@ -83,7 +83,12 @@ export function combineRead(frames, unconfirmedFrames) {
  * into can legitimately live in any frame. Kept alongside combineRead so both
  * combine strategies live in one pure, tested module.
  *
- * @param {Array<{frameId: number, url: string, title: string, nodes: object[]}>} frames
+ * Each frame's own `generation` (Bug 1: stale refs succeed silently -- see
+ * ref_registry.mjs/injected.js) is surfaced on every node it produced and on
+ * that frame's manifest entry -- each frame has its OWN independent counter
+ * (its own `window.__abb`), so there is no single tab-wide generation number.
+ *
+ * @param {Array<{frameId: number, url: string, title: string, nodes: object[], generation: number}>} frames
  * @param {string[]} unconfirmedFrames
  */
 export function combineSnapshot(frames, unconfirmedFrames) {
@@ -91,7 +96,7 @@ export function combineSnapshot(frames, unconfirmedFrames) {
   const nodes = [];
   for (const f of ordered) {
     for (const node of f.nodes || []) {
-      nodes.push({ ...node, ref: qualifyRef(f.frameId, node.ref), frame_id: f.frameId });
+      nodes.push({ ...node, ref: qualifyRef(f.frameId, node.ref), frame_id: f.frameId, generation: f.generation });
     }
   }
   const top = ordered.find((f) => f.frameId === 0) || ordered[0];
@@ -105,6 +110,7 @@ export function combineSnapshot(frames, unconfirmedFrames) {
       url: f.url,
       title: f.title,
       node_count: (f.nodes || []).length,
+      generation: f.generation,
     })),
     unconfirmed_frames: unconfirmedFrames,
   };

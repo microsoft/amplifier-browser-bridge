@@ -113,8 +113,8 @@ test("combineRead handles a single-frame page (the common case) with no frames a
 
 test("combineSnapshot qualifies every node's ref with its owning frame and keeps all frames", () => {
   const frames = [
-    { frameId: 0, url: "u0", title: "t0", nodes: [{ ref: "e1", role: "button", name: "Go" }] },
-    { frameId: 7, url: "u7", title: "t7", nodes: [{ ref: "e1", role: "link", name: "Doc" }] },
+    { frameId: 0, url: "u0", title: "t0", nodes: [{ ref: "e1", role: "button", name: "Go" }], generation: 1 },
+    { frameId: 7, url: "u7", title: "t7", nodes: [{ ref: "e1", role: "link", name: "Doc" }], generation: 3 },
   ];
   const result = combineSnapshot(frames, []);
   assert.equal(result.frame_count, 2);
@@ -127,8 +127,8 @@ test("combineSnapshot qualifies every node's ref with its owning frame and keeps
 
 test("combineSnapshot reports a per-frame manifest ordered by frame_id", () => {
   const frames = [
-    { frameId: 5, url: "u5", title: "t5", nodes: [{ ref: "e1", role: "button", name: "" }] },
-    { frameId: 0, url: "u0", title: "t0", nodes: [] },
+    { frameId: 5, url: "u5", title: "t5", nodes: [{ ref: "e1", role: "button", name: "" }], generation: 2 },
+    { frameId: 0, url: "u0", title: "t0", nodes: [], generation: 1 },
   ];
   const result = combineSnapshot(frames, []);
   assert.deepEqual(
@@ -136,4 +136,18 @@ test("combineSnapshot reports a per-frame manifest ordered by frame_id", () => {
     [0, 5]
   );
   assert.equal(result.frames.find((f) => f.frame_id === 5).node_count, 1);
+});
+
+test("combineSnapshot (Bug 1) surfaces each frame's OWN generation on its nodes and its manifest entry", () => {
+  const frames = [
+    { frameId: 0, url: "u0", title: "t0", nodes: [{ ref: "e1", role: "button", name: "Go" }], generation: 4 },
+    { frameId: 3, url: "u3", title: "t3", nodes: [{ ref: "e9", role: "link", name: "Doc" }], generation: 1 },
+  ];
+  const result = combineSnapshot(frames, []);
+  const nodeF0 = result.nodes.find((n) => n.frame_id === 0);
+  const nodeF3 = result.nodes.find((n) => n.frame_id === 3);
+  assert.equal(nodeF0.generation, 4);
+  assert.equal(nodeF3.generation, 1);
+  assert.equal(result.frames.find((f) => f.frame_id === 0).generation, 4);
+  assert.equal(result.frames.find((f) => f.frame_id === 3).generation, 1);
 });

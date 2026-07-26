@@ -178,7 +178,7 @@ async def test_vision_read_single_image_composes_capture_and_extraction(
     assert result["result"]["image_count"] == 1
     assert captured_images == [raw_bytes]
     # capture_hidden defaults to True for vision_read (unlike raw screenshot)
-    target, command, args = fake.command_calls[0]
+    _target, command, args = fake.command_calls[0]
     assert command == "screenshot"
     assert args["capture_hidden"] is True
 

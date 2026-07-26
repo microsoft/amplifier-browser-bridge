@@ -192,12 +192,15 @@ async def _call_anthropic(cfg: VisionConfig, images: list[bytes], prompt: str, m
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    async with aiohttp.ClientSession() as session, session.post(
-        "https://api.anthropic.com/v1/messages",
-        json=body,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=90),
-    ) as resp:
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(
+            "https://api.anthropic.com/v1/messages",
+            json=body,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as resp,
+    ):
         data = await resp.json()
         if resp.status >= 400:
             raise VisionError(f"Anthropic API returned HTTP {resp.status}: {data}")
@@ -216,12 +219,15 @@ async def _call_openai(cfg: VisionConfig, images: list[bytes], prompt: str, medi
     body = {"model": cfg.model, "max_tokens": 4096, "messages": [{"role": "user", "content": content}]}
     headers = {"authorization": f"Bearer {cfg.api_key}", "content-type": "application/json"}
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    async with aiohttp.ClientSession() as session, session.post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        json=body,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=90),
-    ) as resp:
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            json=body,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as resp,
+    ):
         data = await resp.json()
         if resp.status >= 400:
             raise VisionError(f"OpenAI API returned HTTP {resp.status}: {data}")
@@ -243,12 +249,15 @@ async def _call_gemini(cfg: VisionConfig, images: list[bytes], prompt: str, medi
         )
     body = {"contents": [{"parts": parts}]}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg.model}:generateContent?key={cfg.api_key}"
-    async with aiohttp.ClientSession() as session, session.post(
-        url,
-        json=body,
-        headers={"content-type": "application/json"},
-        timeout=aiohttp.ClientTimeout(total=90),
-    ) as resp:
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(
+            url,
+            json=body,
+            headers={"content-type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=90),
+        ) as resp,
+    ):
         data = await resp.json()
         if resp.status >= 400:
             raise VisionError(f"Gemini API returned HTTP {resp.status}: {data}")
