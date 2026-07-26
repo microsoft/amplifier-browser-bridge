@@ -129,6 +129,195 @@ def test_auth_disabled_when_unconfigured(tmp_path: Any) -> None:
     assert store.validate("anything") is True
 
 
+# ---------------------------------------------------------------------------
+# Gap 2: configurable per-command device-round-trip timeout (real-world finding
+# -- a heavy SPA's `read` timed out at the prior fixed 30s default even at
+# status:"complete"; see hub.py's DEFAULT_COMMAND_TIMEOUT / MIN/MAX_COMMAND_TIMEOUT
+# and protocol.py's HUB_ONLY_ARGS).
+# ---------------------------------------------------------------------------
+
+
+class _NeverRespondingSocket:
+    """A device connection that accepts the send but never resolves the
+    pending future -- simulates a device that is connected (LIVE) but whose
+    command genuinely never returns, so the hub's own wait is what expires."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_json(self, data: dict[str, Any], /) -> None:
+        self.sent.append(data)
+        # Deliberately never resolves record.pending[data["id"]].
+
+
+def test_timeout_s_override_fires_before_the_hub_default(tmp_path: Any) -> None:
+    """A caller-supplied args.timeout_s shorter than the hub's default must be
+    the one that actually expires -- proves the override reaches asyncio.wait_for,
+    not just gets validated and ignored."""
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+    assert record.tier is Tier.LIVE
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "read", {"timeout_s": 1.0})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "timeout waiting 1.0s" in result["error"]
+    assert "'read'" in result["error"]
+    assert "args.timeout_s" in result["error"]  # actionable: names how to raise it
+
+
+def test_timeout_s_rejects_out_of_range_values(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    record.touch()
+
+    async def run(value: Any) -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "read", {"timeout_s": value})
+
+    too_small = asyncio.run(run(0.0))
+    assert too_small["ok"] is False
+    assert "args.timeout_s" in too_small["error"]
+
+    too_large = asyncio.run(run(99999.0))
+    assert too_large["ok"] is False
+    assert "args.timeout_s" in too_large["error"]
+
+    not_a_number = asyncio.run(run("soon"))
+    assert not_a_number["ok"] is False
+    assert "args.timeout_s" in not_a_number["error"]
+
+
+def test_timeout_s_never_reaches_the_device_wire(tmp_path: Any) -> None:
+    """timeout_s is a hub-only knob (protocol.py's HUB_ONLY_ARGS) -- it must never
+    show up in the envelope actually sent to the device."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record)
+    record.ws = fake_ws
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1), "read", {"timeout_s": 5.0, "wake": True}
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is True
+    assert len(fake_ws.sent) == 1
+    assert "timeout_s" not in fake_ws.sent[0]["args"]
+    assert fake_ws.sent[0]["args"] == {"wake": True}  # every OTHER arg still passes through
+
+
+def test_default_timeout_used_when_no_override_given(tmp_path: Any) -> None:
+    """Without args.timeout_s, a command still uses the hub's configured default
+    (proves the override plumbing doesn't silently break the no-override path)."""
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=0.05)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "read", {})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "timeout waiting 0.05s" in result["error"]
+
+
+def test_queued_command_preserves_timeout_override_until_drained(tmp_path: Any) -> None:
+    """A command that queues on a non-live device must not silently revert to the
+    hub default once the device reconnects and the command drains."""
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    hub.registry.get_or_create("d1")  # never bound -- DORMANT
+
+    async def enqueue() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "read", {"timeout_s": 5.0})
+
+    queued = asyncio.run(enqueue())
+    assert queued["status"] == "queued"
+
+    record = hub.registry.get_or_create("d1")
+    assert len(record.queue) == 1
+    stored_cmd = next(iter(record.queue))
+    assert stored_cmd.timeout == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Task 3: discoverable alternatives named in error text (never automatically
+# retried/escalated -- see docs/designs/browser-bridge.md's "Mechanism, not
+# policy" section).
+# ---------------------------------------------------------------------------
+
+
+def test_read_timeout_names_all_frames_as_an_alternative_when_not_already_set(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "read", {"timeout_s": 1.0})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "args.all_frames=true" in result["error"]
+
+
+def test_read_timeout_with_all_frames_already_set_names_frame_id_instead(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1), "read", {"timeout_s": 1.0, "all_frames": True}
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "args.frame_id" in result["error"]
+    # Doesn't re-suggest the option the caller already used.
+    assert "args.all_frames=true gathers" not in result["error"]
+
+
+def test_click_timeout_names_trusted_as_an_alternative(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1, ref="e1"), "click", {"timeout_s": 1.0})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "args.trusted=true" in result["error"]
+
+
+def test_navigate_timeout_names_no_alternative(tmp_path: Any) -> None:
+    """A command with no relevant alternative gets no hint appended -- the
+    hint function must not invent one just to say something."""
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1), "navigate", {"timeout_s": 1.0, "url": "x"}
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert result["error"].rstrip().endswith("--command-timeout <seconds>`.")
+
+
 def test_auth_per_device_override(tmp_path: Any) -> None:
     store = TokenStore(default_token="default-tok", device_tokens={"d1": "special-tok"})
     assert store.validate("special-tok", device_id="d1") is True

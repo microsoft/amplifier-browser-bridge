@@ -15,6 +15,7 @@ Two layers of tests here, deliberately:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -137,6 +138,21 @@ def test_denylist_no_match_for_ordinary_site() -> None:
     denylist = Denylist()
     assert denylist.match("example.com") is None
     assert denylist.match(None) is None
+
+
+def test_auth_denylist_does_not_leak_to_sibling_google_subdomains() -> None:
+    """Bug 2 requirement 2, explicit regression: `accounts.google.com` is
+    denylisted; `docs.google.com` and `mail.google.com` are ordinary content
+    hosts on the SAME parent domain (google.com) and must stay visible unless
+    separately, deliberately listed. Verifies host_matches_domain's
+    suffix-with-dot-boundary semantics specifically for this pair, since it's
+    the exact scenario named in the task."""
+    denylist = Denylist()
+    assert denylist.match("accounts.google.com") is not None
+    assert denylist.match("docs.google.com") is None
+    assert denylist.match("mail.google.com") is None
+    # A genuine subdomain of the denylisted host itself must still match.
+    assert denylist.match("sub.accounts.google.com") is not None
 
 
 def test_denylist_load_from_file_replaces_defaults(tmp_path: Any) -> None:
@@ -264,6 +280,135 @@ def test_hub_tabs_result_filtered_before_reaching_agent(tmp_path: Any) -> None:
     returned_ids = {t["tab_id"] for t in result["result"]}
     assert returned_ids == {10}
     assert 11 not in returned_ids
+
+
+def test_filter_tabs_result_records_matched_domain_and_host_in_audit(tmp_path: Any) -> None:
+    """Bug 2 requirement 3: the audit event for a hidden tab must record the
+    matched rule (category + domain) and the actual host -- previously this
+    event recorded `category` only, which is why the audit log could not
+    explain what was hidden or why."""
+    audit_path = tmp_path / "audit.jsonl"
+    engine = PolicyEngine(AuditLog(audit_path))
+    tabs = [{"tab_id": 2, "window_id": 1, "url": "https://secure.chase.com/dashboard", "title": "Chase"}]
+    engine.filter_tabs_result("d1", tabs)
+
+    lines = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    hidden = [rec for rec in lines if rec["event"] == "policy_tab_hidden"]
+    assert len(hidden) == 1
+    assert hidden[0]["category"] == "financial"
+    assert hidden[0]["matched_domain"] == "chase.com"
+    assert hidden[0]["host"] == "secure.chase.com"
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 case study: discarded-tab exception for the `auth` category only
+# ---------------------------------------------------------------------------
+# A discarded tab has no live renderer -- see policy.py's `_tab_discarded`
+# docstring for the full investigation (a real 531-tab profile had 49 tabs
+# stuck displaying a login.microsoftonline.com OAuth-authorize URL, frozen
+# mid-redirect while backgrounded/discarded; none were interactive login
+# screens). The exception is narrow: `auth` category only, and only while the
+# tab is known-discarded.
+
+
+def test_filter_tabs_result_shows_discarded_auth_tab_instead_of_hiding(tmp_path: Any) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    engine = PolicyEngine(AuditLog(audit_path))
+    tabs = [
+        {
+            "tab_id": 5,
+            "window_id": 1,
+            "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x",
+            "title": "Sign in",
+            "discarded": True,
+        }
+    ]
+    visible = engine.filter_tabs_result("d1", tabs)
+    assert {t["tab_id"] for t in visible} == {5}
+
+    lines = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    shown_events = [rec for rec in lines if rec["event"] == "policy_tab_shown_despite_match"]
+    assert len(shown_events) == 1
+    assert shown_events[0]["category"] == "auth"
+    assert shown_events[0]["reason"] == "discarded_auth_tab"
+    # And it must NOT also appear as hidden.
+    assert not [rec for rec in lines if rec["event"] == "policy_tab_hidden"]
+
+
+def test_filter_tabs_result_still_hides_live_auth_tab(tmp_path: Any) -> None:
+    """The exception must not weaken protection for a tab that IS live (not
+    discarded) and genuinely on an identity-provider host -- e.g. the user
+    actively looking at a real login form right now."""
+    engine = PolicyEngine(AuditLog(tmp_path / "audit.jsonl"))
+    tabs = [
+        {
+            "tab_id": 6,
+            "window_id": 1,
+            "url": "https://accounts.google.com/signin/v2",
+            "title": "Sign in",
+            "discarded": False,
+        }
+    ]
+    visible = engine.filter_tabs_result("d1", tabs)
+    assert visible == []
+
+
+def test_filter_tabs_result_does_not_extend_exception_to_financial_category(tmp_path: Any) -> None:
+    """The discarded-tab exception is scoped to `auth` only -- a discarded
+    financial-category tab must stay hidden. financial/healthcare/
+    password_managers protect against revealing WHICH services the user
+    uses at all, a concern that holds regardless of render state."""
+    engine = PolicyEngine(AuditLog(tmp_path / "audit.jsonl"))
+    tabs = [
+        {
+            "tab_id": 7,
+            "window_id": 1,
+            "url": "https://www.chase.com/dashboard",
+            "title": "Chase",
+            "discarded": True,
+        }
+    ]
+    visible = engine.filter_tabs_result("d1", tabs)
+    assert visible == []
+
+
+def test_evaluate_allows_command_targeting_discarded_auth_tab(tmp_path: Any) -> None:
+    """Request-path symmetry: once a discarded auth-category tab has been
+    observed (e.g. via a prior `tabs` call), a subsequent command explicitly
+    targeting it is allowed through to dispatch -- NOT because the content is
+    now considered safe, but because Bug 1's own discarded-tab check at the
+    extension layer will still refuse to act on it without an explicit
+    `wake=true`. The hub must not double-block ahead of that."""
+    audit_path = tmp_path / "audit.jsonl"
+    engine = PolicyEngine(AuditLog(audit_path))
+    engine.filter_tabs_result(
+        "d1",
+        [
+            {
+                "tab_id": 9,
+                "url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+                "discarded": True,
+            }
+        ],
+    )
+    decision = engine.evaluate(Target(device_id="d1", tab_id=9), "read", {"wake": True})
+    assert decision.status == "allow"
+
+    lines = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    allowed_events = [rec for rec in lines if rec["event"] == "policy_allowed_despite_match"]
+    assert len(allowed_events) == 1
+    assert allowed_events[0]["category"] == "auth"
+
+
+def test_evaluate_still_denies_command_targeting_live_auth_tab(tmp_path: Any) -> None:
+    """Symmetric negative case: a NON-discarded auth-category tab is still
+    denied at the request path -- the exception never applies to a live tab."""
+    engine = PolicyEngine(AuditLog(tmp_path / "audit.jsonl"))
+    engine.filter_tabs_result(
+        "d1", [{"tab_id": 10, "url": "https://accounts.google.com/signin/v2", "discarded": False}]
+    )
+    decision = engine.evaluate(Target(device_id="d1", tab_id=10), "read", {})
+    assert decision.status == "deny"
 
 
 def test_hub_command_targeting_denied_tab_is_rejected(tmp_path: Any) -> None:

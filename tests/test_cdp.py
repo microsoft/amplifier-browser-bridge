@@ -83,6 +83,25 @@ def test_requires_cdp_false_by_default() -> None:
     assert requires_cdp("click", {"_cdp": True}) is False
 
 
+def test_requires_cdp_accepts_string_and_int_true_forms() -> None:
+    """Regression test for a real reported bug: `abb cmd <target> screenshot
+    --arg capture_hidden=true` sends the STRING "true" (the CLI's `cmd` escape
+    hatch always parses --arg key=value as strings). Before args_bool.truthy()
+    was wired in here, `requires_cdp` used a strict `is True` identity check,
+    which silently returned False for a string -- the hub never escalated to
+    CDP, and the device failed loud with "requires the target tab to already
+    be active" despite the caller passing exactly the flag meant to prevent
+    that."""
+    assert requires_cdp("screenshot", {"capture_hidden": "true"}) is True
+    assert requires_cdp("screenshot", {"capture_hidden": 1}) is True
+    assert requires_cdp("click", {"trusted": "true"}) is True
+    assert requires_cdp("type", {"trusted": "TRUE"}) is True
+    assert requires_cdp("key", {"trusted": 1}) is True
+    # And the false-ish string forms must still correctly resolve to False --
+    # not "any string is truthy".
+    assert requires_cdp("screenshot", {"capture_hidden": "false"}) is False
+
+
 # ---------------------------------------------------------------------------
 # cdp.CdpRegistry -- pure state machine
 # ---------------------------------------------------------------------------

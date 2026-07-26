@@ -60,9 +60,15 @@ def test_all_expected_tools_are_registered():
         "browser_tab_close",
         "browser_tab_activate",
         "browser_screenshot",
+        "browser_vision_read",
         "browser_wait_for",
         "browser_wait_text",
         "browser_poll",
+        "browser_fetch_bytes",
+        "browser_grab_image",
+        "browser_downloads_list",
+        "browser_download",
+        "browser_wait_download",
     }
     registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert registered == expected
@@ -239,3 +245,128 @@ async def test_hub_error_surfaces_as_ok_false_not_an_exception(monkeypatch: pyte
     result = await srv.browser_read(device_id="d1", tab_id=1)
 
     assert result == {"ok": False, "error": "unauthorized"}
+
+
+# ---------------------------------------------------------------------------
+# browser_screenshot -- returns MCP image content blocks (pixels, no model call)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_returns_image_content_block(monkeypatch: pytest.MonkeyPatch):
+    import base64
+
+    from mcp.server.fastmcp import Image
+
+    raw = b"\xff\xd8\xfake-jpeg"
+    b64 = base64.b64encode(raw).decode("ascii")
+    fake = _FakeHubClient(
+        {"ok": True, "result": {"tab_id": 7, "format": "jpeg", "base64": b64, "via": "cdp"}}
+    )
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_screenshot(device_id="d1", tab_id=7, capture_hidden=True)
+
+    assert isinstance(result, list)
+    assert isinstance(result[0], Image)
+    assert result[0].data == raw
+    assert isinstance(result[1], dict)
+    assert "base64" not in result[1]  # replaced by the Image content block, not duplicated as text
+    assert result[1]["tab_id"] == 7
+    _, command, args = fake.command_calls[0]
+    assert command == "screenshot"
+    assert args == {"capture_hidden": True}
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_multi_page_returns_one_image_per_page(monkeypatch: pytest.MonkeyPatch):
+    import base64
+
+    from mcp.server.fastmcp import Image
+
+    pages = [
+        {"index": i, "format": "jpeg", "base64": base64.b64encode(f"p{i}".encode()).decode()}
+        for i in range(3)
+    ]
+    fake = _FakeHubClient(
+        {"ok": True, "result": {"tab_id": 7, "pages": pages, "page_count": 3, "capped": False, "via": "cdp"}}
+    )
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_screenshot(device_id="d1", tab_id=7, multi_page=True, max_pages=5)
+
+    assert sum(1 for item in result if isinstance(item, Image)) == 3
+    meta = next(item for item in result if isinstance(item, dict))
+    assert meta["page_count"] == 3
+    _, _, args = fake.command_calls[0]
+    assert args == {"multi_page": True, "max_pages": 5}
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_queued_result_passes_through_as_is(monkeypatch: pytest.MonkeyPatch):
+    queued = {"status": "queued", "command_id": "cmd-1", "tier": "intermittent", "queue_position": 1}
+    fake = _FakeHubClient(queued)
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_screenshot(device_id="d1", tab_id=7)
+
+    assert result == queued  # no image to render -- pass the queued shape through untouched
+
+
+# ---------------------------------------------------------------------------
+# browser_vision_read -- distinct mechanism, real model call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browser_vision_read_composes_screenshot_and_extraction(monkeypatch: pytest.MonkeyPatch):
+    import base64
+
+    raw = b"\xff\xd8\xfake-jpeg"
+    b64 = base64.b64encode(raw).decode("ascii")
+    fake = _FakeHubClient(
+        {"ok": True, "result": {"tab_id": 7, "format": "jpeg", "base64": b64, "via": "cdp"}}
+    )
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    async def _fake_extract_text(images, prompt, **kwargs):
+        return {
+            "text": "extracted!",
+            "provider": "anthropic",
+            "model": "claude-3-5-sonnet-latest",
+            "image_count": 1,
+        }
+
+    monkeypatch.setattr("amplifier_browser_bridge.vision_read.extract_text", _fake_extract_text)
+
+    result = await srv.browser_vision_read(device_id="d1", tab_id=7, prompt="read this")
+
+    assert result["ok"] is True
+    assert result["result"]["text"] == "extracted!"
+    assert result["result"]["vision_provider"] == "anthropic"
+    # capture_hidden defaults to True for vision_read
+    _, command, args = fake.command_calls[0]
+    assert command == "screenshot"
+    assert args["capture_hidden"] is True
+
+
+@pytest.mark.asyncio
+async def test_browser_vision_read_surfaces_config_error_as_ok_false(monkeypatch: pytest.MonkeyPatch):
+    from amplifier_browser_bridge.vision import VisionConfigError
+
+    raw = b"\xff\xd8\xfake-jpeg"
+    import base64
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    fake = _FakeHubClient({"ok": True, "result": {"tab_id": 7, "format": "jpeg", "base64": b64}})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    async def _raise_config_error(*args, **kwargs):
+        raise VisionConfigError("No vision provider is configured -- set ANTHROPIC_API_KEY, ...")
+
+    monkeypatch.setattr("amplifier_browser_bridge.vision_read.extract_text", _raise_config_error)
+
+    result = await srv.browser_vision_read(device_id="d1", tab_id=7)
+
+    assert result["ok"] is False
+    assert "No vision provider is configured" in result["error"]

@@ -24,17 +24,44 @@ class HubError(RuntimeError):
 
 
 class HubClient:
+    # Buffer added on top of a caller's requested `args.timeout_s` for this
+    # CLIENT's own websocket recv() -- must always be at least as generous as
+    # whatever the HUB is willing to wait for its device round trip, or the
+    # client gives up and disconnects before the hub's (still-legitimate)
+    # answer ever arrives. Real-world finding: a `read` with args.timeout_s=45
+    # (comfortably within hub.py's DEFAULT_COMMAND_TIMEOUT) still failed
+    # client-side with a raw asyncio CancelledError/websockets recv() timeout,
+    # because this class's own `timeout` (35.0 default, unrelated to the hub's
+    # timeout) expired first. 10s covers connection setup + JSON round-trip
+    # overhead beyond the hub's own wait.
+    _TIMEOUT_BUFFER_S = 10.0
+
     def __init__(self, url: str, token: str | None = None, timeout: float = 35.0) -> None:
-        """`url` is the full hub agent endpoint, e.g. ws://100.124.126.19:8900/agent."""
+        """`url` is the full hub agent endpoint, e.g. ws://100.124.126.19:8900/agent.
+        `timeout` is this client's OWN default wait for a hub response when no
+        per-command override is known ahead of time (`list_devices`/`poll`, and
+        `command()` calls that don't set `args["timeout_s"]`)."""
         self.url = url
         self.token = token
         self.timeout = timeout
 
-    async def _request(self, req: dict[str, Any]) -> dict[str, Any]:
+    async def _request(self, req: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+        effective_timeout = timeout if timeout is not None else self.timeout
         req = {**req, "token": self.token}
-        async with websockets.connect(self.url, open_timeout=10) as ws:
+        # ping_interval=None: this class opens one connection per request, sends
+        # exactly one message, awaits exactly one correlated reply, and closes
+        # (module docstring) -- there is no long-lived session for a dead-peer
+        # keepalive to protect. Real-world finding: with the library's default
+        # ping_interval/ping_timeout (20s/20s), a legitimately long device round
+        # trip (args.timeout_s raised past ~20s) got the CLIENT's own connection
+        # closed out from under it by `websockets`' keepalive machinery
+        # (`ConnectionClosedError: ... keepalive ping timeout`) well before
+        # `effective_timeout` -- the hub was still working; the client silently
+        # gave up first. `open_timeout` (connection establishment) is unaffected
+        # and stays enforced.
+        async with websockets.connect(self.url, open_timeout=10, ping_interval=None) as ws:
             await ws.send(json.dumps(req))
-            raw = await asyncio.wait_for(ws.recv(), timeout=self.timeout)
+            raw = await asyncio.wait_for(ws.recv(), timeout=effective_timeout)
             resp: dict[str, Any] = json.loads(raw)
         if resp.get("type") == "error":
             raise HubError(resp.get("error", "unknown hub error"))
@@ -47,6 +74,22 @@ class HubClient:
     async def command(
         self, target: Target, command: str, args: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        args = args or {}
+        # If the caller asked the HUB to wait longer than this client's own
+        # default (via args.timeout_s -- see hub.py/protocol.py's HUB_ONLY_ARGS),
+        # this client's own recv() must wait at least that long too, or it
+        # disconnects before the hub's answer can arrive. `timeout_s`'s own
+        # validity (numeric, in-range) is the hub's job (`Hub._extract_timeout_override`);
+        # this is a best-effort read of the same value purely to size the
+        # CLIENT-side wait, so an invalid value here just falls back to
+        # `self.timeout` and lets the hub return its own actionable error.
+        client_timeout = self.timeout
+        raw_timeout_s = args.get("timeout_s")
+        if raw_timeout_s is not None:
+            try:
+                client_timeout = max(self.timeout, float(raw_timeout_s) + self._TIMEOUT_BUFFER_S)
+            except (TypeError, ValueError):
+                pass
         resp = await self._request(
             {
                 "v": PROTOCOL_VERSION,
@@ -54,8 +97,9 @@ class HubClient:
                 "type": "command",
                 "command": command,
                 "target": target.to_dict(),
-                "args": args or {},
-            }
+                "args": args,
+            },
+            timeout=client_timeout,
         )
         return resp
 

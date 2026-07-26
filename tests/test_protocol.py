@@ -66,5 +66,30 @@ def test_command_vocabulary_matches_design_doc() -> None:
         # Phase 4: CDP escalation (design doc §7).
         "attach",
         "detach",
+        # Real-profile hardening: self-service extension reload.
+        "reload",
+        # Content-extraction mechanisms (design doc's "Mechanism, not policy").
+        "fetch_bytes",
+        "grab_image",
+        "downloads_list",
+        "download",
+        "wait_download",
     }
     assert COMMANDS == expected
+
+
+def test_content_extraction_commands_are_browser_level() -> None:
+    """None of the new content-extraction commands are dispatched into
+    injected.js's page-world path -- fetch_bytes/downloads_list/download/
+    wait_download are device-only, and grab_image runs in the page's MAIN
+    world via its own executeScript call, not window.__abb.dispatch()."""
+    for name in ("fetch_bytes", "grab_image", "downloads_list", "download", "wait_download"):
+        assert name in BROWSER_LEVEL_COMMANDS
+        assert name not in PAGE_WORLD_COMMANDS
+
+
+def test_reload_is_a_browser_level_command() -> None:
+    """`reload` is device-only (like `tab_open`) -- no tab involved, so it must
+    not be dispatched into injected.js's page-world path."""
+    assert "reload" in BROWSER_LEVEL_COMMANDS
+    assert "reload" not in PAGE_WORLD_COMMANDS
