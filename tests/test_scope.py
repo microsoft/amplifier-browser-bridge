@@ -97,8 +97,8 @@ def test_narrow_on_unknown_can_skip_directly_to_deny() -> None:
 
 def test_narrow_redeem_moves_forward_only() -> None:
     scope = SessionScope(session_id="s1")
-    scope.narrow(redeem="out_of_band")
-    assert scope.redeem == "out_of_band"
+    scope.narrow(redeem="unredeemable")
+    assert scope.redeem == "unredeemable"
     with pytest.raises(ScopeError):
         scope.narrow(redeem="agent")
 
@@ -114,10 +114,10 @@ def test_narrow_unattended_moves_forward_only() -> None:
 def test_narrow_no_op_on_ordered_fields_is_tolerated() -> None:
     """Re-declaring the SAME value for on_unknown/redeem/unattended is
     harmless (unlike write/read, which require a literal 'strict subset')."""
-    scope = SessionScope(session_id="s1", on_unknown="gate", redeem="out_of_band", unattended=True)
-    scope.narrow(on_unknown="gate", redeem="out_of_band", unattended=True)
+    scope = SessionScope(session_id="s1", on_unknown="gate", redeem="unredeemable", unattended=True)
+    scope.narrow(on_unknown="gate", redeem="unredeemable", unattended=True)
     assert scope.on_unknown == "gate"
-    assert scope.redeem == "out_of_band"
+    assert scope.redeem == "unredeemable"
     assert scope.unattended is True
 
 
@@ -132,7 +132,7 @@ def test_narrow_validates_atomically_before_mutating_anything() -> None:
     WHOLE call must fail, and none of the three valid ones may apply either."""
     scope = SessionScope(session_id="s1", write=("github.com", "contoso.com"), on_unknown="allow")
     with pytest.raises(ScopeError):
-        scope.narrow(write=("github.com",), on_unknown="gate", redeem="out_of_band", unattended="not-a-bool")
+        scope.narrow(write=("github.com",), on_unknown="gate", redeem="unredeemable", unattended="not-a-bool")
     assert scope.write == ("github.com", "contoso.com")
     assert scope.on_unknown == "allow"
     assert scope.redeem == "agent"
@@ -169,12 +169,12 @@ def test_from_wire_builds_arbitrary_initial_scope() -> None:
     accepts ANY well-shaped initial values -- there is no 'current' state to
     narrow relative to yet."""
     scope = SessionScope.from_wire(
-        "s1", {"write": ["github.com"], "on_unknown": "deny", "redeem": "out_of_band", "unattended": True}
+        "s1", {"write": ["github.com"], "on_unknown": "deny", "redeem": "unredeemable", "unattended": True}
     )
     assert scope.session_id == "s1"
     assert scope.write == ("github.com",)
     assert scope.on_unknown == "deny"
-    assert scope.redeem == "out_of_band"
+    assert scope.redeem == "unredeemable"
     assert scope.unattended is True
 
 

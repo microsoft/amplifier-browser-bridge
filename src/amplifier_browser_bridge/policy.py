@@ -173,7 +173,51 @@ from .scope import SessionScope
 # How long a tab's flow-elevated status survives with no new triggering
 # observation, before it lapses on its own (design doc section 11.4:
 # "FLOW_TTL_SECONDS = 900 (15 min). Flow elevation is per (device_id, tab_id).").
+# This is an IDLE-gap bound only -- it resets every time a new observation
+# (note_effects/note_page_context) touches the flow. See FLOW_MAX_LIFETIME_SECONDS
+# below for the bound this idle-only design was missing.
 FLOW_TTL_SECONDS: float = 900.0
+
+# Review panel finding (tester-breaker F5, a real bypass): FLOW_TTL_SECONDS alone
+# has no stated END for a flow -- it is a SLIDING idle-gap window that resets on
+# every triggering observation. A long-lived desktop session (measured, SCRATCH.md
+# R5: 142 minutes, zero connection gaps) whose flow keeps getting refreshed by
+# ordinary, continuing activity (a multi-step enterprise wizard that issues a
+# request on every step is exactly this shape -- it is also exactly the measured
+# incident's own URL pattern, `.../jit`, same-origin across every step, so
+# origin-change never clears it either) never actually exits the elevated
+# context: get a human to approve one low-stakes action early, then inject the
+# real dangerous action arbitrarily far into the SAME still-open flow -- "no new
+# gate fires, it's the same flow."
+#
+# FLOW_MAX_LIFETIME_SECONDS is an ABSOLUTE cap on one flow-elevation episode,
+# measured from when the episode STARTED (`started_at`, set once and never
+# refreshed by subsequent observations -- see `_touch_flow`), independent of how
+# recently it was last touched. Once this elapses, the episode ends even if
+# activity is still flowing through it every few seconds; the very next
+# triggering observation starts a genuinely NEW episode (a fresh `started_at`),
+# which is the correct behavior -- a flow that is still actually consequential
+# re-enters elevation immediately, it just can't ride one old, indefinitely-
+# refreshed grant forever.
+#
+# Both timestamps are hub-clock (`time.time()`), never anything the page
+# supplies -- a page can cause MORE triggering observations (more POSTs, more
+# page-context matches) but cannot set what time the hub's clock reads, so it
+# cannot manufacture a longer-than-real elapsed duration. This is deliberately
+# NOT page-authored, unlike everything `classify.py`'s label/page_context
+# channels score (design doc section 2's lemma) -- see this constant's design
+# doc section 11.4 update for the "don't reintroduce the bug one level up" note.
+#
+# Set to 2x FLOW_TTL_SECONDS (30 min): long enough that a real, single-sitting
+# multi-step flow (the measured JIT elevation flow, an onboarding wizard) is
+# never artificially cut off mid-completion, short enough that it cannot cover
+# anything close to the measured 142-minute desktop session length -- an
+# attacker who wants a stale grant to reach a dangerous action late in a long
+# session must re-trigger elevation well before they get there -- and if the
+# session declared `redeem="unredeemable"` (there is no human-approval channel;
+# see docs/designs/approval-channel-options.md's cancellation note), re-triggering
+# gets them nothing at all: the gate is a hard, unrecoverable stop, not a wait.
+FLOW_MAX_LIFETIME_SECONDS: float = 1800.0
 
 # ---------------------------------------------------------------------------
 # Denylist
@@ -499,6 +543,16 @@ class PendingConfirmation:
     # SAME scope, not dispatched scope-free. `Hub._handle_agent_confirm` reads
     # this back and passes it into the re-dispatch `send_command` call.
     session_id: str | None = None
+    # SECURITY-CRITICAL, not advisory metadata (fix for the live self-attestation
+    # hole flagged by the review panel's FAIL): the redemption mode the ORIGINAL
+    # session declared (`scope.redeem`) at the moment this gate fired. Carried
+    # here specifically so `consume_confirmation` has something to check the
+    # redeeming channel against -- before this field existed, `redeem` was
+    # computed into `PolicyDecision.redeem` for display on the wire and then
+    # NEVER consulted again, so a session that declared `redeem: "unredeemable"`
+    # was, in practice, redeemable by the agent's own `confirm` call regardless.
+    # See `consume_confirmation`'s `via` parameter for the enforcement half.
+    redeem: Literal["agent", "unredeemable"] = "agent"
 
 
 @dataclass
@@ -532,7 +586,7 @@ class PolicyDecision:
     token: str | None = None
     detected: dict[str, Any] | None = None
     classification: Classification | None = None
-    redeem: Literal["agent", "out_of_band"] = "agent"
+    redeem: Literal["agent", "unredeemable"] = "agent"
     confirm_scope: Literal["action", "flow"] = "action"
     reason_code: str | None = None
     expires_at: float | None = None
@@ -651,18 +705,59 @@ class PolicyEngine:
         """Live (non-expired) flow-elevation state for (device_id, tab_id), or
         None. Lazily expires on read rather than running a background sweep --
         same ruthless-simplicity reasoning as `_expire_stale` for confirmation
-        tokens."""
+        tokens.
+
+        Two INDEPENDENT bounds, both checked (FIX for review panel finding F5,
+        a real bypass -- see FLOW_MAX_LIFETIME_SECONDS's module-level comment):
+
+        1. Idle gap (`FLOW_TTL_SECONDS`, existing): expires if untouched for
+           too long -- resets on every new triggering observation.
+        2. Absolute lifetime (`FLOW_MAX_LIFETIME_SECONDS`, new): expires once
+           this many seconds have passed since the episode STARTED
+           (`started_at`), no matter how recently it was last touched. This is
+           the bound that closes F5: continuous benign activity can keep
+           resetting bound 1 forever, but it cannot move `started_at`.
+        """
         if tab_id is None:
             return None
         key = (device_id, tab_id)
         state = self._flow_elevated.get(key)
         if state is None:
             return None
-        if time.time() - state["at"] > FLOW_TTL_SECONDS:
+        now = time.time()
+        if now - state["started_at"] > FLOW_MAX_LIFETIME_SECONDS:
+            del self._flow_elevated[key]
+            self._audit.record("flow_cleared", device_id=device_id, tab_id=tab_id, reason="max_lifetime")
+            return None
+        if now - state["at"] > FLOW_TTL_SECONDS:
             del self._flow_elevated[key]
             self._audit.record("flow_cleared", device_id=device_id, tab_id=tab_id, reason="ttl")
             return None
         return state
+
+    def _touch_flow(self, device_id: str, tab_id: int, *, by: str, origin: str | None) -> None:
+        """Mark (device_id, tab_id) flow-elevated, called from `note_effects`/
+        `note_page_context` on every new triggering observation. Refreshes
+        `at` (the idle-gap clock) unconditionally, but preserves `started_at`
+        (the absolute-lifetime clock, FLOW_MAX_LIFETIME_SECONDS) from the
+        CURRENT episode if one is still genuinely live -- a page cannot extend
+        its own episode's absolute cap merely by causing more triggering
+        observations. If the current entry has already expired by either
+        bound, this starts a brand-new episode with a fresh `started_at`,
+        which is correct: a flow that is STILL actually consequential
+        re-enters elevation immediately on the next trigger, it just can't
+        ride one old, indefinitely-refreshed grant forever."""
+        key = (device_id, tab_id)
+        now = time.time()
+        existing = self._flow_elevated.get(key)
+        if existing is not None:
+            stale = now - existing["started_at"] > FLOW_MAX_LIFETIME_SECONDS or (
+                now - existing["at"] > FLOW_TTL_SECONDS
+            )
+            if stale:
+                existing = None
+        started_at = existing["started_at"] if existing is not None else now
+        self._flow_elevated[key] = {"by": by, "at": now, "started_at": started_at, "origin": origin}
 
     # ------------------------------------------------------------------
     # Observation intake -- called by Hub as device results arrive
@@ -756,11 +851,7 @@ class PolicyEngine:
         `note_snapshot`/`note_ref`."""
         if tab_id is None or not effects.state_changing:
             return
-        self._flow_elevated[(device_id, tab_id)] = {
-            "by": "observed_effect",
-            "at": time.time(),
-            "origin": host_of(url) if url else None,
-        }
+        self._touch_flow(device_id, tab_id, by="observed_effect", origin=host_of(url) if url else None)
         self._audit.record(
             "flow_elevated", device_id=device_id, tab_id=tab_id, trigger="observed_effect", url=url
         )
@@ -781,11 +872,7 @@ class PolicyEngine:
         for terms in self.profile.families.values():
             matched = _count_family_terms(terms, context_text)
             if len(matched) >= 2:
-                self._flow_elevated[(device_id, tab_id)] = {
-                    "by": "page_context",
-                    "at": time.time(),
-                    "origin": host_of(url) if url else None,
-                }
+                self._touch_flow(device_id, tab_id, by="page_context", origin=host_of(url) if url else None)
                 self._audit.record(
                     "flow_elevated", device_id=device_id, tab_id=tab_id, trigger="page_context", url=url
                 )
@@ -1029,8 +1116,15 @@ class PolicyEngine:
                     classification=classification,
                 )
             if self.on_unknown == "gate":
+                redeem_mode: Literal["agent", "unredeemable"] = scope.redeem if scope else "agent"
                 pending = self._create_confirmation(
-                    target, command, args, None, {}, session_id=scope.session_id if scope else None
+                    target,
+                    command,
+                    args,
+                    None,
+                    {},
+                    session_id=scope.session_id if scope else None,
+                    redeem=redeem_mode,
                 )
                 return PolicyDecision(
                     status="gate",
@@ -1038,6 +1132,7 @@ class PolicyEngine:
                     token=pending.token,
                     detected={},
                     classification=classification,
+                    redeem=redeem_mode,
                     reason_code=classification.reason_code,
                     expires_at=pending.expires_at,
                 )
@@ -1061,8 +1156,15 @@ class PolicyEngine:
                 "score": classification.score,
                 "matched": [m for s in classification.signals for m in s.matched],
             }
+            redeem_mode = scope.redeem if scope else "agent"
             pending = self._create_confirmation(
-                target, command, args, category, detected, session_id=scope.session_id if scope else None
+                target,
+                command,
+                args,
+                category,
+                detected,
+                session_id=scope.session_id if scope else None,
+                redeem=redeem_mode,
             )
             self._audit.record(
                 "policy_gated",
@@ -1072,6 +1174,7 @@ class PolicyEngine:
                 category=category,
                 detected=detected,
                 token=pending.token,
+                redeem=redeem_mode,
                 classification=classification.to_wire(),
             )
             return PolicyDecision(
@@ -1080,6 +1183,7 @@ class PolicyEngine:
                 token=pending.token,
                 detected=detected,
                 classification=classification,
+                redeem=redeem_mode,
                 confirm_scope=confirm_scope,
                 expires_at=pending.expires_at,
             )
@@ -1191,6 +1295,7 @@ class PolicyEngine:
         detected: dict[str, Any],
         *,
         session_id: str | None = None,
+        redeem: Literal["agent", "unredeemable"] = "agent",
     ) -> PendingConfirmation:
         now = time.time()
         token = uuid.uuid4().hex
@@ -1204,14 +1309,39 @@ class PolicyEngine:
             created_at=now,
             expires_at=now + self.confirmation_ttl,
             session_id=session_id,
+            redeem=redeem,
         )
         self._confirmations[token] = pending
         return pending
 
-    def consume_confirmation(self, token: str) -> PendingConfirmation:
-        """Single-use: raises PolicyError on unknown, already-used, or expired
-        tokens; otherwise marks the token used and returns the original
-        (target, command, args) so the caller can re-dispatch with skip_gate=True.
+    def consume_confirmation(self, token: str, *, via: Literal["agent"] = "agent") -> PendingConfirmation:
+        """Single-use: raises PolicyError on unknown, already-used, expired, or
+        WRONG-CHANNEL tokens; otherwise marks the token used and returns the
+        original (target, command, args) so the caller can re-dispatch with
+        skip_gate=True.
+
+        `via` names the channel THIS redemption attempt is arriving through.
+        `"agent"` is the only value that will ever be passed here --
+        `Hub._handle_agent_confirm` (the `/agent` WebSocket route, which is the
+        only redemption route this codebase has, or ever will have -- see
+        docs/designs/approval-channel-options.md's cancellation note) always
+        calls this with `via="agent"`, whether the caller is an agent's own
+        `confirm` message or a human running `abb confirm` from the CLI.
+
+        A confirmation whose `PendingConfirmation.redeem` is `"unredeemable"`
+        is REFUSED here unconditionally -- this is the fix for the live
+        self-attestation hole the review panel's FAIL flagged: minting a token
+        with `redeem: "unredeemable"` and then calling the agent-route confirm
+        handler must not succeed. There is no other channel, was never going to
+        be one (a human-approval channel was considered and explicitly
+        cancelled -- see `docs/designs/approval-channel-options.md` and
+        `docs/designs/confirmation-gate.md` \u00a716), so a `redeem: "unredeemable"`
+        token cannot be redeemed AT ALL, by design, permanently. That is the
+        point of the name: it is not a placeholder for a channel that doesn't
+        exist yet, it is how an operator declares "this session is unattended;
+        a gate here is a stop, not a wait." The alternative -- letting the
+        agent self-attest a gate that specifically exists to require a human --
+        is the exact hole this closes.
 
         Checks THIS token's own expiry directly, rather than running the lazy
         `_expire_stale` sweep first -- sweeping first would delete the very
@@ -1229,6 +1359,35 @@ class PolicyEngine:
             del self._confirmations[token]
             self._audit.record("policy_confirmation_expired", token=token, category=pending.category)
             raise PolicyError("confirmation token expired")
+        if pending.redeem != via:
+            # This only ever fires for pending.redeem == "unredeemable", since
+            # `via` has exactly one value ("agent") in this codebase. Do NOT
+            # consume the token here -- no `used`, no delete. Marking it used
+            # would mean "this was redeemed"; it wasn't. Leaving it unconsumed
+            # keeps the audit trail (and a retried attempt) honest that this is
+            # a standing refusal, not a one-time rejection -- it will refuse
+            # identically on every subsequent attempt, up to the token's normal
+            # expiry, since no channel this token would accept will ever exist.
+            self._audit.record(
+                "policy_confirmation_wrong_channel",
+                token=token,
+                category=pending.category,
+                required_redeem=pending.redeem,
+                attempted_via=via,
+            )
+            raise PolicyError(
+                "this confirmation requires human approval, and the session declared "
+                "redeem='unredeemable' -- there is no human-approval channel in this "
+                "system (a design was considered and explicitly CANCELLED; see "
+                "docs/designs/approval-channel-options.md and "
+                "docs/designs/confirmation-gate.md \u00a716), so it CANNOT be redeemed "
+                "through the agent/CLI confirm route, or through any other route, ever. "
+                "This is intentional: failing closed rather than letting the agent "
+                "self-attest a gate that specifically exists to require a human. If this "
+                "action needs to happen, narrow the session's scope instead so the gate "
+                "never fires, or use redeem='agent' if self-attestation is acceptable "
+                "for this session."
+            )
         pending.used = True
         del self._confirmations[token]
         self._expire_stale()

@@ -48,6 +48,7 @@ and docs/PROTOCOL.md's CDP section.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import json
 import logging
@@ -216,6 +217,19 @@ class Hub:
         # by, or torn down by, a device's `/device`-route connection. See
         # "Sessions" section below for the full establish/narrow/seal wiring.
         self._sessions: dict[str, SessionScope] = {}
+        # session_id -> asyncio.Lock (review panel F6: "session sealing has no
+        # named serialization point -- two commands dispatched before the
+        # first response lands may both evaluate against pre-seal scope").
+        # `send_command` acquires this for the full evaluate-through-dispatch
+        # span whenever a session_id is given, so two commands sharing a
+        # session (e.g. issued from two concurrent agent connections, or one
+        # connection racing a background poll) are strictly serialized: the
+        # second command's `PolicyEngine.evaluate` call cannot begin until the
+        # first command's full round trip -- including `_ingest_result`'s
+        # seal-on-first-read, see `_maybe_seal_session` -- has completed. This
+        # is the hub's one named serialization point for session-scoped state;
+        # see `_session_lock` and `send_command`'s docstring.
+        self._session_locks: dict[str, asyncio.Lock] = {}
         if not token_store.auth_enabled:
             logger.warning(
                 "No hub token configured (ABB_HUB_TOKEN / token file) -- running with "
@@ -640,7 +654,18 @@ class Hub:
         if not token or not isinstance(token, str):
             return {"ok": False, "error": "confirm requires 'confirmation_token'"}
         try:
-            pending = self.policy.consume_confirmation(token)
+            # via="agent" -- the `/agent` WebSocket route is the ONLY redemption
+            # surface in this codebase, and will remain so: there is no human-
+            # approval channel (a design was considered and explicitly
+            # CANCELLED -- see docs/designs/approval-channel-options.md).
+            # Reached by both an agent's own `confirm` call and a human running
+            # `abb confirm` from the CLI; see cli.py's `confirm` docstring.
+            # `consume_confirmation` refuses any token whose
+            # PendingConfirmation.redeem != "agent" -- this is what makes
+            # `redeem: "unredeemable"` structurally unredeemable through this
+            # handler (or any other), closing the live self-attestation hole
+            # (see policy.py's `consume_confirmation` docstring).
+            pending = self.policy.consume_confirmation(token, via="agent")
         except PolicyError as e:
             return {"ok": False, "error": str(e)}
         self.audit.record(
@@ -794,6 +819,42 @@ class Hub:
                     "reason_code": "unknown_session",
                 }
 
+        # F6 (review panel): serialize evaluate-through-dispatch per session_id
+        # so two commands sharing a session can never both evaluate against
+        # pre-seal scope (see `_session_lock` and this class's `__init__`
+        # docstring for `_session_locks`). `nullcontext()` when there's no
+        # session_id -- the existing scope-free path is unaffected and stays
+        # fully concurrent, matching every pre-scope.py call site.
+        lock_cm = self._session_lock(session_id) if session_id is not None else contextlib.nullcontext()
+        async with lock_cm:
+            return await self._send_command_locked(
+                target, command, args, skip_gate=skip_gate, session_id=session_id, scope=scope
+            )
+
+    def _session_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
+
+    async def _send_command_locked(
+        self,
+        target: Target,
+        command: str,
+        args: dict[str, Any],
+        *,
+        skip_gate: bool,
+        session_id: str | None,
+        scope: SessionScope | None,
+    ) -> dict[str, Any]:
+        """The body of `send_command`, run inside the per-session lock (see
+        F6 above) when `session_id` is given. Holding the lock across the
+        FULL span -- evaluate, then (if live) dispatch and await the device's
+        result, whose ingestion is what seals the session -- is what
+        guarantees a second command for the same session cannot begin
+        `evaluate()` until the first one's seal (if any) has already applied.
+        """
         # `_cdp` is a hub-internal wire signal (see cdp.py, `_dispatch_live`)
         # that authorizes the DEVICE to use CDP dispatch for this specific
         # command. It is set ONLY by the hub's own auto-escalation logic --

@@ -319,6 +319,106 @@ def test_confirm_replay_is_rechecked_against_the_original_sessions_scope(tmp_pat
     assert confirmed["ok"] is True
 
 
+# ---------------------------------------------------------------------------
+# F6 (review panel): session sealing had no named serialization point -- two
+# commands dispatched before the first response lands could both evaluate
+# against pre-seal scope. `send_command` now acquires a per-session_id
+# asyncio.Lock across the full evaluate-through-dispatch span, so a second
+# command sharing a session cannot begin `PolicyEngine.evaluate` until the
+# first command's full round trip -- including seal-on-first-read -- has
+# completed.
+# ---------------------------------------------------------------------------
+
+
+class _SlowIngestingFakeDeviceSocket:
+    """Like `_IngestingFakeDeviceSocket` above, but delays resolving the
+    pending future until `release_event` is set -- lets a test hold command A
+    "in flight" while command B is dispatched concurrently, to prove ordering
+    rather than hoping a race resolves favorably."""
+
+    def __init__(
+        self, hub: Hub, record: Any, canned_result: dict[str, Any], release_event: asyncio.Event
+    ) -> None:
+        self.hub = hub
+        self.record = record
+        self.canned_result = canned_result
+        self.release_event = release_event
+
+    async def send_json(self, data: dict[str, Any], /) -> None:
+        await self.release_event.wait()
+        fut = self.record.pending.get(data["id"])
+        if fut is not None and not fut.done():
+            raw_env = {**self.canned_result, "id": data["id"]}
+            env = self.hub._ingest_result(self.record.device_id, data["id"], raw_env)
+            fut.set_result(env)
+
+
+def test_concurrent_commands_on_same_session_serialize_through_the_session_lock(tmp_path: Any) -> None:
+    """Two commands sharing a session_id, dispatched concurrently (command A,
+    a `snapshot` that will seal the session, held in flight; command B, a
+    state-changing `navigate` to an origin that would be OUT of a narrower
+    scope) must not have B's `evaluate()` run while A's response -- and its
+    seal -- is still pending. Proven by starting both concurrently, releasing
+    A first, and asserting A's seal is visible by the time B's evaluation
+    happens (B is dispatched only after A completes in this test, matching
+    what the lock enforces: no interleaving of the evaluate-through-dispatch
+    span for a shared session)."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    release_a = asyncio.Event()
+    fake_ws = _SlowIngestingFakeDeviceSocket(
+        hub,
+        record,
+        canned_result={"ok": True, "result": {"url": "https://github.com/x", "nodes": []}},
+        release_event=release_a,
+    )
+    record.ws = fake_ws
+    record.touch()
+    scope = hub.establish_session(write=["github.com", "contoso.com"])
+    assert not scope.sealed
+
+    order: list[str] = []
+
+    async def command_a() -> dict[str, Any]:
+        result = await hub.send_command(
+            Target(device_id="d1", tab_id=1), "snapshot", {}, session_id=scope.session_id
+        )
+        order.append("a_done")
+        return result
+
+    async def command_b() -> dict[str, Any]:
+        # Give command_a's send_command a chance to acquire the session lock
+        # first (it starts first below), then attempt to enter the lock too --
+        # this call must BLOCK until command_a releases it.
+        await asyncio.sleep(0)
+        result = await hub.send_command(
+            Target(device_id="d1", tab_id=1),
+            "navigate",
+            {"url": "https://github.com/x"},
+            session_id=scope.session_id,
+        )
+        order.append("b_done")
+        return result
+
+    async def run() -> tuple[dict[str, Any], dict[str, Any]]:
+        task_a = asyncio.create_task(command_a())
+        task_b = asyncio.create_task(command_b())
+        # Let both tasks actually start and block (task_b waiting on the lock,
+        # task_a waiting on release_a) before releasing A.
+        await asyncio.sleep(0.01)
+        assert not scope.sealed  # neither has completed yet -- A is still in flight
+        release_a.set()
+        return await task_a, await task_b
+
+    result_a, result_b = asyncio.run(run())
+    assert result_a["ok"] is True
+    assert scope.sealed  # A's seal-on-first-read ran before B's evaluate could
+    assert result_b["ok"] is True  # B is in-scope (github.com), so it proceeds
+    # A's full round trip (including seal) completed before B's completed --
+    # the lock forces this ordering rather than leaving it to chance.
+    assert order == ["a_done", "b_done"]
+
+
 def test_auth_rejects_wrong_token(tmp_path: Any) -> None:
     store = TokenStore(default_token="secret")
     assert store.validate("secret") is True

@@ -741,7 +741,7 @@ def _build_tools() -> list[_HubTool]:
                         "enum": ["allow", "gate", "deny"],
                         "default": "allow",
                     },
-                    "redeem": {"type": "string", "enum": ["agent", "out_of_band"], "default": "agent"},
+                    "redeem": {"type": "string", "enum": ["agent", "unredeemable"], "default": "agent"},
                     "unattended": {"type": "boolean", "default": False},
                 },
             },
@@ -751,7 +751,7 @@ def _build_tools() -> list[_HubTool]:
             "browser_narrow_scope",
             "Narrow an EXISTING session's scope -- NEVER widens (docs/designs/confirmation-gate.md "
             "section 11.2). write/read may only shrink to a strict subset of the current grant, "
-            "on_unknown may only move allow -> gate -> deny, redeem only agent -> out_of_band, "
+            "on_unknown may only move allow -> gate -> deny, redeem only agent -> unredeemable, "
             "unattended only False -> True. Only the parameters you pass are touched. Once the "
             "session has ingested any page content (a browser_read/browser_snapshot/browser_tabs "
             "result), the hub SEALS it and every subsequent call -- including this one -- is rejected "
@@ -763,7 +763,7 @@ def _build_tools() -> list[_HubTool]:
                     "write": {"type": "string", "description": "Comma-separated hostnames to narrow to."},
                     "read": {"type": "string", "description": "Comma-separated hostnames to narrow to."},
                     "on_unknown": {"type": "string", "enum": ["allow", "gate", "deny"]},
-                    "redeem": {"type": "string", "enum": ["agent", "out_of_band"]},
+                    "redeem": {"type": "string", "enum": ["agent", "unredeemable"]},
                     "unattended": {"type": "boolean", "default": False},
                 },
                 "required": ["session_id"],

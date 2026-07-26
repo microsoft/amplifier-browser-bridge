@@ -13,7 +13,7 @@ Two independent properties, both enforced here, both required together:
 
 1. **`narrow()` only ever narrows.** `write`/`read` may shrink to a strict subset (or from
    `"*"` to any finite set) -- never grow, never return to `"*"`. `on_unknown` may only move
-   `allow -> gate -> deny`; `redeem` only `agent -> out_of_band`; `unattended` only
+   `allow -> gate -> deny`; `redeem` only `agent -> unredeemable`; `unattended` only
    `False -> True`. Every one of these moves reduces what the session may do, never expands
    it. A model that calls `narrow_scope` with a widening request gets `ScopeError`, not a
    silently-clamped no-op -- fail loud (`CONTRIBUTING.md`).
@@ -66,7 +66,7 @@ Origins = Literal["*"] | tuple[str, ...]
 SCOPE_FIELDS: frozenset[str] = frozenset({"read", "write", "on_unknown", "redeem", "unattended"})
 
 _ON_UNKNOWN_ORDER: tuple[str, ...] = ("allow", "gate", "deny")
-_REDEEM_ORDER: tuple[str, ...] = ("agent", "out_of_band")
+_REDEEM_ORDER: tuple[str, ...] = ("agent", "unredeemable")
 
 
 class ScopeError(ValueError):
@@ -158,7 +158,7 @@ class SessionScope:
     read: Origins = "*"
     write: Origins = "*"
     on_unknown: Literal["allow", "gate", "deny"] = "allow"
-    redeem: Literal["agent", "out_of_band"] = "agent"
+    redeem: Literal["agent", "unredeemable"] = "agent"
     unattended: bool = False
     _sealed: bool = False
 
