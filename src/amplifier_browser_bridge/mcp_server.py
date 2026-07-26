@@ -849,6 +849,7 @@ async def browser_establish_session(
     on_unknown: str = "allow",
     redeem: str = "agent",
     unattended: bool = False,
+    allow_self_attested_escalation: bool = False,
 ) -> dict[str, Any]:
     """Create a new session with a caller-declared WRITE scope
     (docs/designs/confirmation-gate.md, Candidate C). This is a boundary the
@@ -861,11 +862,19 @@ async def browser_establish_session(
     'gist.github.com'). on_unknown: 'allow' (default) | 'gate' | 'deny' --
     what to do when an action cannot be classified at all. redeem: 'agent'
     (default, self-attestation) | 'unredeemable' (no human-approval channel
-    exists in this system, by design -- see docs/designs/
-    approval-channel-options.md -- so a gate under this mode can never be
-    confirmed at all; declare it for a genuinely unattended session where a
+    exists in this system TODAY, by deliberate current decision -- see
+    docs/designs/approval-channel-options.md section 0 for the decision and
+    what would reopen it -- so a gate under this mode can never be confirmed
+    at all right now; declare it for a genuinely unattended session where a
     gate should mean stop, not wait). unattended: whether this session is
     running without a human watching (one-way False -> True).
+    allow_self_attested_escalation: FIX 3 (product review panel) -- defaults
+    False. Even when `write` covers the origin, an action classified into a
+    privilege/permission-escalation category (e.g. permission_change -- the
+    measured incident's own category) is forced to redeem='unredeemable'
+    unless this is explicitly True here. write scope is an origin allowlist;
+    it never implies "and may also self-attest its own escalations there."
+    Cannot be turned on later via browser_narrow_scope.
 
     IMPORTANT: this ALWAYS creates a brand-new session with a fresh
     session_id -- it can never be used to reset an existing session's scope
@@ -876,7 +885,12 @@ async def browser_establish_session(
     write_scope = "*" if write == "*" else [o.strip() for o in write.split(",") if o.strip()]
     try:
         return await _client().establish_session(
-            read=read_scope, write=write_scope, on_unknown=on_unknown, redeem=redeem, unattended=unattended
+            read=read_scope,
+            write=write_scope,
+            on_unknown=on_unknown,
+            redeem=redeem,
+            unattended=unattended,
+            allow_self_attested_escalation=allow_self_attested_escalation,
         )
     except HubError as e:
         return {"ok": False, "error": str(e)}
@@ -890,13 +904,18 @@ async def browser_narrow_scope(
     on_unknown: str | None = None,
     redeem: str | None = None,
     unattended: bool = False,
+    deny_self_attested_escalation: bool = False,
 ) -> dict[str, Any]:
     """Narrow an EXISTING session's scope -- NEVER widens
     (docs/designs/confirmation-gate.md section 11.2). write/read may only
     shrink to a strict subset of the current grant (comma-separated
     hostnames), on_unknown may only move allow -> gate -> deny, redeem only
-    agent -> unredeemable, unattended only False -> True. Only the
-    parameters you pass are touched; the rest of the scope is unaffected.
+    agent -> unredeemable, unattended only False -> True,
+    allow_self_attested_escalation only True -> False (pass
+    deny_self_attested_escalation=True to turn it off; it can never be
+    turned back on for this session -- FIX 3, product review panel). Only
+    the parameters you pass are touched; the rest of the scope is
+    unaffected.
 
     Once the session has ingested any page content (a browser_read/
     browser_snapshot/browser_tabs result), the hub SEALS it and every

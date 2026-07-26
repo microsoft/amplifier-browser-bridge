@@ -63,7 +63,9 @@ Origins = Literal["*"] | tuple[str, ...]
 # The only fields `narrow()` (or a wire `narrow_scope` request) may touch. Kept as a
 # module-level constant so `hub.py` can validate an incoming wire payload against the
 # same set without duplicating the field list.
-SCOPE_FIELDS: frozenset[str] = frozenset({"read", "write", "on_unknown", "redeem", "unattended"})
+SCOPE_FIELDS: frozenset[str] = frozenset(
+    {"read", "write", "on_unknown", "redeem", "unattended", "allow_self_attested_escalation"}
+)
 
 _ON_UNKNOWN_ORDER: tuple[str, ...] = ("allow", "gate", "deny")
 _REDEEM_ORDER: tuple[str, ...] = ("agent", "unredeemable")
@@ -140,6 +142,27 @@ def _narrow_unattended(current: bool, new: Any) -> bool:
     return new
 
 
+def _narrow_escalation_allowance(current: bool, new: Any) -> bool:
+    """FIX 3 (product review panel): the mirror image of `_narrow_unattended`
+    -- `True` (self-attested escalation allowed) is the PERMISSIVE value here,
+    so narrowing only ever moves True -> False, never back to True. A session
+    cannot grant itself the ability to self-attest privilege escalation after
+    the fact via `narrow()`/`narrow_scope`; it is either declared at
+    `establish_session` time (a human present, deciding up front) or it is not
+    available for the rest of that session's life."""
+    if not isinstance(new, bool):
+        raise ScopeError(f"allow_self_attested_escalation must be a bool, got: {new!r}")
+    if new == current:
+        return new
+    if current is False and new is True:
+        raise ScopeError(
+            "allow_self_attested_escalation may only narrow True -> False, never back to "
+            "True -- it must be declared explicitly at establish_session time, not granted "
+            "later via narrow_scope"
+        )
+    return new
+
+
 @dataclass
 class SessionScope:
     """A caller-declared, narrow-only constraint on what a session may DO.
@@ -152,6 +175,20 @@ class SessionScope:
     same monotonic-narrowing guarantee), it is simply not yet enforced against any command --
     honestly documented, not silently dropped, the same "mechanism present, not yet a consumer"
     stance `addressing.py` takes with `profile_id`.
+
+    `allow_self_attested_escalation` (FIX 3, product review panel) defaults to `False`: an
+    action classified into `classify.ESCALATION_CATEGORIES` (today, just `permission_change` --
+    the measured incident's own category) can NEVER be redeemed via self-attestation, no matter
+    how broad `write` is and no matter what `redeem` says, UNLESS this field was explicitly set
+    `True` at `establish_session` time. This is deliberately a SEPARATE field from `write`: the
+    incident happened while browsing `github.com`, and `github.com` will almost always be IN a
+    broadly-scoped session's `write` set (the maintainer's own stated preference for broad
+    access) -- so "the origin is in scope" must never be read as "and therefore this session may
+    also grant itself Administrator." `write` answers "what origins may this session mutate";
+    this field answers a structurally distinct question, "may this session confirm its OWN
+    privilege escalations," and the two must not be conflatable by construction. See
+    `policy.py`'s `evaluate()` for the enforcement and its honest limits (the categorizing signal
+    is not purely browser-asserted).
     """
 
     session_id: str
@@ -160,6 +197,7 @@ class SessionScope:
     on_unknown: Literal["allow", "gate", "deny"] = "allow"
     redeem: Literal["agent", "unredeemable"] = "agent"
     unattended: bool = False
+    allow_self_attested_escalation: bool = False
     _sealed: bool = False
 
     @property
@@ -221,6 +259,10 @@ class SessionScope:
             updates["redeem"] = _narrow_ordered("redeem", _REDEEM_ORDER, self.redeem, kwargs["redeem"])
         if "unattended" in kwargs:
             updates["unattended"] = _narrow_unattended(self.unattended, kwargs["unattended"])
+        if "allow_self_attested_escalation" in kwargs:
+            updates["allow_self_attested_escalation"] = _narrow_escalation_allowance(
+                self.allow_self_attested_escalation, kwargs["allow_self_attested_escalation"]
+            )
         for key, value in updates.items():
             setattr(self, key, value)
 
@@ -238,6 +280,7 @@ class SessionScope:
             "on_unknown": self.on_unknown,
             "redeem": self.redeem,
             "unattended": self.unattended,
+            "allow_self_attested_escalation": self.allow_self_attested_escalation,
             "sealed": self._sealed,
         }
 
@@ -261,6 +304,11 @@ class SessionScope:
         unattended = payload.get("unattended", False)
         if not isinstance(unattended, bool):
             raise ScopeError(f"unattended must be a bool, got: {unattended!r}")
+        allow_self_attested_escalation = payload.get("allow_self_attested_escalation", False)
+        if not isinstance(allow_self_attested_escalation, bool):
+            raise ScopeError(
+                f"allow_self_attested_escalation must be a bool, got: {allow_self_attested_escalation!r}"
+            )
         return SessionScope(
             session_id=session_id,
             read=read,
@@ -268,6 +316,7 @@ class SessionScope:
             on_unknown=on_unknown,
             redeem=redeem,
             unattended=unattended,
+            allow_self_attested_escalation=allow_self_attested_escalation,
         )
 
 

@@ -157,6 +157,7 @@ class HubClient:
         on_unknown: str = "allow",
         redeem: str = "agent",
         unattended: bool = False,
+        allow_self_attested_escalation: bool = False,
     ) -> dict[str, Any]:
         """Create a brand-new session with a caller-declared write scope
         (docs/designs/confirmation-gate.md section 11.2, Candidate C). The
@@ -165,7 +166,15 @@ class HubClient:
         it further. Returns `{"ok": True, "session_id": ..., "scope": {...}}`
         on success, or `{"ok": False, "error": ...}` if the declared values
         were malformed (e.g. `write` given as something other than `"*"` or a
-        list of hostnames)."""
+        list of hostnames).
+
+        `allow_self_attested_escalation` (FIX 3, product review panel)
+        defaults to `False`: even when `write` covers the origin, an action
+        classified into `classify.ESCALATION_CATEGORIES` (e.g.
+        `permission_change` -- the measured incident's own category) is
+        forced to `redeem="unredeemable"` unless this is explicitly set
+        `True` here, at establishment. It cannot be turned on later via
+        `narrow_scope` -- see `scope.py`'s docstring."""
         resp = await self._request(
             {
                 "v": PROTOCOL_VERSION,
@@ -176,6 +185,7 @@ class HubClient:
                 "on_unknown": on_unknown,
                 "redeem": redeem,
                 "unattended": unattended,
+                "allow_self_attested_escalation": allow_self_attested_escalation,
             }
         )
         return resp

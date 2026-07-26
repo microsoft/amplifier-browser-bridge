@@ -155,6 +155,7 @@ from urllib.parse import urlsplit
 from .addressing import Target
 from .audit import AuditLog
 from .classify import (
+    ESCALATION_CATEGORIES,
     ActionDescriptor,
     Classification,
     ClassifierProfile,
@@ -1156,7 +1157,29 @@ class PolicyEngine:
                 "score": classification.score,
                 "matched": [m for s in classification.signals for m in s.matched],
             }
-            redeem_mode = scope.redeem if scope else "agent"
+            # FIX 3 (product review panel, priority finding): a session's write
+            # scope is an ORIGIN allowlist, not a grant of "and also self-attest
+            # your own privilege escalations there." An action classified into
+            # ESCALATION_CATEGORIES forces redeem="unredeemable" regardless of
+            # write scope and regardless of the session's OWN declared `redeem`
+            # -- unless the session explicitly opted in via
+            # `allow_self_attested_escalation=True` at establish_session time.
+            # This is what closes the gap the incident itself demonstrates: the
+            # incident happened while browsing github.com, and github.com will
+            # almost always be IN a broadly-scoped session's write set, so "the
+            # origin is in scope" cannot by itself be read as "and therefore
+            # this session may confirm its own Administrator grant." See
+            # classify.ESCALATION_CATEGORIES and scope.py's
+            # `allow_self_attested_escalation` docstrings for the full argument
+            # and its honest limits (the categorizing signal is not purely
+            # browser-asserted -- see below).
+            is_escalation = bool(set(classification.categories) & ESCALATION_CATEGORIES)
+            escalation_allowed = bool(scope is not None and scope.allow_self_attested_escalation)
+            escalation_locked = is_escalation and not escalation_allowed
+            if escalation_locked:
+                redeem_mode: Literal["agent", "unredeemable"] = "unredeemable"
+            else:
+                redeem_mode = scope.redeem if scope else "agent"
             pending = self._create_confirmation(
                 target,
                 command,
@@ -1175,6 +1198,7 @@ class PolicyEngine:
                 detected=detected,
                 token=pending.token,
                 redeem=redeem_mode,
+                escalation_locked=escalation_locked,
                 classification=classification.to_wire(),
             )
             return PolicyDecision(

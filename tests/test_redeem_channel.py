@@ -153,13 +153,21 @@ def test_hub_agent_confirm_route_rejects_unredeemable_token_end_to_end(tmp_path:
 
 
 def test_agent_channel_confirmation_still_works_as_before(tmp_path: Any) -> None:
+    """Uses a NON-escalation category label (`delete`, not `permission_change`)
+    -- FIX 3 (product review panel) forces `redeem="unredeemable"` for
+    ESCALATION_CATEGORIES regardless of the session's own declared `redeem`,
+    so `ELEVATE_LABEL` is no longer a valid "ordinary gate" fixture for this
+    test's actual purpose (proving the wrong-channel FIX left the default
+    redeem="agent" path unaffected for gates OUTSIDE that category). See
+    `tests/test_escalation_category.py` for ELEVATE_LABEL's new behavior."""
     engine = _engine(tmp_path)
     decision = engine.evaluate(
         Target(device_id="d1", tab_id=1, ref="e1"),
         "click",
-        {"ref": "e1", "label": ELEVATE_LABEL, "page_url": "https://repos.opensource.microsoft.com/x"},
+        {"ref": "e1", "label": "Delete Repository", "page_url": "https://repos.opensource.microsoft.com/x"},
     )
     assert decision.status == "gate"
+    assert decision.category == "delete"
     assert decision.redeem == "agent"
     assert decision.token is not None
     pending = engine.consume_confirmation(decision.token, via="agent")  # must NOT raise

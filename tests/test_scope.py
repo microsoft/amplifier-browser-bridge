@@ -197,5 +197,6 @@ def test_to_wire_round_trips_the_shape() -> None:
         "on_unknown": "allow",
         "redeem": "agent",
         "unattended": False,
+        "allow_self_attested_escalation": False,
         "sealed": False,
     }

@@ -96,6 +96,31 @@ FAMILY_TO_CATEGORY: dict[str, str] = {
     "oauth_consent": "oauth_grant",
 }
 
+# FIX 3 (product review panel, priority finding: "name and enforce an explicit
+# deny-list of privilege/permission-escalating actions that no declared session
+# scope can implicitly include"). Categories in this set get a structural
+# guarantee `scope.py`'s `write` origin allowlist does NOT provide on its own:
+# `PolicyEngine.evaluate` forces `redeem="unredeemable"` for any classification
+# whose `categories` intersects this set, REGARDLESS of write scope and
+# REGARDLESS of the session's own declared `redeem` mode -- unless the session
+# was explicitly established with `allow_self_attested_escalation=True`
+# (scope.py). This closes the gap the incident itself demonstrates: the
+# incident happened while browsing github.com, and github.com will almost
+# always be IN a broadly-scoped session's write set (the maintainer's own
+# stated preference for broad access), so "the origin is in scope" cannot by
+# itself be read as "and therefore this session may also grant itself
+# Administrator." See policy.py's `evaluate()` and scope.py's module docstring
+# for the enforcement and the honest limits of the signal that assigns this
+# category (it is not purely browser-asserted -- see the note below).
+#
+# Deliberately a single category today, not the full canonical seven
+# (docs/POLICY.md section 3): `permission_change` is the one the measured
+# incident's own category belongs to (Administrator access), and the
+# two-implementation rule (KERNEL_PHILOSOPHY.md) argues against generalizing
+# to categories with no measured incident behind them yet. Extend this set
+# only when a second, real case motivates it.
+ESCALATION_CATEGORIES: frozenset[str] = frozenset({"permission_change"})
+
 # High-confidence exact phrases -- kept from the pre-existing GATE_RULES lists
 # (policy.py), now scored (weight 3) rather than gating outright on their own.
 DEFAULT_PHRASES: dict[str, tuple[str, ...]] = {

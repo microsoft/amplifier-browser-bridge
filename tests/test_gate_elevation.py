@@ -231,14 +231,24 @@ def test_flow_confirmation_covers_subsequent_bland_clicks_but_not_the_elevate_cl
 
 
 def test_elevate_click_effects_are_reported_and_audited(tmp_path: Any) -> None:
+    """Uses a session with `allow_self_attested_escalation=True` (FIX 3,
+    product review panel): ELEVATE_LABEL classifies as `permission_change`,
+    an ESCALATION_CATEGORIES member, which `PolicyEngine.evaluate` now forces
+    to `redeem="unredeemable"` regardless of write scope UNLESS a session
+    explicitly opts in. This test's purpose is D3 attribution, not the
+    escalation lock itself (see `tests/test_escalation_category.py` for that),
+    so it opts in explicitly to keep exercising the confirm-then-redispatch
+    path."""
     from amplifier_browser_bridge.audit import AuditLog
 
     audit_path = tmp_path / "audit.jsonl"
     engine = PolicyEngine(AuditLog(audit_path))
+    scope = SessionScope(session_id="sess-d3", allow_self_attested_escalation=True)
     decision = engine.evaluate(
         Target(device_id="d1", tab_id=1, ref="e99"),
         "click",
         {"ref": "e99", "label": ELEVATE_LABEL, "page_url": FLOW_URL},
+        scope=scope,
     )
     assert decision.status == "gate"
     assert decision.token is not None
