@@ -318,6 +318,62 @@ def test_navigate_timeout_names_no_alternative(tmp_path: Any) -> None:
     assert result["error"].rstrip().endswith("--command-timeout <seconds>`.")
 
 
+# ---------------------------------------------------------------------------
+# Bug 3 (real-profile hardening): a DOM-injecting command timing out on a
+# non-active tab names ALL real alternatives -- activate, vision_read (for
+# read/snapshot only), and raising timeout_s -- never picks one automatically.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_timeout_names_activate_and_vision_read_when_not_already_activated(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "snapshot", {"timeout_s": 1.0})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "args.activate=true" in result["error"]
+    assert "vision_read" in result["error"]
+    assert "args.timeout_s" in result["error"]
+
+
+def test_snapshot_timeout_does_not_resuggest_activate_when_already_set(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(
+            Target(device_id="d1", tab_id=1), "snapshot", {"timeout_s": 1.0, "activate": True}
+        )
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "args.activate=true activates" not in result["error"]
+
+
+def test_click_timeout_names_activate_alongside_trusted(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=120.0)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1, ref="e1"), "click", {"timeout_s": 1.0})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert "args.trusted=true" in result["error"]
+    assert "args.activate=true" in result["error"]
+    # click/type/key don't get the vision_read mention -- that's a read/snapshot-only alternative.
+    assert "vision_read" not in result["error"]
+
+
 def test_auth_per_device_override(tmp_path: Any) -> None:
     store = TokenStore(default_token="default-tok", device_tokens={"d1": "special-tok"})
     assert store.validate("special-tok", device_id="d1") is True

@@ -168,7 +168,12 @@ def _build_tools() -> list[_HubTool]:
         return await _client().command(Target(device_id=input_data["device_id"]), "reload", {})
 
     def read_or_snapshot_args(input_data: dict[str, Any]) -> dict[str, Any]:
-        return {"wake": True} if input_data.get("wake") else {}
+        args: dict[str, Any] = {}
+        if input_data.get("wake"):
+            args["wake"] = True
+        if input_data.get("activate"):
+            args["activate"] = True
+        return args
 
     def click_args(input_data: dict[str, Any]) -> dict[str, Any]:
         return {"ref": input_data["ref"]}
@@ -283,16 +288,25 @@ def _build_tools() -> list[_HubTool]:
         ),
         _HubTool(
             "browser_snapshot",
-            "Accessibility-style snapshot of a tab: a tree of elements with stable `ref` ids (e.g. "
-            "'e12') you can pass to browser_click/browser_type/browser_key. Refs reset on navigation "
-            "-- take a fresh snapshot after navigating. At real-world scale (hundreds of tabs) Edge "
-            "discards background tabs to reclaim memory; a discarded tab fails loud naming the real "
-            "cause (check browser_tabs()'s `discarded` field). Pass wake=true to reload a discarded "
-            "tab and retry -- destroys in-page state, so opt-in only; result reports 'woke': true. "
+            "Accessibility-style snapshot of a tab: a tree of elements with stable, frame-qualified "
+            "`ref` ids (e.g. 'f0.e12') you can pass to browser_click/browser_type/browser_key. Each "
+            "node also carries a `generation` -- refs are only valid from the MOST RECENT snapshot of "
+            "a given frame; using a ref from a superseded snapshot fails loud with a specific 'stale "
+            "ref' error rather than silently doing nothing. Refs reset on navigation -- take a fresh "
+            "snapshot after navigating. At real-world scale (hundreds of tabs) Edge discards "
+            "background tabs to reclaim memory; a discarded tab fails loud naming the real cause "
+            "(check browser_tabs()'s `discarded` field). Pass wake=true to reload a discarded tab and "
+            "retry -- destroys in-page state, so opt-in only; result reports 'woke': true. A heavy/"
+            "hydrated SPA can be slow or time out while the tab is NOT active -- pass activate=true to "
+            "foreground it first (never automatic; steals focus; result reports 'activated': true). "
             + _QUEUE_NOTE,
             {
                 "type": "object",
-                "properties": {**_TAB_TARGET_PROPS, "wake": {"type": "boolean", "default": False}},
+                "properties": {
+                    **_TAB_TARGET_PROPS,
+                    "wake": {"type": "boolean", "default": False},
+                    "activate": {"type": "boolean", "default": False},
+                },
                 "required": ["device_id", "tab_id"],
             },
             lambda input_data: _command("snapshot", read_or_snapshot_args, input_data),
@@ -302,11 +316,17 @@ def _build_tools() -> list[_HubTool]:
             "Read the full visible text of a tab. At real-world scale (hundreds of tabs) Edge "
             "discards background tabs to reclaim memory; a discarded tab fails loud naming the real "
             "cause (check browser_tabs()'s `discarded` field). Pass wake=true to reload a discarded "
-            "tab and retry -- destroys in-page state, so opt-in only; result reports 'woke': true. "
-            + _QUEUE_NOTE,
+            "tab and retry -- destroys in-page state, so opt-in only; result reports 'woke': true. A "
+            "heavy/hydrated SPA can be slow or time out while the tab is NOT active -- pass "
+            "activate=true to foreground it first (never automatic; steals focus; result reports "
+            "'activated': true). " + _QUEUE_NOTE,
             {
                 "type": "object",
-                "properties": {**_TAB_TARGET_PROPS, "wake": {"type": "boolean", "default": False}},
+                "properties": {
+                    **_TAB_TARGET_PROPS,
+                    "wake": {"type": "boolean", "default": False},
+                    "activate": {"type": "boolean", "default": False},
+                },
                 "required": ["device_id", "tab_id"],
             },
             lambda input_data: _command("read", read_or_snapshot_args, input_data),
