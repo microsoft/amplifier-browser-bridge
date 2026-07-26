@@ -169,6 +169,16 @@ task's origins aren't known ahead of time, or you want the maintainer's own broa
 stance, skip this and rely on classification/effects/flow elevation instead -- scope is opt-in,
 not a required step.
 
+**There is no human-in-the-loop approval anywhere in this system, and there will not be one.**
+`redeem: "agent"` (the default confirmation mode) is self-attestation -- it makes the *agent*
+double-check itself, and defends against an accidental click, never an injected one. A dedicated
+human-approval channel was designed in detail and then deliberately cancelled (see
+`docs/designs/approval-channel-options.md`); `redeem: "unredeemable"` names what's left honestly --
+a session declaring it is choosing "a gate here is a permanent stop, nobody redeems it," not "a
+human will be asked." **If an action must not happen unattended, the only real lever is scope: do
+not grant write access to the origin it needs.** Confirmation gates are a safety net against
+mistakes, not a substitute for declaring what a session may do.
+
 ## "The action I'm about to take might be consequential"
 
 Every `click`/`type`/`key`/`navigate` result carries a `classification` block (deterministic

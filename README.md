@@ -289,6 +289,16 @@ Read [docs/POLICY.md](docs/POLICY.md) in full before relying on this for anythin
 threat model it targets -- it documents, plainly, what the denylist cannot see and which
 confirmation gates have no real detection signal wired up yet in this phase.
 
+**There is no human-in-the-loop approval in this system, and there will not be one.** A
+confirmation gate's default redemption mode (`redeem: "agent"`) is self-attestation -- the agent
+makes a second, separately-audited decision, which defends against an accidental action and
+nothing else. A dedicated human-approval channel was designed in detail and then deliberately
+cancelled (see [docs/designs/approval-channel-options.md](docs/designs/approval-channel-options.md)):
+a live experiment showed the strongest candidate could be driven by the very agent it needed to
+exclude. **If an action must not happen unattended, the only real lever is session scope** --
+declare a narrow `write` scope up front (`abb session-establish`) so the action is denied outright,
+rather than relying on a gate that a human will never actually see.
+
 ## Platform support
 
 | Capability | Edge desktop (Windows / macOS / Linux) | Edge Android |

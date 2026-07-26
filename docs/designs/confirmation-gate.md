@@ -1,6 +1,12 @@
 # Design: The Confirmation Gate — deciding when an action deserves a human
 
-**Status:** draft for review
+**Status:** draft for review. **Update (2026-07-26, same day): §15 step 6 / §16.1's "still
+deferred" out-of-band redemption channel is CANCELLED, not deferred** — see
+`docs/designs/approval-channel-options.md` §0 for the decision and evidence, and §17 below for
+what changed in this codebase as a result (the `redeem: "out_of_band"` name, used throughout this
+document as originally written, is renamed to `redeem: "unredeemable"` in the actual
+implementation — this document's historical prose keeps the original name where it is describing
+what was proposed/built at the time, for an accurate record).
 **Date:** 2026-07-26
 **Supersedes:** the gate half of `docs/POLICY.md` §3 and `policy.GATE_RULES`
 **Leaves untouched:** the denylist (`docs/POLICY.md` §2), the kill switch (§5), the audit log (§6)
@@ -332,7 +338,13 @@ Stated plainly, because the whole point of §2 is that some of this cannot be en
    action requires either a narrow scope (available, opt-in) or per-click approval (ruled out).
 3. **`redeem: "agent"` is the default.** Chosen so gates are not dead ends on unattended runs.
    It provides no defense against an injected model. Accepted and labeled as such in every result
-   and every doc; `out_of_band` is one session setting away.
+   and every doc. **Update, same day:** the alternative is not "one session setting away" as
+   originally written here -- a human-approval channel was designed (`docs/designs/
+   approval-channel-options.md`) and then cancelled outright (see that doc's §0). The only
+   session-settable alternative is `redeem: "unredeemable"`, which does not add a channel; it
+   converts the gate into a permanent, unrecoverable stop for a session declared unattended. If
+   this residual risk (self-attestation, no real defense against injection) is unacceptable for a
+   given task, the fix is a narrower `write` scope (Candidate C), not a different `redeem` value.
 4. **False positives will rise.** Scoring plus flow elevation fires more often than today's word
    lists. Accepted because the cadence is per-flow, and because the alternative — a gate tuned so
    tight it misses "Elevate to Administrator" — is the failure we are fixing.
@@ -589,7 +601,10 @@ One test keeps passing but changes meaning and needs a companion:
 2. **The first consequential action in a fresh flow.** Effects are post-hoc; flow elevation needs
    a prior observation or a page-context match.
 3. **A prompt-injected agent under `redeem: "agent"`.** It redeems its own token. Default for
-   ergonomic reasons; `out_of_band` exists and is one setting away.
+   ergonomic reasons. **Update, same day:** there is no channel-based alternative -- `redeem:
+   "unredeemable"` (renamed from `out_of_band`) does not add a channel, it removes the ability to
+   redeem the token at all; see `docs/designs/approval-channel-options.md` §0. The only way to
+   reduce this risk for a given task is a narrower `write` scope.
 4. **Server-side consequences behind an idempotent-looking GET.** A `GET /admin/promote?u=x` is
    indistinguishable from a page load at the effects layer.
 5. **Requests the collector cannot attribute.** `chrome.webRequest` reports `tabId: -1` for
@@ -660,7 +675,7 @@ One test keeps passing but changes meaning and needs a companion:
 | `src/amplifier_browser_bridge/policy.py` | **modify** | Keeps denylist / caches / confirmation lifecycle / kill switch. Delegates gate decisions to `classify` + `scope`. Re-exports `GateRule`/`GATE_RULES` for one release. |
 | `src/amplifier_browser_bridge/hub.py` | **modify** | Session establishment; attach `classification`/`effects` to results; flow-elevation state; `confirm` redemption channels. |
 | `src/amplifier_browser_bridge/client.py` | **modify** | `confirm()`, `establish_session()`. |
-| `src/amplifier_browser_bridge/cli.py` | **modify** | `abb confirm <token>`, `abb approve <token>` (out-of-band), `abb pending`. |
+| `src/amplifier_browser_bridge/cli.py` | **modify** | `abb confirm <token>`. (`abb approve <token>` / `abb pending` were planned for the out-of-band channel here; that channel is CANCELLED -- see §17 -- so these were never built and will not be.) |
 | `src/amplifier_browser_bridge/mcp_server.py` | **modify** | `browser_confirm` tool; surface `classification`/`effects` in tool results. |
 | `extension/action_descriptor.mjs` | **new** | Pure. Element → descriptor fields. Zero `chrome.*`. Companion `.test.mjs`. |
 | `extension/effects_collector.mjs` | **new** | Pure. Event accumulation + windowing + state-changing determination. Zero `chrome.*`. Companion `.test.mjs`. |
@@ -811,7 +826,7 @@ class SessionScope:
     read: Literal["*"] | tuple[str, ...] = "*"
     write: Literal["*"] | tuple[str, ...] = "*"  # origins, e.g. "https://github.com"
     on_unknown: Literal["allow", "gate", "deny"] = "allow"
-    redeem: Literal["agent", "out_of_band"] = "agent"
+    redeem: Literal["agent", "unredeemable"] = "agent"  # renamed from "out_of_band" -- see §17
     unattended: bool = False
     _sealed: bool = False  # set True on first page-content ingest
 
@@ -833,7 +848,8 @@ already applies to the read path.
 
 **Constraints on `narrow()`:** `write` may only go from `"*"` to a tuple, or to a strict subset of
 the existing tuple. `on_unknown` may only move `allow → gate → deny`. `redeem` may only move
-`agent → out_of_band`. `unattended` may only go `False → True`.
+`agent → unredeemable` (renamed from `out_of_band` -- see §17). `unattended` may only go
+`False → True`.
 
 ### 11.3 `effects.py`
 
@@ -929,7 +945,7 @@ class PolicyDecision:
     detected: dict[str, Any] | None = None
     # --- new, all optional ---
     classification: Classification | None = None
-    redeem: Literal["agent", "out_of_band"] = "agent"
+    redeem: Literal["agent", "unredeemable"] = "agent"  # renamed from "out_of_band" -- see §17
     confirm_scope: Literal["action", "flow"] = "action"
     reason_code: str | None = None
     expires_at: float | None = None
@@ -1148,12 +1164,156 @@ Each step is independently shippable and independently valuable.
 4. **Flow elevation.** Wires 1 and 2 together; makes bland labels catchable.
 5. **`scope.py` (C).** Session establishment, narrow-only, `on_unknown`, seal-on-first-read.
    **Done** — see §9 item 10. `write`-scope enforcement is wired into `PolicyEngine.evaluate`
-   and surfaced on all three agent surfaces (CLI/MCP/tool module). `read`-scope enforcement and
-   `redeem: "out_of_band"`'s redemption channel (step 6, below) remain open.
-6. **`redeem: out_of_band` (D2, part 2).** `abb approve`, the separate redemption channel.
+   and surfaced on all three agent surfaces (CLI/MCP/tool module). `read`-scope enforcement
+   remains open (mechanism present, not yet a consumer -- see `scope.py`'s own docstring).
+6. **~~`redeem: out_of_band` (D2, part 2). `abb approve`, the separate redemption channel.~~
+   CANCELLED (2026-07-26, same day).** A live experiment showed the strongest candidate channel
+   could be driven by the very agent it needed to exclude via `chrome.debugger`, and the simpler
+   fix (narrow the session via step 5, already done) was available the whole time. See
+   `docs/designs/approval-channel-options.md` §0 for the decision, the evidence, and what would
+   reopen it. `redeem: "out_of_band"` is renamed `redeem: "unredeemable"` throughout the
+   implementation (§17) -- it remains a real, permanent session setting; it is simply no longer a
+   placeholder for a channel that was going to exist.
 7. **Optional operator-configured screening hook (B).** Escalate-only, out-of-process, off by
    default. Only if a real consumer appears — otherwise skip it (design doc §13; `KERNEL_PHILOSOPHY`
    two-implementation rule).
 
 Steps 1–3 are the critical path: after them, the measured failure is loud even when it is not
 prevented, and a fired gate is no longer a dead end.
+
+---
+
+## 16. Post-implementation hardening (six-lens review panel, 2026-07-26)
+
+A six-lens review panel returned one FAIL and five CONCERNs against the shipped implementation.
+This section records the FAIL and the three unambiguous findings that were fixed, plus two
+findings investigated to a partial/documented stopping point.
+
+### 16.1 FAIL — the self-attestation hole (closed)
+
+Four independent reviewers hit the same live exploit: `PendingConfirmation` had no `redeem`
+field, and `_handle_agent_confirm` never checked one, so a session that declared
+`redeem: "out_of_band"` (the name at the time -- renamed `"unredeemable"`, §17) was, in practice,
+redeemable through the exact same `/agent` route as `redeem: "agent"` — the agent could mint the
+token and confirm it itself, one layer below the incident this whole design exists to prevent.
+
+**Fix:** `redeem` is now carried on `PendingConfirmation` (set from `scope.redeem` at the moment
+a gate fires — this was ALSO missing: `PolicyDecision.redeem` was never actually populated from
+`scope.redeem` anywhere in `evaluate()`, so the wire-level field silently stayed `"agent"`
+regardless of what the session declared) and enforced at `PolicyEngine.consume_confirmation`'s new
+`via` parameter. `Hub._handle_agent_confirm` calls `consume_confirmation(token, via="agent")` —
+the only redemption route this codebase has, or ever will have (§17) — so a `redeem:
+"unredeemable"` token is refused there, unconditionally, with a specific error naming why. A
+wrong-channel attempt does NOT consume the token (no `used`, no delete) — marking it "used" would
+claim a redemption that never happened; it stays unused until it naturally expires. Both the
+refusal and the (new) audit event (`policy_confirmation_wrong_channel`) are unconditional,
+regardless of who is asking — this is what also resolves the CLI finding below.
+
+**Consequence, stated plainly and intentionally:** a `redeem: "unredeemable"` confirmation cannot
+be redeemed AT ALL, by any route, ever. That is correct, deliberate, fail-closed behavior, and — as
+of §17 — it is also the *permanent* behavior, not a placeholder for a channel that was going to be
+built: a dedicated out-of-band channel was designed in full (`docs/designs/
+approval-channel-options.md`) and then explicitly cancelled. The alternative ("leave a path open
+because the real channel isn't built yet") was exactly the hole being closed here, and it remains
+closed regardless of whether a channel is ever coming. See `tests/test_redeem_channel.py`.
+
+### 16.2 The CLI confirm command (kept, relabeled, structurally barred)
+
+Three reviewers converged: a CLI command with a shell on the hub host is not out-of-band with
+respect to the agent, and shipping it without the enforcement above would look like coverage
+where none exists. Resolution: **kept** `abb confirm` (removing it would leave `redeem: "agent"`
+gates — the majority case — with no redemption surface at all, regressing D2). It is now
+explicitly documented (see `cli.py`'s `confirm` command docstring) as a **host-local operator
+convenience**, honestly labeled as out-of-band with respect to the *protocol*, not the *host* —
+and it is **structurally barred** from redeeming `unredeemable` confirmations by the same
+`consume_confirmation(..., via="agent")` enforcement in §16.1, because `abb confirm` reaches the
+identical `Hub._handle_agent_confirm` route an agent's own `confirm` call reaches. This is code
+enforcement, not a docstring promise — see `tests/test_redeem_channel.py`'s
+`test_hub_agent_confirm_route_rejects_unredeemable_token_end_to_end`.
+
+### 16.3 `permission_change` demotion reversed
+
+`docs/designs/approval-channel-options.md` had floated moving `permission_change` to the post-hoc
+side (§4 Candidate H, §6, §7 item 1), reasoning that the grant is revocable and attribution (D3)
+is already fixed. Three reviewers rejected this: revocability of the *permission record* says
+nothing about reversibility of *what an elevated actor does while holding it*. The measured
+incident's own category (Administrator access) is exactly the class where the window between
+grant and revocation is where the damage happens (deploy keys, collaborators, branch protection,
+secret exfiltration) — none of which is undone by later revoking the permission. `permission_change`
+**stays gated**. The reversal and full reasoning are now recorded in
+`docs/designs/approval-channel-options.md` §3.1's table, §6, and §7 item 1, specifically so a
+future reader does not re-derive the same (wrong) conclusion. No code changed for this item — the
+demotion was only ever a design-doc proposal, never implemented in `classify.py`/`policy.py`.
+
+### 16.4 Flow-elevation lifetime bound
+
+New finding (tester-breaker F5): `FLOW_TTL_SECONDS` was a purely idle-gap bound — it resets on
+every triggering observation (`note_effects`/`note_page_context`), so a flow kept alive by
+ordinary, continuing activity (exactly the shape of a multi-step enterprise wizard — and the
+measured incident's own URL is same-origin across every step, so origin-change never clears it
+either) never actually timed out, no matter how long the episode had been running. A human
+approving one low-stakes action early in a long desktop session (measured, `SCRATCH.md` R5: 142
+minutes, zero gaps) could have that approval's *ambient flow context* still contributing a `flow`
+signal to classification arbitrarily late in the same session.
+
+**Fix:** `FLOW_MAX_LIFETIME_SECONDS = 1800.0` (30 min, 2x `FLOW_TTL_SECONDS`) — an ABSOLUTE cap
+measured from when the episode started (`started_at`), independent of how recently it was last
+touched (`at`). `PolicyEngine._touch_flow` refreshes `at` on every observation but preserves
+`started_at` for a still-live episode; `_flow_state`'s read path checks both bounds and expires on
+whichever fires first. Both timestamps are hub-clock (`time.time()`), never page-supplied, so a
+page can cause MORE triggering observations but cannot manufacture more elapsed time — this is
+deliberately NOT page-authored, unlike everything `classify.py`'s label/page_context channels
+score (§2's lemma). Once the absolute cap lapses, the tab is not permanently barred from flow
+elevation — the very next triggering observation starts a genuinely new episode with its own fresh
+cap. See `policy.py`'s `FLOW_MAX_LIFETIME_SECONDS` comment and `tests/test_flow_lifetime.py`
+(including the minute-1-approve / minute-140-exploit shape, reproduced with a deterministic fake
+clock).
+
+### 16.5 F6 — session sealing serialization point (addressed)
+
+Finding: nothing named the point at which two commands sharing a `session_id`, dispatched before
+the first's response lands, are guaranteed to observe a consistent view of that session's
+seal state — a second command's `evaluate()` could run concurrently with the first command's
+`_ingest_result` (where `_maybe_seal_session` actually runs), and see pre-seal scope.
+
+**Fix:** `Hub` now holds a per-`session_id` `asyncio.Lock` (`_session_locks`), acquired by
+`send_command` for the full evaluate-through-dispatch span whenever a `session_id` is given
+(`contextlib.nullcontext()` — no lock, no behavior change — when one isn't). This is the hub's one
+named serialization point for session-scoped state: a second command for the same session cannot
+begin `PolicyEngine.evaluate` until the first command's full round trip — including seal-on-
+first-read — has completed. Commands with no `session_id` are entirely unaffected (fully
+concurrent, matching every pre-`scope.py` call site); commands under *different* sessions are also
+unaffected (independent locks). The cost is that two commands under the SAME session_id can no
+longer pipeline concurrently — an acceptable trade for a security property, and consistent with
+`scope.py`'s existing session-establishment discipline (one decision per session, not per click).
+See `tests/test_hub.py`'s `test_concurrent_commands_on_same_session_serialize_through_the_session_lock`.
+
+### 16.6 F7 — classifier label extraction gaps (investigated, not fixed this pass)
+
+Finding: the D1 classifier fix (`classify.py`) addressed the `combine="all"` boolean conjunction
+bug, but not label *extraction* itself. Four independent gaps were named, each capable of starving
+BOTH the label and page_context channels simultaneously (since both score off the same
+`descriptor.label`/`page_title`/`nearest_heading`/`dialog_title` text):
+
+1. **`aria-label`-only buttons** with no visible text content.
+2. **CSS `::before`/`::after` generated content** contributing to the rendered/visible label a
+   human sees but absent from any DOM text node or attribute.
+3. **Homoglyph substitution** (e.g. Cyrillic `А` U+0410 in `Аdmin` vs Latin `A` U+0041) — defeats
+   word-boundaried regex matching outright, and is NOT fixed by Unicode NFKC normalization (the
+   two characters are in different Unicode blocks entirely; NFKC does not fold cross-script
+   confusables).
+4. **Same-origin iframes** whose accessible-name-bearing content never reaches the top frame's
+   descriptor unless the caller explicitly used `args.all_frames=true`/`frame_id` targeting.
+
+**Status: investigated, not implemented this pass.** Gaps 1 and 4 are real but bounded and
+tractable (an accessible-name computation that checks `aria-label` before falling back to text
+content is a scoped fix in `injected.js`'s accessible-name resolution, and is very likely already
+partially covered — needs verification against the actual accessible-name algorithm before
+claiming a fix). Gap 3 (homoglyphs) requires either a confusable-skeleton normalization pass
+(Unicode TR39) or a mixed-script detector — nontrivial, and risks false positives against
+genuinely multilingual UIs if done carelessly. Gap 2 (CSS-generated content) is arguably
+unfixable from `injected.js`'s DOM-only vantage point without a full computed-style + pseudo-
+element text read, which is a meaningfully larger change. Per this task's instruction to "stop at
+a coherent boundary" rather than leave something half-wired: no code changed for F7. This section
+exists so the four gaps are recorded precisely enough that a follow-up pass can pick them up
+without re-deriving them, and so nobody assumes D1's `combine="all"` fix silently covers them too.

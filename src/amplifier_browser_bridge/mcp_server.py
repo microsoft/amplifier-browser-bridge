@@ -860,9 +860,12 @@ async def browser_establish_session(
     hostnames (subdomain-inclusive, e.g. 'github.com' also covers
     'gist.github.com'). on_unknown: 'allow' (default) | 'gate' | 'deny' --
     what to do when an action cannot be classified at all. redeem: 'agent'
-    (default, self-attestation) | 'out_of_band' (not yet implemented --
-    reserved). unattended: whether this session is running without a human
-    watching (one-way False -> True).
+    (default, self-attestation) | 'unredeemable' (no human-approval channel
+    exists in this system, by design -- see docs/designs/
+    approval-channel-options.md -- so a gate under this mode can never be
+    confirmed at all; declare it for a genuinely unattended session where a
+    gate should mean stop, not wait). unattended: whether this session is
+    running without a human watching (one-way False -> True).
 
     IMPORTANT: this ALWAYS creates a brand-new session with a fresh
     session_id -- it can never be used to reset an existing session's scope
@@ -892,7 +895,7 @@ async def browser_narrow_scope(
     (docs/designs/confirmation-gate.md section 11.2). write/read may only
     shrink to a strict subset of the current grant (comma-separated
     hostnames), on_unknown may only move allow -> gate -> deny, redeem only
-    agent -> out_of_band, unattended only False -> True. Only the
+    agent -> unredeemable, unattended only False -> True. Only the
     parameters you pass are touched; the rest of the scope is unaffected.
 
     Once the session has ingested any page content (a browser_read/

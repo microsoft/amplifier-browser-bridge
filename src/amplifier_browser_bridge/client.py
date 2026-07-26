@@ -135,8 +135,10 @@ class HubClient:
         caller of it). `redeem: "agent"` (this method) is self-attestation --
         the caller (a human via `abb confirm`, or an agent process explicitly
         deciding to proceed) makes a second, separately-audited decision.
-        `redeem: "out_of_band"` sessions are not yet implemented (see
-        docs/designs/confirmation-gate.md section 15, step 6 -- deferred)."""
+        `redeem: "unredeemable"` sessions can never be confirmed through this
+        method (or any other route in this system) -- there is no human-
+        approval channel, by design; see docs/designs/approval-channel-options.md
+        for the cancellation and its reasoning."""
         resp = await self._request(
             {
                 "v": PROTOCOL_VERSION,

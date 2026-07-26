@@ -252,10 +252,31 @@ def tab_open(device: str, url: str, active: bool, timeout: float | None) -> None
 @click.argument("confirmation_token")
 def confirm(confirmation_token: str) -> None:
     """Redeem a confirmation token from a prior `needs_confirmation` response
-    (docs/designs/confirmation-gate.md, D2). This is `redeem: "agent"`
-    self-attestation -- run by whoever is driving the CLI, as an explicit,
-    separately-audited second decision. See `docs/POLICY.md` section 3 for
-    what triggers a gate in the first place."""
+    (docs/designs/confirmation-gate.md, D2).
+
+    HONEST LABEL (docs/designs/approval-channel-options.md section 4,
+    Candidate A): this is a HOST-LOCAL operator convenience, not a human-
+    approval channel. It reaches the exact same hub route
+    (`Hub._handle_agent_confirm`) that an agent's own `confirm` call reaches
+    -- running this command is out-of-band with respect to the *protocol*,
+    not with respect to the *host*. An agent with a shell on this machine can
+    run `abb confirm <token>` itself; this command grants no protection
+    against that.
+
+    It can ONLY redeem a confirmation whose session declared `redeem:
+    "agent"` (the default). A confirmation whose session declared `redeem:
+    "unredeemable"` is structurally refused here -- the hub enforces this at
+    `PolicyEngine.consume_confirmation`, not merely by convention -- because
+    there is no human-approval channel in this system, by design (a channel
+    was considered and explicitly CANCELLED after a live experiment showed the
+    strongest candidate could be driven by the very agent it needed to
+    exclude -- see docs/designs/approval-channel-options.md). If you see that
+    refusal, it is working as intended: this command is not, and must never be
+    treated as, a substitute for real human-in-the-loop approval. There is no
+    such substitute in this system -- if an action must not happen unattended,
+    the way to prevent it is to not grant it in the session's write scope
+    (`abb session-establish --write ...`), not to rely on a gate firing.
+    """
     try:
         result = asyncio.run(_client().confirm(confirmation_token))
     except HubError as e:
@@ -546,7 +567,7 @@ def cmd(
 @click.option(
     "--on-unknown", type=click.Choice(["allow", "gate", "deny"]), default="allow", show_default=True
 )
-@click.option("--redeem", type=click.Choice(["agent", "out_of_band"]), default="agent", show_default=True)
+@click.option("--redeem", type=click.Choice(["agent", "unredeemable"]), default="agent", show_default=True)
 @click.option("--unattended", is_flag=True, default=False)
 def session_establish(read: str, write: str, on_unknown: str, redeem: str, unattended: bool) -> None:
     """Create a new session with a caller-declared write scope
@@ -583,7 +604,7 @@ def session_establish(read: str, write: str, on_unknown: str, redeem: str, unatt
 @click.option("--read", default=None, help="Comma-separated origins to narrow READ scope to.")
 @click.option("--write", default=None, help="Comma-separated origins to narrow WRITE scope to.")
 @click.option("--on-unknown", type=click.Choice(["allow", "gate", "deny"]), default=None)
-@click.option("--redeem", type=click.Choice(["agent", "out_of_band"]), default=None)
+@click.option("--redeem", type=click.Choice(["agent", "unredeemable"]), default=None)
 @click.option(
     "--unattended", is_flag=True, default=False, help="Set unattended=true (one-way: False -> True only)."
 )
@@ -598,7 +619,7 @@ def session_narrow(
     """Narrow an EXISTING session's scope -- NEVER widens
     (docs/designs/confirmation-gate.md section 11.2): write/read may only
     shrink to a strict subset of the current grant, on_unknown may only
-    move allow -> gate -> deny, redeem only agent -> out_of_band, unattended
+    move allow -> gate -> deny, redeem only agent -> unredeemable, unattended
     only False -> True. Only the options you pass are touched.
 
     Once the session has ingested any page content (a read/snapshot/tabs

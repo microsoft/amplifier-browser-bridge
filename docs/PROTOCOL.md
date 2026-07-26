@@ -301,9 +301,17 @@ cannot suppress a real one.
 silent gap: `tier: "none"` means nothing could be observed, not that nothing happened. A tab
 observed to be `state_changing` enters **flow elevation** (design doc §11.4): subsequent
 state-changing commands in that tab gate until its committed origin changes, a flow-scoped
-confirmation is redeemed (`confirm_scope: "flow"` above), or 15 minutes elapse -- this is how a
-bland-labeled button (e.g. "Next" in a multi-step flow) becomes catchable without any label
-signal of its own.
+confirmation is redeemed (`confirm_scope: "flow"` above), or 15 minutes of no new triggering
+observation elapse -- this is how a bland-labeled button (e.g. "Next" in a multi-step flow)
+becomes catchable without any label signal of its own.
+
+**Flow elevation has TWO independent bounds** (design doc §16.4, fix for review-panel finding F5):
+the 15-minute idle-gap bound above resets on every new triggering observation, so a flow kept
+"warm" by ordinary, continuing activity would otherwise never end. A second, ABSOLUTE bound
+(`FLOW_MAX_LIFETIME_SECONDS`, 30 minutes) is measured from when the flow episode started and does
+NOT reset on continued activity -- it ends the episode regardless of how recently it was last
+touched. Once it lapses, the very next triggering observation starts a genuinely new episode with
+its own fresh 30-minute cap; a tab is never permanently excluded from flow elevation.
 
 ### `confirm` (agent -> hub) / `result` (hub -> agent)
 
@@ -323,6 +331,28 @@ another denial; a confirmation only bypasses the *gate*, never the denylist). A 
 with the same `confirmation_token` fails with `{"ok": false, "error": "confirmation token already
 used"}`; one submitted after the token's TTL fails with `{"ok": false, "error": "confirmation
 token expired"}`.
+
+**Channel enforcement (fix for a live self-attestation hole, `docs/designs/confirmation-gate.md`
+§16.1):** `confirm` on this route is `redeem: "agent"` self-attestation, and ONLY redeems a
+confirmation whose session declared `redeem: "agent"` (the default). A confirmation whose
+session declared `redeem: "unredeemable"` is refused here unconditionally --
+`{"ok": false, "error": "...requires human approval... redeem='unredeemable'..."}` -- because this
+is the ONLY redemption route this protocol has, or ever will have (see below), and it is reachable
+by the agent's own process. This is enforced in `PolicyEngine.consume_confirmation`, not advisory:
+a wrong-channel attempt does not consume the token (marking it "used" would claim a redemption that
+never happened), and is separately audited as `policy_confirmation_wrong_channel`.
+
+**There is no human-approval channel in this system, and there will not be one.** A dedicated
+out-of-band channel (the extension's own UI, pushed over the `/device` socket) was designed in
+detail in `docs/designs/approval-channel-options.md` and then **cancelled**: a live CDP experiment
+showed the strongest candidate could be driven by the very agent it needed to exclude (see that
+doc's cancellation note), and the simpler fix -- a narrower session `write` scope, already built
+via `establish_session`/`narrow_scope` below -- was available the whole time. `redeem:
+"unredeemable"` is the honest name for what declaring it does: a session that declares it is
+saying "this session is unattended; a gate here is a permanent stop, not a wait." Its gated actions
+can never be confirmed, by any route, ever -- not a temporary gap pending a future channel. **If an
+action must not happen unattended, the way to prevent it is to not grant it in the session's write
+scope** (see `establish_session` below), not to rely on a gate firing and a human approving it.
 
 ### `establish_session` (agent -> hub) / `result` (hub -> agent)
 
@@ -373,7 +403,7 @@ changes nothing at all):
 - `write`/`read`: `"*"` -> any finite list, or a **strict subset** of the current list. Never
   back to `"*"`, never a superset, never a disjoint set.
 - `on_unknown`: `allow -> gate -> deny` only (may skip directly from `allow` to `deny`).
-- `redeem`: `agent -> out_of_band` only.
+- `redeem`: `agent -> unredeemable` only.
 - `unattended`: `false -> true` only.
 
 ```json
