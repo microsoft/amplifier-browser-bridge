@@ -56,18 +56,29 @@ uv pip install -e ".[mcp]"   # MCP server support (abb-mcp)
 abb hub --host 0.0.0.0 --port 8900
 ```
 
-Auth is disabled by default in dev and this is loudly logged. To enable it, set `ABB_HUB_TOKEN`
-and match it in `extension/config.js`'s `HUB_TOKEN`, and pass `ABB_TOKEN` to the CLI/MCP server.
+Auth is disabled by default in dev and this is loudly logged. To enable it, run `abb init`
+(generates a token, writes it to the hub's token file) and paste the printed token into the
+extension's options page (its toolbar-icon click), and pass `ABB_TOKEN` to the CLI/MCP server.
 See `docs/PROTOCOL.md` ("Authentication") for the full resolution order.
 
 ### Loading the extension unpacked
 
-1. Edit `extension/config.js` so `HUB_URL` points at your hub's address. Use a tailnet IP
-   literal, never a MagicDNS name -- see `docs/designs/browser-bridge.md` section 4 for why
-   MagicDNS resolution is unreliable per-device.
-2. In Edge, go to `edge://extensions`, enable Developer mode, choose "Load unpacked", and select
-   the `extension/` directory.
-3. Confirm the device shows up via `abb devices`.
+Hub URL and token are runtime configuration (`chrome.storage.local`), entered through the
+extension's own options page -- never a tracked source file. See README.md's "Setup" section
+for the full `abb init` / `abb doctor` flow; the short version for local dev:
+
+1. In Edge, go to `edge://extensions`, enable Developer mode, choose "Load unpacked", and select
+   the `extension/` directory (or a directory staged by `abb init` -- see below).
+2. Click the extension's toolbar icon (its only UI) to open the options page. Enter the hub's
+   Hub URL -- a tailnet IP literal, never a MagicDNS name, see `docs/designs/browser-bridge.md`
+   section 4 for why -- and the token from `abb init`/your hub operator, then Save.
+3. Confirm the device shows up via `abb devices` or `abb doctor`.
+
+For iterative development, prefer staging via `abb init --dest <dir>` (or reuse an existing
+staged directory) over loading directly from `extension/` in this repo checkout -- an unpacked
+extension's identity (and therefore its `chrome.storage.local` config) is tied to the exact
+directory path it was loaded from, so loading from a stable staged path means future `abb init`
+re-runs (which re-copy the JS/HTML/manifest files) never disturb a working configuration.
 
 ### Running tests
 
@@ -97,8 +108,9 @@ At minimum, verify syntax before submitting a change:
 
 ```bash
 node --input-type=module --check < extension/background.js
-node --input-type=module --check < extension/config.js
 node --input-type=module --check < extension/injected.js
+node --input-type=module --check < extension/options.js
+node --input-type=module --check < extension/config_validate.mjs
 node --input-type=module --check < extension/frame_refs.mjs
 node --input-type=module --check < extension/combine_frames.mjs
 node --input-type=module --check < extension/download_claim.mjs

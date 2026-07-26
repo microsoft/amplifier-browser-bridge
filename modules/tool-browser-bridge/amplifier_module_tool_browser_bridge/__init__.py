@@ -13,6 +13,11 @@ guaranteed).
 `HubClient` is already async (it awaits a websocket round-trip), so tools call it
 directly with `await` -- no `asyncio.to_thread` needed; that's only for wrapping
 genuinely blocking/synchronous code, which nothing here is.
+
+See docs/DECISION_GUIDE.md in the amplifier-browser-bridge repo for WHICH of these
+tools to reach for and when -- a dozen read/act mechanisms plus modifiers (wake,
+activate, trusted, capture_hidden) is real power with no map otherwise. This module
+picks nothing for you; it forwards exactly what the caller asked for.
 """
 
 from __future__ import annotations

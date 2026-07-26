@@ -1,5 +1,8 @@
 # Wire Protocol
 
+See [docs/DECISION_GUIDE.md](DECISION_GUIDE.md) for WHICH mechanism to reach for and when --
+this document defines each command's exact semantics; that one is the decision layer on top.
+
 This is the contract everything else in this repo depends on. `src/amplifier_browser_bridge/protocol.py`
 is the Python-side source of truth for the names below (message types, command vocabulary,
 capability keys); `extension/background.js` mirrors the same shapes by hand in JS (there is no

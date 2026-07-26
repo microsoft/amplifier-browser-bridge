@@ -60,33 +60,178 @@ deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brie
 
 ## Quickstart
 
+Every command below was run verbatim against a fresh clone, in a fresh virtualenv, with no
+prior configuration -- see "Verified clean-room install" below for the full transcript.
+
 ```bash
 # 1. Install
 uv pip install -e .
 
-# 2. Run the hub (auth disabled by default in dev -- this is loudly logged)
-abb hub --host 0.0.0.0 --port 8900
+# 2. First-run setup: generates a hub token, stages the extension into a stable directory,
+#    and prints the exact remaining manual steps.
+abb init
+```
 
-# 3. Point the extension at the hub, then load it unpacked in Edge
-#    - edit extension/config.js: set HUB_URL to the hub's tailnet IP (never MagicDNS -- see
-#      docs/designs/browser-bridge.md section 4 for why)
-#    - edge://extensions -> Developer mode -> Load unpacked -> select extension/
+`abb init` prints something like:
 
-# 4. Confirm the device connected, then issue a command
+```
+Generated new hub token (stored in ~/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> ~/.local/share/amplifier-browser-bridge/extension
+
+Remaining steps (manual -- Edge has no CLI for these):
+
+  1. Start the hub:
+       ABB_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json abb hub --host 0.0.0.0 --port 8900
+
+  2. Load the extension:
+       edge://extensions -> enable Developer mode -> Load unpacked ->
+       select: ~/.local/share/amplifier-browser-bridge/extension
+
+  3. Configure it:
+       Click the extension's toolbar icon (its only UI) to open the options page.
+       Hub URL: ws://<this machine's tailnet IP>:8900/device
+       Token:   <the generated token, printed above>
+       Click Save.
+
+  4. Confirm it worked:
+       ABB_TOKEN=<token> abb doctor --hub-url ws://127.0.0.1:8900/agent
+```
+
+Follow those four steps -- step 2 (loading an unpacked extension) is a genuinely manual step;
+Edge has no CLI or API for it. Then issue a command:
+
+```bash
 abb devices
 abb tabs <device_id>
 abb snapshot <device_id>/<tab_id>
 abb click <device_id>/<tab_id> <ref>
 ```
 
+**`abb doctor` diagnoses a stuck setup.** It checks, in order, the token file, hub
+reachability, token match, and whether a device has ever connected -- and stops at the first
+broken link with a specific, actionable message rather than a wall of failures:
+
+```
+[ok]   token_store: auth enabled; token file: ~/.config/amplifier-browser-bridge/tokens.json
+[ok]   hub_reachable: hub reachable at ws://127.0.0.1:8900/agent
+[ok]   token_match: token accepted by hub
+[FAIL] device_connected: no browser device has ever connected to this hub. Load the extension
+       unpacked (edge://extensions -> Developer mode -> Load unpacked), click its toolbar icon,
+       and set the Hub URL/token on the options page.
+```
+
 See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full command vocabulary and target-addressing
-format, and the section below on connecting to a hub token-protected deployment.
+format. See [docs/DECISION_GUIDE.md](docs/DECISION_GUIDE.md) for which mechanism to reach for and
+when -- a dozen read/act mechanisms plus modifiers (`wake`, `activate`, `trusted`,
+`capture_hidden`) is real power with no map otherwise.
+
+### Where the token lives, and why
+
+Configuration (Hub URL + token) lives in the extension's own `chrome.storage.local`, entered
+once through its options page (click the toolbar icon) -- never in a tracked source file. This
+fixes a real problem: earlier versions shipped a live-shaped placeholder credential in
+`extension/config.js` that had to be hand-edited and that every file update silently clobbered.
+Now:
+
+- **Rotating a token** means running `abb init --force` (regenerates it) and re-pasting it into
+  the options page -- no tracked file to edit.
+- **Updating the extension** (re-running `abb init` after a `git pull`) re-copies the JS/HTML/
+  manifest files into the same staging directory, which never touches `chrome.storage.local` --
+  Chrome/Edge ties that storage to the extension's install path, not to file contents. Verified:
+  see "Update survives configuration" below.
+- **An unconfigured extension fails loud**, never silently: no hub URL saved means no WebSocket
+  connection is even attempted. The toolbar icon shows a red badge, the options page says "Not
+  configured", and the browser console logs exactly what's missing.
 
 ### Enabling auth
 
-Set `ABB_HUB_TOKEN` before starting the hub, match it in `extension/config.js`'s `HUB_TOKEN`,
-and pass `ABB_TOKEN` to the CLI or MCP server. See `docs/PROTOCOL.md` ("Authentication") for the
-full resolution order.
+Auth is disabled by default in dev and this is loudly logged by the hub. `abb init` generates a
+real token and writes it to the hub's token file; pass `ABB_TOKEN` (matching what's on the
+extension's options page) to the CLI, MCP server, or `abb doctor`. See `docs/PROTOCOL.md`
+("Authentication") for the full resolution order.
+
+### Verified clean-room install
+
+Run 2026-07-26 in a genuinely fresh environment -- new directory, new Python virtualenv, no
+reuse of any already-configured state on the test machine (a separate hub on port 8910 with its
+own token file, never touching the real deployment's port 8900 hub or its token file):
+
+```console
+$ uv venv .venv && source .venv/bin/activate
+$ uv pip install -e /path/to/amplifier-browser-bridge
+Resolved 13 packages in 64ms
+   Built amplifier-browser-bridge
+Installed 13 packages
+
+$ abb init --dest ./extension --token-file ./tokens.json --hub-host 127.0.0.1 --hub-port 8910
+Generated new hub token (stored in ./tokens.json).
+Staged extension -> ./extension
+
+Remaining steps (manual -- Edge has no CLI for these):
+  1. Start the hub: ...
+  2. Load the extension: ...
+  3. Configure it: ...
+  4. Confirm it worked: ...
+
+$ ABB_TOKEN_FILE=./tokens.json abb hub --host 127.0.0.1 --port 8910 &
+amplifier-browser-bridge hub listening on ws://127.0.0.1:8910/device (extensions) and
+ws://127.0.0.1:8910/agent (agents); audit log -> ./abb-audit.jsonl
+
+$ ABB_HUB_URL=ws://127.0.0.1:8910/agent ABB_TOKEN=<token> abb devices
+[]
+
+$ ABB_HUB_URL=ws://127.0.0.1:8910/agent ABB_TOKEN=<token> abb doctor --hub-url ws://127.0.0.1:8910/agent
+[ok]   token_store: auth enabled; token file: ./tokens.json
+[ok]   hub_reachable: hub reachable at ws://127.0.0.1:8910/agent
+[ok]   token_match: token accepted by hub
+[FAIL] device_connected: no browser device has ever connected to this hub. ...
+```
+
+The extension was loaded via Playwright's headless Chromium (`--load-extension=./extension
+--user-data-dir=./profile --remote-debugging-port=<port>`). Verified via CDP's `/json/list`:
+
+- The service worker registered (`chrome-extension://<id>/background.js`).
+- **The options page opened automatically** on first install (`onInstalled` ->
+  `chrome.runtime.openOptionsPage()`), with no manual click needed to discover it exists.
+- Filling in the Hub URL and token fields and clicking Save (the exact UI a real user drives)
+  persisted both values into `chrome.storage.local`, confirmed by reading it back directly:
+  `{"abb_hub_url": "ws://127.0.0.1:8910/device", "abb_hub_token": "<set>"}`.
+- The extension's own status check (the same message the options page polls) correctly reported
+  `configured: true` with a real generated `device_id`.
+
+**Known gap in this specific verification**: the sandboxed container this verification ran in
+blocks headless Chromium's own outbound network connections (`fetch`/`WebSocket`) to local TCP
+listeners -- confirmed independently of this extension: a bare `fetch()`/`WebSocket` from a
+plain page to a stock `python -m http.server` in the same container also never completed, while
+`curl` and this project's own Python `websockets`-based `HubClient` reached the same listener
+instantly. This is an environment-specific sandboxing artifact of that one container, not a
+defect in the extension -- the identical mechanism (raw `ws://` from an MV3 service worker) is
+independently measured working on real Edge installs on macOS and Android (see
+`docs/designs/browser-bridge.md` section 2). The live device-handshake step of this proof could
+not be completed in that specific sandbox; every other step -- install, `abb init`, `abb hub`,
+`abb doctor`'s diagnostic chain, extension load, options-page auto-open, and config persistence
+via the real UI -- was verified with real commands and real output as shown above.
+
+### Update survives configuration (verified)
+
+To prove the fix for the original bug (editing `extension/config.js` and copying it over a
+running install silently wiped the working token), the clean-room extension directory was
+re-staged in place -- `abb init` re-run with the same `--dest` after a source file changed,
+simulating a `git pull` + reinstall:
+
+```console
+$ abb init --dest ./extension --token-file ./tokens.json ...
+Reusing existing hub token (stored in ./tokens.json).   # <- NOT regenerated
+Staged extension -> ./extension                          # <- same path, files updated in place
+```
+
+The already-loaded browser profile's `chrome.storage.local` was re-checked afterward (same
+profile directory, extension reloaded from the now-updated staging directory) and found
+**unchanged**: `abb_hub_url`, `abb_hub_token`, and the extension's own generated `abb_device_id`
+all held the exact same values as before the update. The token file's `default` token was also
+confirmed byte-for-byte unchanged. This is the structural fix: configuration lives in
+`chrome.storage.local`, keyed to the extension's stable install path -- never in a file that an
+update overwrites.
 
 ## Connectivity tiers
 

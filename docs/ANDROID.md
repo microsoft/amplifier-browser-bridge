@@ -24,10 +24,12 @@ the honest line between the two.
   not just "Edge") is not in the excluded list. A silently-excluded browser
   produces the same symptom as no Tailscale at all: the extension connects to
   nothing and never appears in `abb devices`.
-- **The hub's tailnet IP literal, never a MagicDNS name**, in `extension/config.js`
-  before packaging -- see design doc section 4: MagicDNS was measured to resolve
-  correctly on one device and fail on another *in the same tailnet at the same
-  moment*. IP literals are the only thing that worked everywhere.
+- **The hub's tailnet IP literal, never a MagicDNS name**, entered on the extension's
+  options page (its toolbar-icon click) AFTER installing on-device -- see design doc
+  section 4: MagicDNS was measured to resolve correctly on one device and fail on
+  another *in the same tailnet at the same moment*. IP literals are the only thing
+  that worked everywhere. This is a post-install step now (configuration lives in
+  `chrome.storage.local`, not a packaged file) -- packaging no longer bakes in a URL.
 
 ## Two packaging traps (already discovered -- don't rediscover them)
 
@@ -65,8 +67,9 @@ scripts/package-android.sh
 
 This:
 
-1. Stages `extension/background.js`, `injected.js`, and `config.js` together with
-   `manifest.android.json` (renamed to `manifest.json`) -- the Android-safe
+1. Stages `extension/background.js`, `injected.js`, `options.html`/`options.js`, and the
+   dependency-free `.mjs` helper modules together with `manifest.android.json` (renamed to
+   `manifest.json`) -- the Android-safe
    manifest variant that omits the `debugger` permission (genuinely absent on Edge
    Android; requesting a permission the platform doesn't have is unnecessary risk
    for store/policy review, and every command still works via injection --
@@ -188,7 +191,7 @@ with no way to know when (or whether) it will reconnect on its own.
 | Download completes but nothing appears in Downloads/My Files | Trap #1 -- Chromium intercepted the `.crx` MIME type and silently discarded it | Serve as `.bin` with `Content-Type: application/octet-stream`, rename to `.crx` on-device before installing |
 | "Extension install by crx" does nothing -- no dialog, no error, no toast | Trap #2 -- the file isn't a real CRX3 (was a renamed `.zip`, was corrupted in transit, or the rename in step 2 above didn't actually change the extension) | Rebuild with `scripts/package-android.sh` (never hand-roll a `.crx`); re-verify with `scripts/verify_crx.py`; re-download and re-check the file's size/SHA-256 matches what the script printed |
 | "Extension install by crx" prompts for a **URL** instead of accepting your file, or otherwise seems to want a network location | Misreading of the feature -- it requires a **local file path**, confirmed; there is no URL-based install path on Edge Android | Ensure the file is downloaded and renamed locally on the device first, then point the file picker at it |
-| Extension installs, but never appears in `abb devices` | Tailscale not connected on the phone, or Edge Canary excluded from the tailnet, or `config.js`'s `HUB_URL` uses a MagicDNS name instead of an IP literal | Check Tailscale's connection state and per-app exclusion list on the phone; confirm `config.js` was edited to a tailnet IP literal before packaging |
+| Extension installs, but never appears in `abb devices` | Tailscale not connected on the phone, Edge Canary excluded from the tailnet, the options page was never configured, or the configured Hub URL uses a MagicDNS name instead of an IP literal | Check Tailscale's connection state and per-app exclusion list on the phone; open the extension's options page (toolbar icon) and confirm the Hub URL is set to a tailnet IP literal, not MagicDNS |
 | Device connects, but goes dark for many minutes with no self-recovery | Battery-optimization exemption not applied ("sleeping apps" still active) | Apply the onboarding requirement above; re-test with the screen locked for a few minutes and confirm the tier transitions to `intermittent` (not stuck `dormant` forever) and self-heals |
 | `capabilities.debugger` is `false` | **This is correct, not a bug.** `chrome.debugger` (CDP) is genuinely absent on Edge Android | No action -- CDP-requiring commands (`trusted` input, `capture_hidden` screenshot) will fail loud with a clear capability-unavailable error; everything else works via injection |
 | Extension ID changes between rebuilds | The signing key wasn't reused -- either it was deleted, or `ABB_ANDROID_SIGNING_KEY` pointed somewhere different between runs | Locate/restore the original key; back it up going forward. A changed ID means Android treats the rebuilt package as a different extension |

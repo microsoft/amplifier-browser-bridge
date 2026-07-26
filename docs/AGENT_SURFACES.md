@@ -30,7 +30,10 @@ Playwright MCP's vocabulary, design doc section 9):
 
 See `docs/PROTOCOL.md` for the exact command semantics and `docs/designs/browser-bridge.md`
 for the addressing model (`device_id` -> `window_id`/`tab_id` -> `ref`) and the
-three-tier connectivity model (`live` / `intermittent` / `dormant`).
+three-tier connectivity model (`live` / `intermittent` / `dormant`). See
+`docs/DECISION_GUIDE.md` for WHICH of these tools to reach for and when -- a dozen
+read/act mechanisms plus modifiers (`wake`, `activate`, `trusted`, `capture_hidden`) is
+real power with no map otherwise.
 
 ## The one thing both surfaces must get right: tier pass-through
 

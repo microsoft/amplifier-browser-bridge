@@ -62,7 +62,14 @@ mcp = FastMCP(
         "commands queue until it wakes). A command sent to a non-live device "
         "returns immediately with a queued status -- it never blocks. See each "
         "tool's description for the exact shape, and use browser_poll to check "
-        "back later."
+        "back later.\n\n"
+        "WHICH TOOL, WHEN: this server exposes ~a dozen read/act mechanisms plus "
+        "modifiers (wake, activate, trusted, capture_hidden) with real, different "
+        "tradeoffs -- see docs/DECISION_GUIDE.md in the repo for the full decision "
+        "tree (e.g. 'I want the text of this page' -> browser_read -> "
+        "all_frames=true -> browser_fetch_bytes/browser_vision_read, in that "
+        "order, each with its failure mode named). This server picks nothing for "
+        "you; every tool's own description also names its specific tradeoffs."
     ),
 )
 

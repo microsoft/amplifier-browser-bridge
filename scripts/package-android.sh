@@ -80,7 +80,15 @@ trap cleanup EXIT
 
 cp "$EXTENSION_SRC/background.js" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/injected.js" "$STAGE_EXT/"
-cp "$EXTENSION_SRC/config.js" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/options.html" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/options.js" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/config_validate.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/frame_refs.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/combine_frames.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/ref_registry.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/args_bool.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/fetch_utils.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/download_claim.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/manifest.android.json" "$STAGE_EXT/manifest.json"
 
 VERSION=$(python3 -c "import json; print(json.load(open('$STAGE_EXT/manifest.json'))['version'])")
