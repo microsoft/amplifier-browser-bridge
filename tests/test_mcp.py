@@ -64,6 +64,7 @@ def test_all_expected_tools_are_registered():
         "browser_wait_for",
         "browser_wait_text",
         "browser_poll",
+        "browser_confirm",
         "browser_fetch_bytes",
         "browser_grab_image",
         "browser_downloads_list",

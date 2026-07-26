@@ -154,6 +154,25 @@ from urllib.parse import urlsplit
 
 from .addressing import Target
 from .audit import AuditLog
+from .classify import (
+    ActionDescriptor,
+    Classification,
+    ClassifierProfile,
+    _count_family_terms,
+)
+from .classify import classify as _classify
+
+# The commands effects collection, flow-elevation, and (in a later phase)
+# scope enforcement apply to (design doc section 11.4). Re-exported (bare
+# import, not aliased -- ruff PLC0414) from effects.py so policy.py and
+# hub.py share one canonical set; `hub.py` imports `STATE_CHANGING_COMMANDS`
+# from `policy`, not `effects`, for that reason.
+from .effects import STATE_CHANGING_COMMANDS, EffectsReport
+
+# How long a tab's flow-elevated status survives with no new triggering
+# observation, before it lapses on its own (design doc section 11.4:
+# "FLOW_TTL_SECONDS = 900 (15 min). Flow elevation is per (device_id, tab_id).").
+FLOW_TTL_SECONDS: float = 900.0
 
 # ---------------------------------------------------------------------------
 # Denylist
@@ -468,7 +487,7 @@ class PendingConfirmation:
     target: Target
     command: str
     args: dict[str, Any]
-    category: str
+    category: str | None
     detected: dict[str, Any]
     created_at: float
     expires_at: float
@@ -478,13 +497,38 @@ class PendingConfirmation:
 @dataclass
 class PolicyDecision:
     """The single return type of PolicyEngine.evaluate. `status` drives Hub's
-    branch; `reason`/`category`/`token`/`detected` carry the detail."""
+    branch; `reason`/`category`/`token`/`detected` carry the detail.
+
+    The remaining fields are additive (docs/designs/confirmation-gate.md
+    section 8, "Migration" -- all optional, all defaulted, existing
+    construction sites unaffected):
+
+    - `classification`: the full scored `Classification` (classify.py),
+      attached on every state-changing decision regardless of outcome --
+      `advisory=True` always; never a security boundary on its own.
+    - `redeem`: how a `needs_confirmation` token may be redeemed. `"agent"`
+      (default) is self-attestation, honestly labeled as such -- see the
+      design doc section 3, Candidate E.
+    - `confirm_scope`: `"action"` (this one command) or `"flow"` (redeeming
+      clears flow elevation for this tab until its origin changes or
+      FLOW_TTL_SECONDS elapses).
+    - `reason_code`: set on `deny`/`unknown` outcomes needing a specific,
+      machine-readable cause (`"out_of_scope"`, `"unclassifiable"`, or one of
+      classify.py's `ReasonCode` values).
+    - `expires_at`: the confirmation token's expiry (epoch seconds), when
+      `status == "gate"`.
+    """
 
     status: Literal["allow", "deny", "gate"]
     reason: str | None = None
     category: str | None = None
     token: str | None = None
     detected: dict[str, Any] | None = None
+    classification: Classification | None = None
+    redeem: Literal["agent", "out_of_band"] = "agent"
+    confirm_scope: Literal["action", "flow"] = "action"
+    reason_code: str | None = None
+    expires_at: float | None = None
 
 
 # Generic, agent-facing denial text. Deliberately does NOT name the matched
@@ -510,11 +554,25 @@ class PolicyEngine:
         denylist: Denylist | None = None,
         gate_rules: tuple[GateRule, ...] = GATE_RULES,
         confirmation_ttl: float = DEFAULT_CONFIRMATION_TTL_SECONDS,
+        profile: ClassifierProfile | None = None,
+        on_unknown: Literal["allow", "gate", "deny"] = "allow",
     ) -> None:
         self._audit = audit
         self.denylist = denylist if denylist is not None else Denylist.load()
+        # Retained for one release (docs/designs/confirmation-gate.md section
+        # 8, "Migration") -- GATE_RULES has no real importers outside this
+        # module, and `evaluate()` no longer consults it: gate decisions are
+        # now made by `classify.classify()` against `self.profile`. Kept as a
+        # constructor param purely so existing call sites (tests included)
+        # that pass `gate_rules=...` don't break.
         self.gate_rules = gate_rules
         self.confirmation_ttl = confirmation_ttl
+        self.profile = profile if profile is not None else ClassifierProfile()
+        # Stands in for a per-session SessionScope's `on_unknown` (scope.py is
+        # not implemented in this phase -- see this module's docstring
+        # section below on what's deliberately deferred). Applies hub-wide
+        # rather than per-session until scope.py exists.
+        self.on_unknown: Literal["allow", "gate", "deny"] = on_unknown
         self.kill_switch_active = False
 
         # (device_id, tab_id) -> last-observed full URL. Built exclusively from
@@ -563,6 +621,42 @@ class PolicyEngine:
 
         self._confirmations: dict[str, PendingConfirmation] = {}
 
+        # (device_id, tab_id) -> {"by": "observed_effect"|"page_context", "at":
+        # epoch_seconds, "origin": the origin recorded at trigger time}. D3 +
+        # flow elevation (design doc section 11.4): a tab that was observed to
+        # do something state-changing (or whose page context matched a
+        # consequence family) enters an elevated-consequence context -- every
+        # subsequent state-changing command in it gates until the tab's
+        # committed ORIGIN changes (see note_tab_url below), a flow-scoped
+        # confirmation is redeemed (see hub.py's _handle_agent_confirm), or
+        # FLOW_TTL_SECONDS elapses. This is how a bland "Next" becomes
+        # catchable -- not by its label, but by the observed character of the
+        # flow it sits in.
+        self._flow_elevated: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def _clear_flow(self, device_id: str, tab_id: int, *, reason: str) -> None:
+        key = (device_id, tab_id)
+        if key in self._flow_elevated:
+            del self._flow_elevated[key]
+            self._audit.record("flow_cleared", device_id=device_id, tab_id=tab_id, reason=reason)
+
+    def _flow_state(self, device_id: str, tab_id: int | None) -> dict[str, Any] | None:
+        """Live (non-expired) flow-elevation state for (device_id, tab_id), or
+        None. Lazily expires on read rather than running a background sweep --
+        same ruthless-simplicity reasoning as `_expire_stale` for confirmation
+        tokens."""
+        if tab_id is None:
+            return None
+        key = (device_id, tab_id)
+        state = self._flow_elevated.get(key)
+        if state is None:
+            return None
+        if time.time() - state["at"] > FLOW_TTL_SECONDS:
+            del self._flow_elevated[key]
+            self._audit.record("flow_cleared", device_id=device_id, tab_id=tab_id, reason="ttl")
+            return None
+        return state
+
     # ------------------------------------------------------------------
     # Observation intake -- called by Hub as device results arrive
     # ------------------------------------------------------------------
@@ -570,10 +664,19 @@ class PolicyEngine:
     def note_tab_url(self, device_id: str, tab_id: int | None, url: str | None) -> None:
         """Record the hub's own observation of what URL a tab is on. Called from
         `navigate`/`snapshot`/`read` results and from each entry of a `tabs`
-        result (see `filter_tabs_result`)."""
+        result (see `filter_tabs_result`).
+
+        Also clears flow elevation (see `_flow_elevated`) the moment this
+        tab's committed ORIGIN changes -- design doc section 11.4: flow
+        elevation survives same-origin navigation (an SPA route change, a
+        page reload) but not a genuine origin change, which is treated as
+        "the agent has left the elevated-consequence context.\""""
         if tab_id is None or not url:
             return
+        previous = self._tab_hosts.get((device_id, tab_id))
         self._tab_hosts[(device_id, tab_id)] = url
+        if previous is not None and host_of(previous) != host_of(url):
+            self._clear_flow(device_id, tab_id, reason="origin_change")
 
     def note_tab_discarded(self, device_id: str, tab_id: int | None, discarded: bool | None) -> None:
         """Record the hub's own observation of a tab's `discarded` state, from
@@ -631,6 +734,55 @@ class PolicyEngine:
             cache = {"url": url, "nodes": {}}
             self._tab_refs[key] = cache
         cache["nodes"][ref] = {"label": label, "tag": tag, "input_type": input_type}
+
+    def note_effects(
+        self, device_id: str, tab_id: int | None, effects: EffectsReport, url: str | None
+    ) -> None:
+        """Browser-asserted (design doc section 2). If `effects.state_changing`,
+        marks (device_id, tab_id) flow-elevated with reason `"observed_effect"`.
+        This is the D3-to-flow-elevation wiring: the same observation that
+        fixes attribution (the result/audit now names the actual request) also
+        feeds the ONE page-immune pre-hoc signal this design has -- a tab that
+        was just observed to do something consequential stays elevated until
+        its origin changes, a flow confirmation is redeemed, or the TTL
+        lapses. Called from `Hub._ingest_result`, symmetric with
+        `note_snapshot`/`note_ref`."""
+        if tab_id is None or not effects.state_changing:
+            return
+        self._flow_elevated[(device_id, tab_id)] = {
+            "by": "observed_effect",
+            "at": time.time(),
+            "origin": host_of(url) if url else None,
+        }
+        self._audit.record(
+            "flow_elevated", device_id=device_id, tab_id=tab_id, trigger="observed_effect", url=url
+        )
+
+    def note_page_context(
+        self, device_id: str, tab_id: int | None, url: str | None, title: str | None, headings: list[str]
+    ) -> None:
+        """Page-asserted, weak (design doc section 2(a): advisory, not a
+        boundary -- every input here is forgeable). Marks (device_id, tab_id)
+        flow-elevated with reason `"page_context"` when >=2 distinct terms
+        from any classifier family appear across `title` + `headings`. Fed
+        from `snapshot`/`read` results (`Hub._ingest_result`)."""
+        if tab_id is None:
+            return
+        context_text = " ".join(t for t in ([title] + list(headings)) if t)
+        if not context_text:
+            return
+        for terms in self.profile.families.values():
+            matched = _count_family_terms(terms, context_text)
+            if len(matched) >= 2:
+                self._flow_elevated[(device_id, tab_id)] = {
+                    "by": "page_context",
+                    "at": time.time(),
+                    "origin": host_of(url) if url else None,
+                }
+                self._audit.record(
+                    "flow_elevated", device_id=device_id, tab_id=tab_id, trigger="page_context", url=url
+                )
+                return
 
     def _resolve_ref_hint(self, target: Target) -> dict[str, Any] | None:
         """Best-effort `{label, tag, input_type}` for `target.ref`, or `None`
@@ -728,7 +880,29 @@ class PolicyEngine:
     ) -> PolicyDecision:
         """The single entry point. See Hub.send_command (hub.py) for the choke
         point that guarantees every command passes through here exactly once,
-        before it can reach `_dispatch_live` or a device queue."""
+        before it can reach `_dispatch_live` or a device queue.
+
+        Decision flow (docs/designs/confirmation-gate.md section 12):
+
+            1. kill switch active?                     -> deny
+            2. resolve url_context / host
+            3. denylist match (discarded-auth exception)? -> deny
+            4. command not state-changing?              -> allow, classification=None
+            5. skip_gate (post-confirmation re-dispatch)? -> allow (denylist already ran)
+            6. build ActionDescriptor (caller args win; else hub's own
+               observations: ref hint cache, tab-host cache, flow state)
+            7. classify(descriptor, profile)
+            8. status == "unknown" -> on_unknown handling
+            9. status == "elevated" -> gate
+            10. otherwise -> allow, classification attached
+
+        `scope.py` (caller-declared write scope, Candidate C) is not
+        implemented in this phase -- see this module's docstring and
+        docs/designs/confirmation-gate.md's build-order section 15. Step 5 of
+        the design doc's flow (session write-scope enforcement) is therefore
+        absent; `on_unknown` is a hub-wide constructor setting standing in for
+        a per-session one until scope.py exists.
+        """
         if self.kill_switch_active:
             return PolicyDecision(status="deny", reason=KILL_SWITCH_REASON)
 
@@ -771,49 +945,169 @@ class PolicyEngine:
                 )
                 return PolicyDecision(status="deny", reason=DENY_REASON, category=category)
 
-        if not skip_gate:
-            label = args.get("label") if isinstance(args.get("label"), str) else None
-            input_type = args.get("input_type") if isinstance(args.get("input_type"), str) else None
-            # Phase 4: if the caller didn't supply a label/input_type
-            # explicitly, resolve them from the hub's own remembered
-            # snapshot/wait_for observations for this ref -- see
-            # `_resolve_ref_hint` and the module docstring's "Label hints are
-            # now wired" section. Caller-supplied values always win; this is
-            # a fallback, never an override.
-            if label is None or input_type is None:
-                hint = self._resolve_ref_hint(target)
-                if hint is not None:
-                    if label is None and isinstance(hint.get("label"), str):
-                        label = hint["label"]
-                    if input_type is None and isinstance(hint.get("input_type"), str):
-                        input_type = hint["input_type"]
-            for rule in self.gate_rules:
-                if command not in rule.commands:
-                    continue
-                detected = rule.matches(label, url_context)
-                if (
-                    detected is None
-                    and rule.category == "file_upload"
-                    and input_type in FILE_UPLOAD_INPUT_TYPES
-                ):
-                    detected = {"category": rule.category, "input_type_match": input_type}
-                if detected is None:
-                    continue
-                pending = self._create_confirmation(target, command, args, rule.category, detected)
-                self._audit.record(
-                    "policy_gated",
-                    device_id=target.device_id,
-                    tab_id=target.tab_id,
-                    command=command,
-                    category=rule.category,
-                    detected=detected,
-                    token=pending.token,
-                )
-                return PolicyDecision(
-                    status="gate", category=rule.category, token=pending.token, detected=detected
-                )
+        if command not in STATE_CHANGING_COMMANDS:
+            # read/tabs/screenshot/etc. are never classified -- classify.py's
+            # scoring only applies to the commands that can actually change
+            # state (design doc section 11.4's STATE_CHANGING_COMMANDS).
+            return PolicyDecision(status="allow", classification=None)
 
-        return PolicyDecision(status="allow")
+        if skip_gate:
+            # Post-confirmation re-dispatch: a human already explicitly
+            # approved this exact (target, command, args) via a single-use
+            # token (Hub._handle_agent_confirm). Skip classification/gating
+            # entirely -- the denylist check above still ran unconditionally.
+            return PolicyDecision(status="allow")
+
+        descriptor = self._build_descriptor(target, command, args, url_context, host)
+        classification = _classify(descriptor, self.profile)
+
+        if classification.status == "unknown":
+            self._audit.record(
+                "policy_unclassified",
+                device_id=target.device_id,
+                tab_id=target.tab_id,
+                command=command,
+                reason_code=classification.reason_code,
+                on_unknown=self.on_unknown,
+            )
+            if self.on_unknown == "deny":
+                return PolicyDecision(
+                    status="deny",
+                    reason="action could not be classified (no page semantics observed)",
+                    reason_code="unclassifiable",
+                    classification=classification,
+                )
+            if self.on_unknown == "gate":
+                pending = self._create_confirmation(target, command, args, None, {})
+                return PolicyDecision(
+                    status="gate",
+                    category=None,
+                    token=pending.token,
+                    detected={},
+                    classification=classification,
+                    reason_code=classification.reason_code,
+                    expires_at=pending.expires_at,
+                )
+            # "allow" (default): proceed, but the caller always sees the
+            # classification and its reason_code -- fail-loud means visible,
+            # not necessarily blocked (design doc section 6).
+            return PolicyDecision(status="allow", classification=classification)
+
+        if classification.status == "elevated":
+            # confirm_scope is "flow" only when the flow channel was the SOLE
+            # contributing signal (design doc section 12, step 10) -- if any
+            # other channel also scored, the elevate-worthy evidence is about
+            # THIS action specifically, not just the ambient flow context.
+            contributing = [s for s in classification.signals if s.weight > 0]
+            confirm_scope: Literal["action", "flow"] = (
+                "flow" if contributing and all(s.channel == "flow" for s in contributing) else "action"
+            )
+            category = classification.categories[0] if classification.categories else None
+            detected = {
+                "category": category,
+                "score": classification.score,
+                "matched": [m for s in classification.signals for m in s.matched],
+            }
+            pending = self._create_confirmation(target, command, args, category, detected)
+            self._audit.record(
+                "policy_gated",
+                device_id=target.device_id,
+                tab_id=target.tab_id,
+                command=command,
+                category=category,
+                detected=detected,
+                token=pending.token,
+                classification=classification.to_wire(),
+            )
+            return PolicyDecision(
+                status="gate",
+                category=category,
+                token=pending.token,
+                detected=detected,
+                classification=classification,
+                confirm_scope=confirm_scope,
+                expires_at=pending.expires_at,
+            )
+
+        return PolicyDecision(status="allow", classification=classification)
+
+    def _build_descriptor(
+        self,
+        target: Target,
+        command: str,
+        args: dict[str, Any],
+        url_context: str | None,
+        host: str | None,
+    ) -> ActionDescriptor:
+        """Assembles an `ActionDescriptor` for `classify()`. Caller-supplied
+        `args` values always win over the hub's own cached hints (Phase 4
+        precedent, `_resolve_ref_hint`'s docstring) -- this is a fallback,
+        never an override."""
+        label = args.get("label") if isinstance(args.get("label"), str) else None
+        input_type = args.get("input_type") if isinstance(args.get("input_type"), str) else None
+        href = args.get("href") if isinstance(args.get("href"), str) else None
+        href_cross_origin = (
+            args.get("href_cross_origin") if isinstance(args.get("href_cross_origin"), bool) else None
+        )
+        form_method = args.get("form_method") if isinstance(args.get("form_method"), str) else None
+        form_action = args.get("form_action") if isinstance(args.get("form_action"), str) else None
+        form_cross_origin = (
+            args.get("form_cross_origin") if isinstance(args.get("form_cross_origin"), bool) else None
+        )
+        is_submit = args.get("is_submit") if isinstance(args.get("is_submit"), bool) else None
+        page_title = args.get("page_title") if isinstance(args.get("page_title"), str) else None
+        nearest_heading = (
+            args.get("nearest_heading") if isinstance(args.get("nearest_heading"), str) else None
+        )
+        dialog_title = args.get("dialog_title") if isinstance(args.get("dialog_title"), str) else None
+
+        hint = self._resolve_ref_hint(target)
+        if hint is not None:
+            if label is None and isinstance(hint.get("label"), str):
+                label = hint["label"]
+            if input_type is None and isinstance(hint.get("input_type"), str):
+                input_type = hint["input_type"]
+            if href is None and isinstance(hint.get("href"), str):
+                href = hint["href"]
+            if href_cross_origin is None and isinstance(hint.get("href_cross_origin"), bool):
+                href_cross_origin = hint["href_cross_origin"]
+            if form_method is None and isinstance(hint.get("form_method"), str):
+                form_method = hint["form_method"]
+            if form_action is None and isinstance(hint.get("form_action"), str):
+                form_action = hint["form_action"]
+            if form_cross_origin is None and isinstance(hint.get("form_cross_origin"), bool):
+                form_cross_origin = hint["form_cross_origin"]
+            if is_submit is None and isinstance(hint.get("is_submit"), bool):
+                is_submit = hint["is_submit"]
+            if nearest_heading is None and isinstance(hint.get("nearest_heading"), str):
+                nearest_heading = hint["nearest_heading"]
+            if dialog_title is None and isinstance(hint.get("dialog_title"), str):
+                dialog_title = hint["dialog_title"]
+            if page_title is None and isinstance(hint.get("page_title"), str):
+                page_title = hint["page_title"]
+
+        flow_state = self._flow_state(target.device_id, target.tab_id)
+
+        return ActionDescriptor(
+            command=command,
+            label=label,
+            role=None,
+            tag=None,
+            input_type=input_type,
+            href=href,
+            href_cross_origin=href_cross_origin,
+            form_method=form_method,
+            form_action=form_action,
+            form_cross_origin=form_cross_origin,
+            is_submit=is_submit,
+            page_title=page_title,
+            nearest_heading=nearest_heading,
+            dialog_title=dialog_title,
+            url=url_context,
+            origin=host,
+            flow_elevated=flow_state is not None,
+            flow_elevated_by=flow_state.get("by") if flow_state else None,
+        )
 
     def _resolve_url_context(self, target: Target, command: str, args: dict[str, Any]) -> str | None:
         """Best-available URL signal for this command, in priority order. See
@@ -834,7 +1128,12 @@ class PolicyEngine:
     # ------------------------------------------------------------------
 
     def _create_confirmation(
-        self, target: Target, command: str, args: dict[str, Any], category: str, detected: dict[str, Any]
+        self,
+        target: Target,
+        command: str,
+        args: dict[str, Any],
+        category: str | None,
+        detected: dict[str, Any],
     ) -> PendingConfirmation:
         now = time.time()
         token = uuid.uuid4().hex

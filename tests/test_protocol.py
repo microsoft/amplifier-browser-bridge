@@ -56,6 +56,7 @@ def test_command_vocabulary_matches_design_doc() -> None:
         "back",
         "forward",
         "read",
+        "describe",
         "tabs",
         "tab_open",
         "tab_close",

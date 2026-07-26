@@ -223,6 +223,21 @@ def tab_open(device: str, url: str, active: bool, timeout: float | None) -> None
     _run_command(device, "tab_open", {"url": url, "active": active}, timeout=timeout)
 
 
+@main.command()
+@click.argument("confirmation_token")
+def confirm(confirmation_token: str) -> None:
+    """Redeem a confirmation token from a prior `needs_confirmation` response
+    (docs/designs/confirmation-gate.md, D2). This is `redeem: "agent"`
+    self-attestation -- run by whoever is driving the CLI, as an explicit,
+    separately-audited second decision. See `docs/POLICY.md` section 3 for
+    what triggers a gate in the first place."""
+    try:
+        result = asyncio.run(_client().confirm(confirmation_token))
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    _print(result)
+
+
 @main.command(name="tab-close")
 @click.argument("target")
 @TIMEOUT_OPTION

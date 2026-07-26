@@ -44,6 +44,12 @@ COMMANDS: frozenset[str] = frozenset(
         "back",
         "forward",
         "read",
+        # D1 (docs/designs/confirmation-gate.md section 11.5): on-demand full
+        # action descriptor for one ref -- exists for the `unknown`
+        # classification recovery path (reason_code "ref_not_observed"), so a
+        # caller can obtain a descriptor without a full re-snapshot. Never
+        # auto-fires; the caller invokes it explicitly.
+        "describe",
         "tabs",
         "tab_open",
         "tab_close",
@@ -99,7 +105,19 @@ COMMANDS: frozenset[str] = frozenset(
 # The rest are browser-chrome-level commands the extension's background script
 # executes directly against chrome.tabs / chrome.windows / chrome.debugger.
 PAGE_WORLD_COMMANDS: frozenset[str] = frozenset(
-    {"snapshot", "read", "click", "type", "key", "scroll", "back", "forward", "wait_for", "wait_text"}
+    {
+        "snapshot",
+        "describe",
+        "read",
+        "click",
+        "type",
+        "key",
+        "scroll",
+        "back",
+        "forward",
+        "wait_for",
+        "wait_text",
+    }
 )
 BROWSER_LEVEL_COMMANDS: frozenset[str] = COMMANDS - PAGE_WORLD_COMMANDS
 

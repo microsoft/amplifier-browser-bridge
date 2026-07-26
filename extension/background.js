@@ -20,6 +20,7 @@ import {
   pickInterruptedDownload,
   validateWaitDownloadArgs,
 } from "./download_claim.mjs";
+import { EffectsCollector, EFFECTS_WINDOW_MS, emptyEffectsReport } from "./effects_collector.mjs";
 
 const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 15000; // measured to hold a desktop MV3 worker alive
@@ -36,6 +37,11 @@ let reconnecting = false; // single-flight guard -- see scheduleReconnect()
 let reconnectAttempt = 0;
 let heartbeatTimer = null;
 let heartbeatSeq = 0;
+// D3 (docs/designs/confirmation-gate.md): the effects-collection tier this
+// device can actually support, determined once via probeEffectsTier() (a real
+// invocation, never a typeof check -- same discipline as probeCapabilities()).
+// "none" until probed.
+let effectsTier = "none";
 
 // ---------------------------------------------------------------------------
 // Runtime configuration -- hub URL + shared token, read from chrome.storage.local
@@ -207,6 +213,151 @@ async function probeCapabilities() {
 }
 
 // ---------------------------------------------------------------------------
+// Effects collection (D3, docs/designs/confirmation-gate.md) -- "attribution
+// first, gating second." For every STATE_CHANGING_COMMANDS dispatch, records
+// what the browser actually did in a bounded window after the command's own
+// result, and attaches it as an `effects` block. Browser-asserted: the page
+// cannot suppress a request it actually made (design doc section 2).
+// ---------------------------------------------------------------------------
+
+// Behavioral probe (never `typeof`) for the effects-collection tier this
+// device can support. `webrequest` requires the `webRequest` manifest
+// permission; falls back to `navigation` (webNavigation -- already granted
+// on desktop, absent on Android until manifest.android.json adds it) if that
+// throws; `none` if neither is usable.
+async function probeEffectsTier() {
+  try {
+    const noop = () => {};
+    chrome.webRequest.onBeforeRequest.addListener(noop, { urls: ["<all_urls>"] });
+    chrome.webRequest.onBeforeRequest.removeListener(noop);
+    return "webrequest";
+  } catch {
+    // fall through to the next tier
+  }
+  try {
+    // getAllFrames rejecting with a "no such tab" style message still proves
+    // chrome.webNavigation itself exists and is callable -- only a message
+    // naming the API as undefined means it's genuinely absent.
+    await chrome.webNavigation.getAllFrames({ tabId: -1 });
+    return "navigation";
+  } catch (err) {
+    const message = String((err && err.message) || err || "");
+    return /webNavigation/i.test(message) && /undefined|not a function/i.test(message) ? "none" : "navigation";
+  }
+}
+
+// Runs `fn()` (a state-changing command's own dispatch) while collecting
+// browser-asserted effects on `target.tab_id`, holding the collection window
+// open EFFECTS_WINDOW_MS past `fn()`'s own completion (design doc section
+// 11.5) before finalizing the report. Listener registration is best-effort
+// and scoped to the acting tab where the API supports it (webRequest); where
+// it does not (chrome.downloads has no tabId on DownloadItem, so downloads
+// are collected globally during the window -- an honest, documented
+// limitation, not a silent gap -- see design doc section 9.6).
+async function withEffectsCollection(target, fn) {
+  const tabId = target && typeof target.tab_id === "number" ? target.tab_id : null;
+  if (tabId === null || effectsTier === "none") {
+    const result = await fn();
+    return { ok: true, result, effects: emptyEffectsReport(effectsTier) };
+  }
+
+  let pageOrigin = null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab && tab.url) pageOrigin = new URL(tab.url).origin;
+  } catch {
+    pageOrigin = null;
+  }
+
+  const collector = new EffectsCollector();
+
+  const onRequest = (details) => {
+    if (details.tabId !== tabId) return;
+    let crossOrigin = false;
+    if (pageOrigin) {
+      try {
+        crossOrigin = new URL(details.url).origin !== pageOrigin;
+      } catch {
+        crossOrigin = false;
+      }
+    }
+    collector.addRequest(details.method, details.url, details.type, crossOrigin);
+  };
+  const onNavigation = (details) => {
+    if (details.tabId !== tabId || details.frameId !== 0) return;
+    let originChanged = false;
+    if (pageOrigin) {
+      try {
+        originChanged = new URL(details.url).origin !== pageOrigin;
+      } catch {
+        originChanged = false;
+      }
+    }
+    collector.addNavigation(details.url, details.transitionType || null, originChanged);
+  };
+  const onDownloadCreated = (item) => {
+    collector.addDownload((item && (item.filename || item.url)) || null);
+  };
+  const onTabCreated = (tab) => {
+    if (tab && tab.openerTabId === tabId) collector.addTabOpened(tab.id);
+  };
+
+  let webRequestActive = false;
+  if (effectsTier === "webrequest") {
+    try {
+      chrome.webRequest.onBeforeRequest.addListener(onRequest, { urls: ["<all_urls>"], tabId });
+      webRequestActive = true;
+    } catch {
+      webRequestActive = false;
+    }
+  }
+  try {
+    chrome.webNavigation.onCommitted.addListener(onNavigation);
+  } catch {
+    /* absent on this device -- collector simply records fewer navigations */
+  }
+  try {
+    chrome.downloads.onCreated.addListener(onDownloadCreated);
+  } catch {
+    /* absent on this device */
+  }
+  try {
+    chrome.tabs.onCreated.addListener(onTabCreated);
+  } catch {
+    /* absent on this device */
+  }
+
+  try {
+    const result = await fn();
+    await new Promise((resolve) => setTimeout(resolve, EFFECTS_WINDOW_MS));
+    return { ok: true, result, effects: collector.report(effectsTier, EFFECTS_WINDOW_MS) };
+  } finally {
+    if (webRequestActive) {
+      try {
+        chrome.webRequest.onBeforeRequest.removeListener(onRequest);
+      } catch {
+        /* already gone */
+      }
+    }
+    try {
+      chrome.webNavigation.onCommitted.removeListener(onNavigation);
+    } catch {
+      /* already gone */
+    }
+    try {
+      chrome.downloads.onCreated.removeListener(onDownloadCreated);
+    } catch {
+      /* already gone */
+    }
+    try {
+      chrome.tabs.onCreated.removeListener(onTabCreated);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Connection lifecycle -- single-flight reconnect with exponential backoff + jitter
 // ---------------------------------------------------------------------------
 // The probe kit that informed this design fired three `hello`s in five seconds on
@@ -252,6 +403,7 @@ async function connect() {
   setBadge("connecting");
   await ensureIdentity();
   if (!capabilities) capabilities = await probeCapabilities();
+  effectsTier = await probeEffectsTier();
 
   try {
     ws = new WebSocket(hubUrl);
@@ -431,12 +583,25 @@ function wantsAllFrames(command, args) {
 // docs/PROTOCOL.md's "Frames" section).
 const FRAME_ROUTED_REF_COMMANDS = new Set(["click", "type", "key"]);
 
+// D3 (docs/designs/confirmation-gate.md section 11.4): the commands effects
+// collection applies to -- mirrors effects.py's STATE_CHANGING_COMMANDS. Only
+// the untrusted (non-CDP) dispatch path is wrapped in this phase; the
+// CDP-backed trusted-input path (cdpClick/cdpType/cdpKey) does not yet
+// collect effects -- a documented scope limit, not a silent gap.
+const STATE_CHANGING_COMMANDS = new Set(["click", "type", "key", "navigate"]);
+
 async function executeCommand(command, target, args) {
   try {
     if (command === "tabs") return { ok: true, result: await listTabs(target) };
     if (command === "tab_open") return { ok: true, result: await tabOpen(args) };
     if (command === "tab_close") return { ok: true, result: await tabClose(target) };
     if (command === "tab_activate") return { ok: true, result: await tabActivate(target) };
+    if (STATE_CHANGING_COMMANDS.has(command) && !(args && args._cdp)) {
+      return await withEffectsCollection(target, async () => {
+        if (command === "navigate") return await navigate(target, args);
+        return await runInPage(target, command, args);
+      });
+    }
     if (command === "navigate") return { ok: true, result: await navigate(target, args) };
     if (command === "screenshot") return { ok: true, result: await screenshot(target, args) };
     // Self-service extension reload (Phase 5) -- see reloadExtension()'s own

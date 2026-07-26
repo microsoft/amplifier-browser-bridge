@@ -55,6 +55,7 @@ import math
 import signal
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any
 
 from aiohttp import WSMsgType, web
@@ -64,7 +65,8 @@ from .args_bool import truthy
 from .audit import AuditLog
 from .auth import TokenStore
 from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
-from .policy import PolicyEngine, PolicyError
+from .effects import EffectsReport
+from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
 from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
@@ -458,6 +460,50 @@ class Hub:
                     input_type=result.get("input_type"),
                 )
 
+        if cmd.command == "snapshot" and isinstance(result, dict):
+            # D1 (docs/designs/confirmation-gate.md section 11.4):
+            # page_title/headings feed `PolicyEngine.note_page_context`, the
+            # weak, page-asserted flow-elevation trigger -- symmetric with
+            # note_effects below, which is the browser-asserted one.
+            tab_id = cmd.target.tab_id
+            if tab_id is not None:
+                headings = result.get("headings")
+                self.policy.note_page_context(
+                    device_id,
+                    tab_id,
+                    result.get("url") if isinstance(result.get("url"), str) else None,
+                    result.get("page_title") if isinstance(result.get("page_title"), str) else None,
+                    headings if isinstance(headings, list) else [],
+                )
+
+        if cmd.command in STATE_CHANGING_COMMANDS:
+            # D3 (docs/designs/confirmation-gate.md section 11): parse the
+            # device's browser-asserted `effects` block (absent/malformed ->
+            # the honest empty/"none"-tier report -- EffectsReport.from_wire
+            # never raises), feed it into flow elevation (note_effects), and
+            # attach it to the outgoing envelope so the caller sees it
+            # regardless of whether the gate fired. Runs BEFORE `env` is
+            # handed to the pending future (this method's own caller,
+            # `_handle_device_message`, does that next) so the *next*
+            # command in this tab already observes any resulting
+            # flow_elevated -- the design doc's explicit ordering constraint.
+            effects = EffectsReport.from_wire(env.get("effects"))
+            tab_id = cmd.target.tab_id
+            if tab_id is not None:
+                effects_url = result.get("url") if isinstance(result, dict) else None
+                if not isinstance(effects_url, str):
+                    effects_url = self.policy._tab_hosts.get((device_id, tab_id))
+                self.policy.note_effects(device_id, tab_id, effects, effects_url)
+                if effects.state_changing:
+                    self.audit.record(
+                        "action_effects",
+                        device_id=device_id,
+                        tab_id=tab_id,
+                        command=cmd.command,
+                        effects=effects.to_wire(),
+                    )
+            env = {**env, "effects": effects.to_wire()}
+
         return env
 
     async def _drain_queue(self, record: DeviceRecord) -> None:
@@ -620,13 +666,24 @@ class Hub:
 
         decision = self.policy.evaluate(target, command, args, skip_gate=skip_gate)
         if decision.status == "deny":
-            return {"ok": False, "error": decision.reason}
+            deny_response: dict[str, Any] = {"ok": False, "error": decision.reason}
+            if decision.reason_code:
+                deny_response["reason_code"] = decision.reason_code
+            return deny_response
         if decision.status == "gate":
             return {
                 "status": "needs_confirmation",
                 "confirmation_token": decision.token,
                 "category": decision.category,
                 "detected": decision.detected,
+                "classification": decision.classification.to_wire() if decision.classification else None,
+                "redeem": decision.redeem,
+                "confirm_scope": decision.confirm_scope,
+                "expires_at": (
+                    datetime.fromtimestamp(decision.expires_at, UTC).isoformat()
+                    if decision.expires_at is not None
+                    else None
+                ),
             }
 
         record = self.registry.get(target.device_id)
@@ -635,8 +692,19 @@ class Hub:
 
         cmd = QueuedCommand(id=new_id(), target=target, command=command, args=args, timeout=timeout_override)
 
+        # D1 (docs/designs/confirmation-gate.md section 7): attach the
+        # classification to the returned envelope on EVERY state-changing
+        # decision, gated or not -- "reported on every state-changing
+        # result, whether or not it gated" (design doc section 5). Computed
+        # once here from the already-evaluated `decision`, not round-tripped
+        # through the device.
+        classification_wire = decision.classification.to_wire() if decision.classification else None
+
         if record.tier is Tier.LIVE:
-            return await self._dispatch_live(record, cmd)
+            result = await self._dispatch_live(record, cmd)
+            if classification_wire is not None:
+                result = {**result, "classification": classification_wire}
+            return result
 
         position = record.queue.enqueue(cmd)
         self.audit.record(
@@ -647,13 +715,16 @@ class Hub:
             tier=record.tier.value,
             queue_position=position,
         )
-        return {
+        queued_response: dict[str, Any] = {
             "status": "queued",
             "command_id": cmd.id,
             "tier": record.tier.value,
             "last_seen": record.last_seen.isoformat() if record.last_seen else None,
             "queue_position": position,
         }
+        if classification_wire is not None:
+            queued_response["classification"] = classification_wire
+        return queued_response
 
     @staticmethod
     def _extract_timeout_override(args: dict[str, Any]) -> tuple[float | None, dict[str, Any], str | None]:

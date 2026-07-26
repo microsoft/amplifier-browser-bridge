@@ -37,7 +37,7 @@ class HubClient:
     _TIMEOUT_BUFFER_S = 10.0
 
     def __init__(self, url: str, token: str | None = None, timeout: float = 35.0) -> None:
-        """`url` is the full hub agent endpoint, e.g. ws://100.124.126.19:8900/agent.
+        """`url` is the full hub agent endpoint, e.g. ws://<your tailnet IP>:8900/agent.
         `timeout` is this client's OWN default wait for a hub response when no
         per-command override is known ahead of time (`list_devices`/`poll`, and
         `command()` calls that don't set `args["timeout_s"]`)."""
@@ -111,6 +111,27 @@ class HubClient:
                 "type": "poll",
                 "device_id": device_id,
                 "command_id": command_id,
+            }
+        )
+        return resp
+
+    async def confirm(self, confirmation_token: str) -> dict[str, Any]:
+        """Redeem a single-use confirmation token from a prior
+        `needs_confirmation` response (docs/designs/confirmation-gate.md, D2 --
+        "a fired gate is a dead end without a redemption surface"). Sends the
+        hub's existing `confirm` agent-route message (`Hub._handle_agent_confirm`,
+        already wired at the wire level; this is the first CLI/lib-facing
+        caller of it). `redeem: "agent"` (this method) is self-attestation --
+        the caller (a human via `abb confirm`, or an agent process explicitly
+        deciding to proceed) makes a second, separately-audited decision.
+        `redeem: "out_of_band"` sessions are not yet implemented (see
+        docs/designs/confirmation-gate.md section 15, step 6 -- deferred)."""
+        resp = await self._request(
+            {
+                "v": PROTOCOL_VERSION,
+                "id": new_id(),
+                "type": "confirm",
+                "confirmation_token": confirmation_token,
             }
         )
         return resp

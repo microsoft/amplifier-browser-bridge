@@ -22,7 +22,7 @@ Run it:
 
 Configure the hub connection via the same env vars the CLI uses:
 
-    ABB_HUB_URL   -- e.g. ws://100.124.126.19:8900/agent (default ws://127.0.0.1:8900/agent)
+    ABB_HUB_URL   -- e.g. ws://<your tailnet IP>:8900/agent (default ws://127.0.0.1:8900/agent)
     ABB_TOKEN     -- per-device/agent shared token, if the hub has auth enabled
 """
 
@@ -771,6 +771,21 @@ async def browser_poll(device_id: str, command_id: str) -> dict[str, Any]:
     {"ok": ...} result once it has actually run."""
     try:
         return await _client().poll(device_id, command_id)
+    except HubError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_confirm(confirmation_token: str) -> dict[str, Any]:
+    """Redeem a single-use confirmation token from a prior tool call that
+    returned `{"status": "needs_confirmation", "confirmation_token": ...}`
+    (docs/designs/confirmation-gate.md). This is `redeem: "agent"`
+    self-attestation: calling this tool is the model's own explicit,
+    separately-audited second decision to proceed with a gated action --
+    not a human approval. Tokens expire; a stale token returns an error
+    naming why."""
+    try:
+        return await _client().confirm(confirmation_token)
     except HubError as e:
         return {"ok": False, "error": str(e)}
 

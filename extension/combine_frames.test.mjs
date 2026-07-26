@@ -15,7 +15,7 @@ test("combineRead returns every frame's content -- no frame is dropped or single
   const frames = [
     { frameId: 0, url: "https://sp.example/page", title: "Policy Page", text: "nav chrome" },
     { frameId: 860, url: "https://o365.example/bootstrap.js", title: "", text: "x".repeat(3608) },
-    { frameId: 862, url: "https://ppc-word-view.example/doc", title: "Global-Travel-Policy.docx", text: "PAGE 1 OF 5" },
+    { frameId: 862, url: "https://ppc-word-view.example/doc", title: "quarterly-report.docx", text: "PAGE 1 OF 5" },
     { frameId: 861, url: "https://sharepoint.example/w/r/doc", title: "", text: "" },
     { frameId: 864, url: "https://auth.example/oauth", title: "WacOAuth", text: "abcdef" },
   ];

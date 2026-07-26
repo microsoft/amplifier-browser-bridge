@@ -7,20 +7,20 @@ import assert from "node:assert/strict";
 import { validateHubUrl, validateHubToken, isConfigured } from "./config_validate.mjs";
 
 test("validateHubUrl accepts a full ws:// URL with a path unchanged", () => {
-  const result = validateHubUrl("ws://100.124.126.19:8900/device");
+  const result = validateHubUrl("ws://100.64.1.2:8900/device");
   assert.equal(result.valid, true);
-  assert.equal(result.normalized, "ws://100.124.126.19:8900/device");
+  assert.equal(result.normalized, "ws://100.64.1.2:8900/device");
   assert.equal(result.error, null);
 });
 
 test("validateHubUrl appends /device to a bare host:port URL", () => {
-  const result = validateHubUrl("ws://100.124.126.19:8900");
+  const result = validateHubUrl("ws://100.64.1.2:8900");
   assert.equal(result.valid, true);
-  assert.equal(result.normalized, "ws://100.124.126.19:8900/device");
+  assert.equal(result.normalized, "ws://100.64.1.2:8900/device");
 });
 
 test("validateHubUrl accepts wss://", () => {
-  const result = validateHubUrl("wss://spark-1.tailnet.ts.net:8900/device");
+  const result = validateHubUrl("wss://example-host.example-tailnet.ts.net:8900/device");
   assert.equal(result.valid, true);
 });
 
@@ -45,7 +45,7 @@ test("validateHubUrl rejects a non-URL string", () => {
 });
 
 test("validateHubUrl rejects http(s) -- must be ws/wss", () => {
-  const result = validateHubUrl("https://100.124.126.19:8900/device");
+  const result = validateHubUrl("https://100.64.1.2:8900/device");
   assert.equal(result.valid, false);
   assert.match(result.error, /ws:\/\/ or wss:\/\//);
 });

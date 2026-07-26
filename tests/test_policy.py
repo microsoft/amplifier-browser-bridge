@@ -456,8 +456,45 @@ def test_gate_purchase_via_label(tmp_path: Any) -> None:
     assert decision.token
 
 
-def test_gate_purchase_via_checkout_url(tmp_path: Any) -> None:
+def test_purchase_checkout_url_alone_is_clear_not_gate_under_scoring(tmp_path: Any) -> None:
+    """Post-confirmation-gate rewrite: `navigate` has no label channel, so a
+    checkout URL match (weight 2, docs/designs/confirmation-gate.md section
+    11.1's scoring table) alone no longer reaches threshold (3) on its own --
+    this is the documented, intentional consequence of moving away from
+    "any single channel gates" (the same conjunction-removal principle that
+    motivated this whole redesign, applied honestly in the other direction
+    too: a single weak signal must not gate just because it used to).
+    Corroborated by a second signal (a form_cross_origin hint, or flow
+    elevation), it still gates -- see the next test."""
     engine = _engine(tmp_path)
+    decision = engine.evaluate(
+        Target(device_id="d1", tab_id=1), "navigate", {"url": "https://shop.example.com/cart/checkout"}
+    )
+    assert decision.status == "allow"
+    assert decision.classification is not None
+    assert decision.classification.status == "clear"
+    assert "purchase" in decision.classification.categories
+
+
+def test_purchase_checkout_url_plus_flow_elevation_gates(tmp_path: Any) -> None:
+    """Preserves the original protective intent by a different mechanism
+    (docs/designs/confirmation-gate.md section 8's migration pattern, applied
+    here too): a checkout-URL navigate inside a tab already flow-elevated by
+    an observed effect reaches threshold (2 + 3 = 5) and gates."""
+    from amplifier_browser_bridge.effects import EffectsReport, ObservedRequest
+
+    engine = _engine(tmp_path)
+    engine.note_effects(
+        "d1",
+        1,
+        EffectsReport(
+            tier="webrequest",
+            window_ms=1500,
+            attribution="time_window",
+            requests=(ObservedRequest(method="POST", url="https://shop.example.com/cart/add"),),
+        ),
+        "https://shop.example.com/cart",
+    )
     decision = engine.evaluate(
         Target(device_id="d1", tab_id=1), "navigate", {"url": "https://shop.example.com/cart/checkout"}
     )
@@ -483,22 +520,44 @@ def test_gate_delete(tmp_path: Any) -> None:
     assert decision.category == "delete"
 
 
-def test_gate_oauth_grant_requires_both_label_and_url(tmp_path: Any) -> None:
+def test_lone_allow_label_does_not_gate(tmp_path: Any) -> None:
+    """Replacement for test_gate_oauth_grant_requires_both_label_and_url
+    (docs/designs/confirmation-gate.md section 8's migration table): the old
+    test encoded `combine="all"` -- the very conjunction bug that let
+    "Elevate bkrabach to Administrator" through, because it required BOTH
+    signals unconditionally, no matter how strong either one was alone. The
+    new mechanism preserves the same protective intent (a bare "Allow" --
+    cookie banner, notification prompt -- must not gate) via scoring instead
+    of a hardcoded conjunction: "allow" is a single weak `oauth_consent`
+    family term (weight 1, below threshold), so it does not gate alone --
+    but it is no longer STRUCTURALLY incapable of gating alone the way the
+    old rule was; two family terms together, or one term plus flow
+    elevation, reaches threshold with no URL at all (see
+    test_lone_allow_label_does_not_gate's sibling assertions below and
+    test_permission_change_weak_label_alone_does_not_gate's flow-elevation
+    test for the general pattern)."""
     engine = _engine(tmp_path)
-    # Label alone ("Allow") is far too common a word (cookie banners, notification
-    # prompts) -- must NOT gate without the URL signal too (combine="all").
+    # Label alone ("Allow") is one weak family term -- does not gate.
     label_only = engine.evaluate(
         Target(device_id="d1", tab_id=1, ref="e4"), "click", {"ref": "e4", "label": "Allow"}
     )
     assert label_only.status == "allow"
+    assert label_only.classification is not None
+    assert label_only.classification.status == "clear"
 
+    # "Allow" (weight 1) + an OAuth authorize URL (weight 2) reaches
+    # threshold (3) -- same practical outcome as the old combine="all" rule,
+    # reached by summing independent evidence rather than hardcoding a
+    # two-signal requirement that the measured incident's own label
+    # ("Elevate bkrabach to Administrator") could never satisfy.
     both_signals = engine.evaluate(
         Target(device_id="d1", tab_id=1, ref="e4"),
         "click",
         {"ref": "e4", "label": "Allow", "page_url": "https://github.com/login/oauth/authorize?client_id=x"},
     )
     assert both_signals.status == "gate"
-    assert both_signals.category == "oauth_grant"
+    assert both_signals.classification is not None
+    assert "oauth_grant" in both_signals.classification.categories
 
 
 def test_gate_file_upload_via_input_type_hint(tmp_path: Any) -> None:
@@ -510,8 +569,33 @@ def test_gate_file_upload_via_input_type_hint(tmp_path: Any) -> None:
     assert decision.category == "file_upload"
 
 
-def test_gate_account_creation_via_url(tmp_path: Any) -> None:
+def test_signup_url_alone_is_clear_not_gate_under_scoring(tmp_path: Any) -> None:
+    """See test_purchase_checkout_url_alone_is_clear_not_gate_under_scoring's
+    docstring -- same scoring-table consequence for account_creation."""
     engine = _engine(tmp_path)
+    decision = engine.evaluate(
+        Target(device_id="d1", tab_id=1), "navigate", {"url": "https://app.example.com/signup"}
+    )
+    assert decision.status == "allow"
+    assert decision.classification is not None
+    assert "account_creation" in decision.classification.categories
+
+
+def test_signup_url_plus_flow_elevation_gates(tmp_path: Any) -> None:
+    from amplifier_browser_bridge.effects import EffectsReport, ObservedRequest
+
+    engine = _engine(tmp_path)
+    engine.note_effects(
+        "d1",
+        1,
+        EffectsReport(
+            tier="webrequest",
+            window_ms=1500,
+            attribution="time_window",
+            requests=(ObservedRequest(method="POST", url="https://app.example.com/onboarding/start"),),
+        ),
+        "https://app.example.com/onboarding",
+    )
     decision = engine.evaluate(
         Target(device_id="d1", tab_id=1), "navigate", {"url": "https://app.example.com/signup"}
     )
@@ -519,20 +603,44 @@ def test_gate_account_creation_via_url(tmp_path: Any) -> None:
     assert decision.category == "account_creation"
 
 
-def test_gate_permission_change_requires_both_signals(tmp_path: Any) -> None:
+def test_permission_change_weak_label_alone_does_not_gate(tmp_path: Any) -> None:
+    """Replacement for test_gate_permission_change_requires_both_signals
+    (docs/designs/confirmation-gate.md section 8's migration table -- this is
+    the exact rule that failed to catch "Elevate bkrabach to Administrator"
+    because `combine="all"` required a URL match too, and the JIT elevation
+    flow's URL never matched `/settings/permissions`). "Access" is a single
+    weak `privilege`-family term (weight 1) -- below threshold alone,
+    preserving the original protective intent (a lone weak word should not
+    gate) via scoring rather than a hardcoded two-signal requirement."""
     engine = _engine(tmp_path)
-    label_only = engine.evaluate(
-        Target(device_id="d1", tab_id=1, ref="e6"), "click", {"ref": "e6", "label": "Grant"}
+    weak_label = engine.evaluate(
+        Target(device_id="d1", tab_id=1, ref="e6"), "click", {"ref": "e6", "label": "Access"}
     )
-    assert label_only.status == "allow"
+    assert weak_label.status == "allow"
+    assert weak_label.classification is not None
+    assert weak_label.classification.status == "clear"
 
     both = engine.evaluate(
         Target(device_id="d1", tab_id=1, ref="e6"),
         "click",
-        {"ref": "e6", "label": "Grant", "page_url": "https://app.example.com/settings/permissions"},
+        {"ref": "e6", "label": "Access", "page_url": "https://app.example.com/settings/permissions"},
     )
     assert both.status == "gate"
-    assert both.category == "permission_change"
+    assert both.classification is not None
+    assert "permission_change" in both.classification.categories
+
+    # And -- the actual bug fix -- the measured label alone, with NEITHER a
+    # matching URL NOR any conjunction requirement, now gates on its own:
+    # two `privilege`-family terms ("elevate", "administrator") co-occurring
+    # scores 3, at threshold.
+    measured = engine.evaluate(
+        Target(device_id="d1", tab_id=1, ref="e7"),
+        "click",
+        {"ref": "e7", "label": "Elevate bkrabach to Administrator"},
+    )
+    assert measured.status == "gate"
+    assert measured.classification is not None
+    assert "permission_change" in measured.classification.categories
 
 
 def test_ordinary_click_with_no_signal_is_not_gated(tmp_path: Any) -> None:

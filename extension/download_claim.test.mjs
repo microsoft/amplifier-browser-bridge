@@ -79,7 +79,7 @@ test("since_id mode ignores a new download that is not yet complete", () => {
 test("since_id mode narrows by filename pattern when given", () => {
   const items = [
     { id: 61, filename: "unrelated-notification-sound.mp3", state: "complete" },
-    { id: 62, filename: "Global-Travel-Policy.docx", state: "complete" },
+    { id: 62, filename: "quarterly-report.docx", state: "complete" },
   ];
   const picked = pickCompletedDownload(items, { sinceId: 50, pattern: /\.docx$/ });
   assert.equal(picked.id, 62);

@@ -102,6 +102,107 @@ if (!window.__abb) {
       return IMPLICIT_ROLES[el.tagName.toLowerCase()] || el.tagName.toLowerCase();
     }
 
+    // ---------------------------------------------------------------------
+    // Action-descriptor field extraction (docs/designs/confirmation-gate.md
+    // section 11.5, D1). Mirrors extension/action_descriptor.mjs's algorithm
+    // by hand (same constraint as ref_registry.mjs above: this file cannot
+    // `import` a module). These fields are PAGE-ASSERTED and therefore
+    // advisory, never a security boundary -- see classify.py's module
+    // docstring for the full contract.
+    // ---------------------------------------------------------------------
+
+    const HEADING_MAX_CHARS = 200;
+    const HEADINGS_MAX_COUNT = 8;
+
+    function capText(text) {
+      if (typeof text !== "string") return null;
+      const trimmed = text.trim();
+      return trimmed.length > 0 ? trimmed.slice(0, HEADING_MAX_CHARS) : null;
+    }
+
+    function isCrossOrigin(urlString) {
+      if (typeof urlString !== "string" || !urlString) return null;
+      try {
+        return new URL(urlString, location.href).origin !== location.origin;
+      } catch {
+        return null;
+      }
+    }
+
+    function hrefInfoFor(el) {
+      const raw = el.getAttribute && el.getAttribute("href");
+      if (!raw) return { href: null, href_cross_origin: null };
+      return { href: raw, href_cross_origin: isCrossOrigin(raw) };
+    }
+
+    function formInfoFor(el) {
+      const form = el.closest && el.closest("form");
+      if (!form) return { form_method: null, form_action: null, form_cross_origin: null };
+      const method = (form.getAttribute("method") || "get").toLowerCase();
+      const action = form.getAttribute("action") || null;
+      return { form_method: method, form_action: action, form_cross_origin: action ? isCrossOrigin(action) : null };
+    }
+
+    function isSubmitControlFor(el) {
+      const tag = el.tagName;
+      if (tag === "INPUT") return el.type === "submit";
+      if (tag === "BUTTON") return !el.hasAttribute("type") || el.getAttribute("type") === "submit";
+      return false;
+    }
+
+    // Best-effort: walk up from `el`, checking each ancestor level's preceding
+    // siblings (and their descendants) for a heading. This is a heuristic,
+    // not an authoritative DOM-semantics computation -- see classify.py's
+    // module docstring on why every page-asserted signal here is advisory.
+    function nearestHeadingFor(el) {
+      let node = el;
+      while (node) {
+        let sib = node.previousElementSibling;
+        while (sib) {
+          if (/^H[1-6]$/.test(sib.tagName)) return capText(sib.textContent);
+          const found = sib.querySelector && sib.querySelector("h1,h2,h3,h4,h5,h6");
+          if (found) return capText(found.textContent);
+          sib = sib.previousElementSibling;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    }
+
+    function dialogTitleFor(el) {
+      const dialog = el.closest && el.closest('[role="dialog"], dialog');
+      if (!dialog) return null;
+      const aria = dialog.getAttribute("aria-label");
+      if (aria) return capText(aria);
+      const heading = dialog.querySelector("h1,h2,h3,h4,h5,h6");
+      return heading ? capText(heading.textContent) : null;
+    }
+
+    // Assembles every additive descriptor field for one element -- called
+    // from both snapshot() (per visible node) and describe() (on demand for
+    // one ref, e.g. the `unknown`-classification recovery path).
+    function descriptorFieldsFor(el) {
+      return {
+        ...hrefInfoFor(el),
+        ...formInfoFor(el),
+        is_submit: isSubmitControlFor(el),
+        nearest_heading: nearestHeadingFor(el),
+        dialog_title: dialogTitleFor(el),
+      };
+    }
+
+    // h1/h2 text on the page, capped -- top-level `headings` field alongside
+    // `page_title` (reuses the existing `title` field -- see snapshot()).
+    function pageHeadings() {
+      const seen = [];
+      for (const h of document.querySelectorAll("h1, h2")) {
+        const text = capText(h.textContent);
+        if (text) seen.push(text);
+        if (seen.length >= HEADINGS_MAX_COUNT) break;
+      }
+      return seen;
+    }
+
     function nameOf(el) {
       const aria = el.getAttribute("aria-label");
       if (aria) return aria;
@@ -223,6 +324,9 @@ if (!window.__abb) {
         // FILE_UPLOAD_INPUT_TYPES) -- an unambiguous alternative to fuzzy
         // label matching for input[type=file]. Only meaningful on <input>.
         if (el.tagName === "INPUT") node.input_type = el.type;
+        // Action-descriptor fields (design doc section 11.5, D1) -- additive,
+        // page-asserted, advisory. See descriptorFieldsFor()'s own comment.
+        Object.assign(node, descriptorFieldsFor(el));
         nodes.push(node);
       }
       // child_frames is frame-local (this frame's own iframe children); refs in
@@ -235,9 +339,35 @@ if (!window.__abb) {
       return {
         url: location.href,
         title: document.title,
+        // page_title duplicates `title` under the descriptor's own field name
+        // (design doc section 11.5: "snapshot()'s top-level result gains
+        // page_title (already has title -- reuse it)") -- kept as a distinct
+        // key so classify.py's ActionDescriptor.page_title reads consistently
+        // whether the value came from a snapshot or a describe() call.
+        page_title: document.title,
+        headings: pageHeadings(),
         nodes,
         child_frames: listChildFrames(),
         generation: myGeneration,
+      };
+    }
+
+    // On-demand full descriptor for one ref (design doc section 11.5) --
+    // exists for the `unknown` classification recovery path: a caller that
+    // gets `reason_code: "ref_not_observed"` can obtain a descriptor without
+    // a full re-snapshot. Never auto-fires; the caller invokes it explicitly
+    // (design doc section 13: no silent escalation).
+    function describe(ref) {
+      const el = resolveRef(ref);
+      return {
+        ref,
+        role: roleOf(el),
+        name: nameOf(el),
+        tag: el.tagName.toLowerCase(),
+        input_type: el.tagName === "INPUT" ? el.type : null,
+        url: location.href,
+        page_title: document.title,
+        ...descriptorFieldsFor(el),
       };
     }
 
@@ -375,6 +505,8 @@ if (!window.__abb) {
         switch (command) {
           case "snapshot":
             return snapshot();
+          case "describe":
+            return describe(args.ref);
           case "read":
             return read();
           case "click":
