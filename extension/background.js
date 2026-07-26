@@ -11,7 +11,7 @@
 // belong in the hub, not here.
 
 import { HUB_URL, HUB_TOKEN } from "./config.js";
-import { parseQualifiedRef, qualifyRef } from "./frame_refs.mjs";
+import { parseQualifiedRef, qualifyRef, qualifySnapshotResult } from "./frame_refs.mjs";
 import { combineRead, combineSnapshot } from "./combine_frames.mjs";
 import { DEFAULT_MAX_FETCH_BYTES, checkSizeCap, bytesToBase64 } from "./fetch_utils.mjs";
 import { truthy } from "./args_bool.mjs";
@@ -407,9 +407,55 @@ function requireTabId(target) {
   return target.tab_id;
 }
 
+// Bug 1 fix, part 2 (real-profile hardening, discovered proving Bug 1 live):
+// chrome.scripting.executeScript does NOT propagate an exception thrown
+// inside the injected function back to this side as a thrown/rejected error
+// -- it silently resolves that frame's InjectionResult with `result:
+// undefined` instead. Measured live: BEFORE this fix, clicking a stale ref
+// (or a flat-out bogus one) produced `{ok: true, result: null}` -- the exact
+// silent-success failure mode this bug report is about -- because
+// injected.js's resolveRef() threw, but nothing on this side ever saw it.
+//
+// The fix: injected.js's dispatch()/rectFor()/focusFor() catch their own
+// errors and return an explicit `{__abbError: message}` sentinel instead of
+// letting the promise reject (see injected.js's rectFor() comment).
+// unwrapAbbResult() is the single choke point that turns that sentinel back
+// into a real thrown Error on THIS side, so executeCommand()'s existing
+// try/catch reports it as `{ok: false, error: <the real message>}` --
+// preserving the specific, actionable cause (stale generation, disconnected,
+// identity mismatch, unknown ref) rather than a generic fallback.
+function unwrapAbbResult(result) {
+  if (result && typeof result === "object" && typeof result.__abbError === "string") {
+    throw new Error(result.__abbError);
+  }
+  return result;
+}
+
+// Bug 2 fix: qualifySnapshotResult() is imported from frame_refs.mjs (see that
+// module for the full rationale) -- kept there, not here, so it's covered by
+// frame_refs.test.mjs's plain `node --test` coverage instead of being
+// untestable inline background.js logic.
+
 async function runInPage(target, command, args) {
   const tabId = requireTabId(target);
-  const tab = await ensureAwake(tabId, args);
+  let tab = await ensureAwake(tabId, args);
+  // Bug 3: `args.activate` (same tolerant truthy() coercion as wake/all_frames)
+  // -- explicit, opt-in tab activation before a DOM-injecting command runs.
+  // Real-world finding: a heavy enterprise SPA timed out on `snapshot` at 170s
+  // while backgrounded, and completed in ~2s once foregrounded -- DOM
+  // injection/traversal is viable-when-foreground, dead-when-background on a
+  // heavy hydrated page. NEVER automatic (co-working etiquette, design doc
+  // §6.3 -- this steals the human's focus exactly like `tab_activate`), and
+  // the result reports it happened, same precedent as `wake`/`woke`. Only
+  // acts (and only reports `activated: true`) when the tab wasn't already
+  // active -- activating an already-active tab steals nothing and reports
+  // nothing, since no engagement actually occurred.
+  let activated = false;
+  if (wantsActivate(args) && !tab.active) {
+    await chrome.tabs.update(tabId, { active: true });
+    activated = true;
+    tab = { ...tab, active: true };
+  }
   // Co-working etiquette (design doc §6.3/§4): a tab the agent is actively
   // working with should not be discarded out from under it mid-session --
   // applied here (a real, deliberate per-tab engagement), never blanket-
@@ -463,7 +509,12 @@ async function runInPage(target, command, args) {
     result = single && single.result;
     if (result && typeof result === "object") {
       if (typeof result.ref === "string") result = { ...result, ref: qualifyRef(single.frameId, result.ref) };
-      result = { ...result, frame_id: single.frameId };
+      // Bug 2: `snapshot`'s `nodes[].ref` values are bare per-frame refs
+      // (injected.js has no notion of frameId) -- qualify each one the same
+      // way the top-level `ref` above is qualified, so a caller can copy a
+      // ref straight out of this result into click/type/key with no
+      // hand-editing. See qualifySnapshotResult()'s own comment.
+      result = qualifySnapshotResult({ ...result, frame_id: single.frameId }, single.frameId);
     }
   } else {
     // Default: top frame (frameId 0) only -- scroll/back/forward/wait_for/
@@ -483,23 +534,34 @@ async function runInPage(target, command, args) {
     if (result && typeof result === "object" && typeof result.ref === "string") {
       result = { ...result, ref: qualifyRef(singleResult.frameId, result.ref) };
     }
+    // Bug 2: this is the COMMON case for `snapshot` (no all_frames, no
+    // explicit frame_id) -- injected.js's plain snapshot() returns bare
+    // `nodes[].ref` values ("e29"); qualify each one with frameId 0 (the
+    // only frame this branch ever targets) so the result composes directly
+    // into click/type/key, matching combineSnapshot's per-node shape.
+    result = qualifySnapshotResult(result, singleResult && singleResult.frameId);
   }
 
-  return attachWokeInfo(result, tab);
+  return attachEngagementInfo(result, tab, activated);
 }
 
 // Fail-loud-adjacent: a command only succeeded because we reloaded the tab
 // first (in-page state -- unsaved form data, scroll position, ephemeral JS
-// state -- was destroyed). The caller asked for this via args.wake, but the
+// state -- was destroyed), or because we activated it (Bug 3: stole the
+// human's focus). The caller asked for both via explicit opt-in args, but the
 // result must still say so plainly (design doc §6.3: never mutate the
-// human's session as a hidden side effect). Single choke point so every
-// runInPage() branch (top-frame, frame-routed, multi-frame) reports this
-// identically instead of three separate copies of the same tagging logic.
-function attachWokeInfo(result, tab) {
-  if (tab.__abbWoke && result && typeof result === "object") {
-    return { ...result, woke: true, wake_reason: "tab was discarded; reloaded to satisfy wake=true" };
+// human's session -- or its focus -- as a hidden side effect). Single choke
+// point so every runInPage() branch (top-frame, frame-routed, multi-frame)
+// reports this identically instead of separate copies of the same tagging logic.
+function attachEngagementInfo(result, tab, activated) {
+  let out = result;
+  if (tab.__abbWoke && out && typeof out === "object") {
+    out = { ...out, woke: true, wake_reason: "tab was discarded; reloaded to satisfy wake=true" };
   }
-  return result;
+  if (activated && out && typeof out === "object") {
+    out = { ...out, activated: true };
+  }
+  return out;
 }
 
 // Route a ref-bearing command (click/type/key-with-ref) to the EXACT frame
@@ -526,7 +588,15 @@ async function runInFrame(tabId, command, args) {
         "refs are only valid within the page load that produced them; take a fresh snapshot"
     );
   }
-  const result = results[0].result;
+  // Bug 1 fix, part 2: chrome.scripting.executeScript does NOT propagate an
+  // exception thrown inside the injected function (e.g. resolveRef's stale/
+  // unknown/disconnected/identity-mismatch errors) back as a thrown error --
+  // it silently resolves with `result: undefined` instead. Measured live:
+  // clicking a stale OR a bogus ref both produced `{ok: true, result: null}`
+  // before this fix. unwrapAbbResult() converts injected.js's `{__abbError}`
+  // sentinel (see its module comment) back into a real thrown Error here, so
+  // executeCommand()'s existing try/catch reports it as `{ok: false, error}`.
+  const result = unwrapAbbResult(results[0].result);
   if (result && typeof result === "object" && typeof result.ref === "string") {
     // injected.js's click()/type() echo back the BARE ref it resolved
     // (e.g. "e12") -- report the qualified ref the caller actually used
@@ -643,6 +713,13 @@ function discardedTabError(tabId) {
 
 function wantsWake(args) {
   return !!(args && truthy(args.wake));
+}
+
+// Bug 3: `args.activate` -- same tolerant truthy() coercion as wake/all_frames.
+// Checked by runInPage() before any DOM injection happens; see that function's
+// own comment for the full rationale and the co-working-etiquette constraints.
+function wantsActivate(args) {
+  return !!(args && truthy(args.activate));
 }
 
 // MEASURED on real Edge 150 (macOS), profile with 531 open tabs:
@@ -1397,12 +1474,17 @@ async function cdpClick(tabId, ref) {
   // world and reported the ref as stale even immediately after a snapshot.
   // Order matters: rect resolution needs no CDP at all, so do it first.
   await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
-  const [{ result: rect }] = await chrome.scripting.executeScript({
+  const [{ result: rawRect }] = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
     func: (r) => window.__abb.rectFor(r),
     args: [bareRef],
   });
-  if (!rect) throw new Error(`stale or unknown element ref: ${ref}`);
+  // Bug 1 fix, part 2: rectFor() returns a `{__abbError}` sentinel (rather
+  // than throwing) for exactly this reason -- see injected.js's rectFor()
+  // comment. unwrapAbbResult() surfaces the REAL cause (stale generation,
+  // disconnected, identity mismatch, unknown ref) instead of the old generic
+  // "stale or unknown element ref" that discarded which of those it was.
+  const rect = unwrapAbbResult(rawRect);
   await cdpAttach(tabId);
   const x = rect.x + rect.width / 2;
   const y = rect.y + rect.height / 2;
@@ -1430,11 +1512,17 @@ async function cdpType(tabId, ref, text) {
   const { frameId, ref: bareRef } = parseQualifiedRef(ref);
   await cdpAttach(tabId);
   await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
-  await chrome.scripting.executeScript({
+  const [{ result: focusResult }] = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
     func: (r) => window.__abb.focusFor(r),
     args: [bareRef],
   });
+  // Bug 1 fix, part 2: this previously ignored focusFor's result entirely --
+  // a stale/unknown/disconnected ref would silently fall through to
+  // Input.insertText typing into whatever (if anything) currently had focus,
+  // the same silent-failure class as the click bug. unwrapAbbResult() fails
+  // loud instead, before any CDP input is dispatched.
+  unwrapAbbResult(focusResult);
   await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text });
   return { ref, trusted: true };
 }
@@ -1447,11 +1535,13 @@ async function cdpKey(tabId, ref, keyName) {
     // below is tab-level regardless.
     const { frameId, ref: bareRef } = parseQualifiedRef(ref);
     await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
-    await chrome.scripting.executeScript({
+    const [{ result: focusResult }] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       func: (r) => window.__abb.focusFor(r),
       args: [bareRef],
     });
+    // Bug 1 fix, part 2 -- see cdpType()'s identical comment above.
+    unwrapAbbResult(focusResult);
   }
   await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyDown", key: keyName });
   await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyUp", key: keyName });

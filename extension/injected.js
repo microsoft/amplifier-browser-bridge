@@ -19,6 +19,34 @@ if (!window.__abb) {
     const refToElement = new Map(); // ref string -> Element
     const elementToRef = new WeakMap(); // Element -> ref string
 
+    // ---------------------------------------------------------------------
+    // Generation-bound ref bookkeeping (Bug 1: stale refs succeed silently)
+    // ---------------------------------------------------------------------
+    // Mirrors extension/ref_registry.mjs's algorithm exactly -- see that file's
+    // module docstring for the full rationale and for why this is a hand-synced
+    // copy rather than an import (injected.js is loaded as a classic script via
+    // chrome.scripting.executeScript({files:...}), which cannot use `import`,
+    // and `window.__abb` must be synchronously ready the instant injection
+    // completes -- a dynamic import would race background.js's very next
+    // executeScript call). Keep the two in sync by hand, same discipline
+    // CONTRIBUTING.md documents for protocol.py/background.js.
+    //
+    // Every `snapshot()` bumps `generation` and re-stamps every ref it touches
+    // with the new value. A ref only resolves while its stamped generation
+    // still equals the CURRENT generation -- i.e. only refs from the MOST
+    // RECENT snapshot (or a `wait_for` that ran since) are valid. A ref from a
+    // superseded snapshot is rejected outright, even if it still points at a
+    // live, connected element (design doc's "Mechanism, not policy": silently
+    // accepting it because the element "still works" would be exactly the
+    // silent-substitution mistake that section forbids).
+    let generation = 0;
+    const refGeneration = new Map(); // ref string -> generation it was last (re)stamped in
+    const refFingerprint = new Map(); // ref string -> {tag, name} captured at last stamp time
+
+    function fingerprintOf(el) {
+      return { tag: el.tagName, name: nameOf(el) };
+    }
+
     // Depth-first traversal that pierces shadow roots (open shadow DOM only -- closed
     // shadow roots are, by design, unreachable from any script). Does NOT descend into
     // iframes -- injected.js runs independently in every frame chrome.scripting's
@@ -82,6 +110,12 @@ if (!window.__abb) {
       return text.slice(0, 120);
     }
 
+    // Mints (or re-confirms) a ref for `el`, stamping it with the CURRENT
+    // generation -- called for every element a snapshot pass visits, and for
+    // wait_for's found element (which stamps with whatever generation is
+    // current WITHOUT bumping it, valid until the next real snapshot
+    // supersedes it). See ref_registry.mjs (this function's tested twin) for
+    // the full rationale.
     function refFor(el) {
       let ref = elementToRef.get(el);
       if (!ref) {
@@ -89,13 +123,48 @@ if (!window.__abb) {
         elementToRef.set(el, ref);
         refToElement.set(ref, el);
       }
+      refGeneration.set(ref, generation);
+      refFingerprint.set(ref, fingerprintOf(el));
       return ref;
     }
 
+    // Bug 1 (stale refs succeed silently): fails loud with one of four
+    // distinct, actionable causes rather than silently resolving a ref that
+    // no longer means what the caller thinks it means. See ref_registry.mjs's
+    // module docstring for the full rationale -- this mirrors that module's
+    // `resolveRef` exactly.
     function resolveRef(ref) {
       const el = refToElement.get(ref);
-      if (!el || !el.isConnected) {
-        throw new Error(`stale or unknown element ref: ${ref}`);
+      if (!el) {
+        throw new Error(
+          `unknown element ref: ${ref} -- never produced in the current page context. If a navigation or ` +
+            "reload happened since you last took a snapshot, the ref table was reset -- take a fresh snapshot."
+        );
+      }
+      const mintedGeneration = refGeneration.get(ref);
+      if (mintedGeneration !== generation) {
+        throw new Error(
+          `stale ref: ${ref} was captured by an earlier snapshot (generation ${mintedGeneration}); the most ` +
+            `recent snapshot on this page is generation ${generation}. Refs are only valid from the MOST ` +
+            "RECENT snapshot -- take a fresh snapshot and use a ref from that result."
+        );
+      }
+      if (!el.isConnected) {
+        throw new Error(
+          `element for ref ${ref} is no longer attached to the page (removed from the DOM since it was ` +
+            `captured, still generation ${generation}) -- take a fresh snapshot.`
+        );
+      }
+      const fp = refFingerprint.get(ref);
+      if (fp) {
+        const now = fingerprintOf(el);
+        if (fp.tag !== now.tag || fp.name !== now.name) {
+          throw new Error(
+            `element for ref ${ref} no longer matches what was captured (expected tag=${fp.tag} ` +
+              `name=${JSON.stringify(fp.name)}, now tag=${now.tag} name=${JSON.stringify(now.name)}) -- the ` +
+              "DOM node may have been reused for different content since the snapshot. Take a fresh snapshot."
+          );
+        }
       }
       return el;
     }
@@ -136,6 +205,12 @@ if (!window.__abb) {
     }
 
     function snapshot() {
+      // Bug 1: every snapshot pass bumps the generation counter FIRST, then
+      // (re)stamps every ref it touches with the new value via refFor() --
+      // this is what makes a ref from THIS pass resolve, and a ref from any
+      // earlier pass a rejected "stale ref" (see resolveRef() above).
+      generation += 1;
+      const myGeneration = generation;
       const elements = deepQueryAll(document.body);
       const nodes = [];
       for (const el of elements) {
@@ -153,8 +228,17 @@ if (!window.__abb) {
       // child_frames is frame-local (this frame's own iframe children); refs in
       // `nodes` are frame-local too (background.js qualifies them with this
       // frame's frameId when combining results from allFrames:true -- see
-      // frame_refs.js and background.js's combineSnapshot()).
-      return { url: location.href, title: document.title, nodes, child_frames: listChildFrames() };
+      // frame_refs.js and background.js's combineSnapshot()). `generation` is
+      // this frame's OWN counter (each frame gets its own window.__abb) --
+      // background.js surfaces it per-node/per-frame in the wire result so a
+      // superseded ref fails loud instead of silently resolving (Bug 1).
+      return {
+        url: location.href,
+        title: document.title,
+        nodes,
+        child_frames: listChildFrames(),
+        generation: myGeneration,
+      };
     }
 
     // Resolve a ref to its viewport-space bounding rect, WITHOUT dispatching
@@ -166,19 +250,38 @@ if (!window.__abb) {
     // any window state (minimized, occluded), so this is reliable input to
     // CDP even for a hidden/minimized tab.
     function rectFor(ref) {
-      const el = resolveRef(ref);
-      el.scrollIntoView({ block: "center", inline: "center" });
-      const r = el.getBoundingClientRect();
-      return { x: r.x, y: r.y, width: r.width, height: r.height, tag: el.tagName.toLowerCase() };
+      try {
+        const el = resolveRef(ref);
+        el.scrollIntoView({ block: "center", inline: "center" });
+        const r = el.getBoundingClientRect();
+        return { x: r.x, y: r.y, width: r.width, height: r.height, tag: el.tagName.toLowerCase() };
+      } catch (err) {
+        // Bug 1 fix, part 2: chrome.scripting.executeScript does NOT propagate
+        // an exception thrown inside the injected function back to the caller
+        // as a rejected promise/thrown error -- it silently resolves that
+        // frame's InjectionResult with `result: undefined` instead (measured
+        // live: a bogus AND a stale ref both produced `{ok: true, result:
+        // null}` before this fix, for exactly this reason). Returning an
+        // explicit `{__abbError}` sentinel is the only way the real message
+        // (e.g. "stale ref: ...") survives the executeScript boundary --
+        // background.js's unwrapAbbResult() converts this back into a real
+        // thrown Error on the extension side. See background.js's cdpClick().
+        return { __abbError: String((err && err.message) || err) };
+      }
     }
 
     // Focus an element without dispatching a click -- used before CDP-backed
     // trusted typing (Input.insertText types into whatever currently has
-    // focus; CDP has no notion of "ref").
+    // focus; CDP has no notion of "ref"). See rectFor()'s comment above for
+    // why this catches internally and returns a sentinel rather than throwing.
     function focusFor(ref) {
-      const el = resolveRef(ref);
-      el.focus();
-      return { ref };
+      try {
+        const el = resolveRef(ref);
+        el.focus();
+        return { ref };
+      } catch (err) {
+        return { __abbError: String((err && err.message) || err) };
+      }
     }
 
     function read() {
@@ -257,29 +360,44 @@ if (!window.__abb) {
 
     async function dispatch(command, args) {
       args = args || {};
-      switch (command) {
-        case "snapshot":
-          return snapshot();
-        case "read":
-          return read();
-        case "click":
-          return click(args.ref);
-        case "type":
-          return typeText(args.ref, args.text);
-        case "key":
-          return key(args.ref, args.key);
-        case "scroll":
-          return scroll(args.x, args.y);
-        case "back":
-          return back();
-        case "forward":
-          return forward();
-        case "wait_for":
-          return await waitFor(args.selector, args.timeout_ms);
-        case "wait_text":
-          return await waitText(args.text, args.timeout_ms);
-        default:
-          throw new Error(`unsupported page-world command: ${command}`);
+      // Bug 1 fix, part 2 (real-profile hardening, discovered proving Bug 1
+      // live): chrome.scripting.executeScript does NOT propagate an exception
+      // thrown in here back to background.js as a thrown/rejected error -- it
+      // silently resolves with `result: undefined` instead. Measured live:
+      // BEFORE this try/catch existed, clicking a stale ref (or a flat-out
+      // bogus one) produced `{ok: true, result: null}` on the wire -- the
+      // exact silent-success failure mode this bug is about -- because
+      // resolveRef() threw here, but nothing on the extension side ever saw
+      // it. Catching here and returning an explicit `{__abbError}` sentinel
+      // is what lets background.js's unwrapAbbResult() (see its own comment)
+      // turn this back into a real `{ok: false, error: ...}` for the caller.
+      try {
+        switch (command) {
+          case "snapshot":
+            return snapshot();
+          case "read":
+            return read();
+          case "click":
+            return click(args.ref);
+          case "type":
+            return typeText(args.ref, args.text);
+          case "key":
+            return key(args.ref, args.key);
+          case "scroll":
+            return scroll(args.x, args.y);
+          case "back":
+            return back();
+          case "forward":
+            return forward();
+          case "wait_for":
+            return await waitFor(args.selector, args.timeout_ms);
+          case "wait_text":
+            return await waitText(args.text, args.timeout_ms);
+          default:
+            throw new Error(`unsupported page-world command: ${command}`);
+        }
+      } catch (err) {
+        return { __abbError: String((err && err.message) || err) };
       }
     }
 
