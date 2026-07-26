@@ -639,25 +639,60 @@ class Hub:
 
         Returns an empty string for commands with no relevant alternative to name.
         """
+        hint = ""
         if command in ("read", "snapshot"):
             if truthy(args.get("all_frames")):
-                return (
+                hint += (
                     " This request already used args.all_frames=true (every frame is instrumented "
                     "before any result returns, which is slower) -- if you know which frame you need "
                     "from a prior result's `frames` entry, args.frame_id=<id> targets just that one "
                     "frame and skips the rest."
                 )
-            return (
-                " If the content you need lives inside an embedded frame (e.g. a SharePoint/M365 "
-                "document viewer) rather than the top frame, args.all_frames=true gathers every frame "
-                "-- slower, so raise args.timeout_s alongside it."
-            )
+            else:
+                hint += (
+                    " If the content you need lives inside an embedded frame (e.g. a SharePoint/M365 "
+                    "document viewer) rather than the top frame, args.all_frames=true gathers every frame "
+                    "-- slower, so raise args.timeout_s alongside it."
+                )
         if command in ("click", "type", "key"):
-            return (
+            hint += (
                 " If the page ignores untrusted synthetic events, args.trusted=true escalates to "
                 "CDP-backed isTrusted input (requires the debugger capability on this device)."
             )
-        return ""
+        # Bug 3 (real-profile hardening): DOM injection/traversal on a heavy SPA is
+        # viable-when-foreground, dead-when-background (measured: a heavy enterprise
+        # SPA timed out at 170s backgrounded, ~2s once activated). Name every real
+        # option -- never pick one automatically (design doc's "Mechanism, not
+        # policy" section) -- for every DOM-injecting command this timeout applies to.
+        page_world_commands = (
+            "snapshot",
+            "read",
+            "click",
+            "type",
+            "key",
+            "scroll",
+            "back",
+            "forward",
+            "wait_for",
+            "wait_text",
+        )
+        if command in page_world_commands and not truthy(args.get("activate")):
+            if command in ("read", "snapshot"):
+                hint += (
+                    " If the target tab is not the active tab, DOM injection/traversal can be slow or "
+                    "hang on a heavy page while backgrounded -- args.activate=true activates the tab "
+                    "first (fast, exact DOM, but steals the human's focus), the agent-surface-only "
+                    "vision_read (not a wire command) captures a screenshot and extracts text via a "
+                    "vision model instead (no focus steal, costs a model call, produces no element "
+                    "refs), or raise args.timeout_s."
+                )
+            else:
+                hint += (
+                    " If the target tab is not the active tab, DOM injection can be slow or hang on a "
+                    "heavy page while backgrounded -- args.activate=true activates the tab first (fast, "
+                    "exact DOM, but steals the human's focus), or raise args.timeout_s."
+                )
+        return hint
 
     async def _dispatch_live(self, record: DeviceRecord, cmd: QueuedCommand) -> dict[str, Any]:
         """The single choke point for CDP escalation (see this module's

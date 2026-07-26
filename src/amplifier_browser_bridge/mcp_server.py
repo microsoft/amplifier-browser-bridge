@@ -162,6 +162,7 @@ async def browser_snapshot(
     tab_id: int,
     window_id: int | None = None,
     wake: bool = False,
+    activate: bool = False,
     timeout_s: float | None = None,
 ) -> dict[str, Any]:
     """Accessibility-style snapshot of a tab: a tree of elements with stable,
@@ -171,12 +172,27 @@ async def browser_snapshot(
     from every frame on the page (iframes included), not just the top frame. Refs
     reset on navigation -- take a fresh snapshot after navigating.
 
+    Each node (and each `frames` entry) also carries a `generation` number: refs
+    are only valid from the MOST RECENT snapshot of a given frame. If you take a
+    second snapshot and then try to use a ref from the first one, browser_click/
+    browser_type/browser_key will fail loud with a specific "stale ref" error
+    rather than silently doing nothing -- take a fresh snapshot and use a ref from
+    that result instead of reusing an older one.
+
     At real-world scale (hundreds of tabs) Edge discards (unloads) most background
     tabs to reclaim memory. A discarded tab fails loud with a specific error naming
     the real cause -- check browser_tabs()'s `discarded` field first. Pass wake=True
     to reload a discarded tab and retry; this destroys in-page state (unsaved form
     data, scroll position, ephemeral JS state), so it is opt-in only -- the result
     reports `"woke": true` when this happened.
+
+    A heavy/hydrated SPA can be slow or outright time out while the tab is NOT the
+    active tab (DOM injection/traversal is measured to be dramatically faster once
+    foregrounded). Pass activate=True to foreground the tab first -- never automatic,
+    since it steals the human's focus; the result reports `"activated": true` when
+    this happened. If you'd rather not steal focus at all, browser_vision_read
+    captures a screenshot and extracts text via a vision model instead (no focus
+    steal, costs a model call, produces no element refs).
 
     `timeout_s`, if given, overrides the hub's default device-round-trip wait for
     just this call -- useful for a heavy/slow-hydrating page (see browser_devices()'s
@@ -188,7 +204,11 @@ async def browser_snapshot(
     hang -- call browser_poll(device_id, command_id) later to retrieve the
     eventual result.
     """
-    args: dict[str, Any] = {"wake": True} if wake else {}
+    args: dict[str, Any] = {}
+    if wake:
+        args["wake"] = True
+    if activate:
+        args["activate"] = True
     return await _run_command(
         device_id, "snapshot", args, window_id=window_id, tab_id=tab_id, timeout_s=timeout_s
     )
@@ -200,6 +220,7 @@ async def browser_read(
     tab_id: int,
     window_id: int | None = None,
     wake: bool = False,
+    activate: bool = False,
     timeout_s: float | None = None,
 ) -> dict[str, Any]:
     """Read the visible text of a tab, gathered across ALL frames (iframes
@@ -217,6 +238,14 @@ async def browser_read(
     data, scroll position, ephemeral JS state), so it is opt-in only -- the result
     reports `"woke": true` when this happened.
 
+    A heavy/hydrated SPA can be slow or outright time out while the tab is NOT the
+    active tab (DOM injection/traversal is measured to be dramatically faster once
+    foregrounded). Pass activate=True to foreground the tab first -- never automatic,
+    since it steals the human's focus; the result reports `"activated": true` when
+    this happened. If you'd rather not steal focus at all, browser_vision_read
+    captures a screenshot and extracts text via a vision model instead (no focus
+    steal, costs a model call, produces no element refs).
+
     `timeout_s`, if given, overrides the hub's default device-round-trip wait for
     just this call -- useful for a heavy/slow-hydrating page (see docs/PROTOCOL.md's
     "Command timeout" section).
@@ -227,7 +256,11 @@ async def browser_read(
     hang -- call browser_poll(device_id, command_id) later to retrieve the
     eventual result.
     """
-    args: dict[str, Any] = {"wake": True} if wake else {}
+    args: dict[str, Any] = {}
+    if wake:
+        args["wake"] = True
+    if activate:
+        args["activate"] = True
     return await _run_command(
         device_id, "read", args, window_id=window_id, tab_id=tab_id, timeout_s=timeout_s
     )

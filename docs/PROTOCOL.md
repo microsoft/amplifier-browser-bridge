@@ -330,8 +330,8 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 
 | Command | Executed via | Notes |
 |---|---|---|
-| `snapshot` | injected.js | Accessibility-style tree, frame-qualified `f<frameId>.eN` refs -- gathered from **every frame** on the page. See "Frames" below. |
-| `read` | injected.js | Full visible text -- gathered from **every frame** on the page; returns the richest frame's text plus a manifest of the rest. See "Frames" below. |
+| `snapshot` | injected.js | Accessibility-style tree, frame-qualified `f<frameId>.eN` refs. Top frame only by default; pass `args.all_frames: true` to gather from **every frame** instead (see "Frames" below). Every node (and every `frames` manifest entry) carries a `generation` -- see "Snapshot generations and ref staleness" below. |
+| `read` | injected.js | Full visible text. Top frame only by default; pass `args.all_frames: true` to gather **every frame's** content uniformly instead (see "Frames" below). |
 | `click` | injected.js | `args.ref`; routes to the exact frame the ref was qualified with |
 | `type` | injected.js | `args.ref`, `args.text`; routes to the exact frame the ref was qualified with |
 | `key` | injected.js | `args.ref` (optional), `args.key`; routes to the exact frame ONLY when `args.ref` is given -- a ref-less key press runs against the top frame (frameId 0) |
@@ -354,8 +354,9 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 | `wait_download` | background.js (`chrome.downloads.search`, polled) | `args.download_id` XOR `args.since_id` (+ optional `args.pattern`), `args.timeout_ms`. Target is device-only. See "Content-extraction mechanisms" below. |
 
 Every `PAGE_WORLD_COMMAND` (`snapshot`, `read`, `click`, `type`, `key`, `scroll`, `back`, `forward`,
-`wait_for`, `wait_text`) also accepts an optional `args.wake` -- see "Discarded tabs" below. Every
-command accepts an optional `args.timeout_s` -- see "Command timeout" below.
+`wait_for`, `wait_text`) also accepts an optional `args.wake` -- see "Discarded tabs" below -- and
+an optional `args.activate` -- see "Foregrounding a tab for DOM injection (`args.activate`)" below.
+Every command accepts an optional `args.timeout_s` -- see "Command timeout" below.
 
 ### Frames
 
@@ -446,6 +447,77 @@ ref-less `key` press still operate on the top frame (frameId 0) only, in this ph
 is a scope decision, not an oversight -- these are page/tab-level operations (or, for `key`, have
 no ref to resolve a frame from) where multi-frame semantics are considerably less obviously
 correct (e.g. "scroll which frame?"). Revisit if a real need for frame-scoped waits emerges.
+
+### Snapshot generations and ref staleness
+
+**The bug this section fixes:** every `snapshot` regenerates a frame's ref table. Before this fix,
+a ref from a *superseded* snapshot could still resolve -- if the same DOM node happened to still
+be connected -- and `click`/`type`/`key` reported `{"ok": true, ...}` while doing nothing (or
+acting on the wrong thing). Reproduced live: snapshot a page, note ref `f0.e93` for a button,
+take a *second* snapshot (or run any other command), then click `f0.e93` -- it resolved and
+reported success, but the click had no effect. That is the worst class of bug for this system: an
+agent believes an action happened and proceeds on a false premise, in a system whose stated
+discipline is fail-loud (design doc §8).
+
+**How it's fixed:** every ref is bound to the *generation* of the snapshot that produced it, not
+just to whether its underlying DOM node still exists. Each frame's own `window.__abb` (one per
+frame -- see "Frame-qualified refs" above) keeps a generation counter, starting at 0. Every
+`snapshot` call increments it and re-stamps every ref it touches (new or already-known) with the
+new value. **A ref only resolves while its stamped generation still equals that frame's CURRENT
+generation** -- i.e., only refs from the *most recent* snapshot of a given frame (or from a
+`wait_for` that ran since) are valid. A ref from any earlier snapshot is rejected outright, even
+if it still points at a live, connected element -- see docs/designs/browser-bridge.md's
+"Mechanism, not policy" section: silently accepting it because the element "still works" would be
+exactly the silent-substitution mistake that section forbids. There is no automatic re-snapshot on
+a stale ref -- the caller re-snapshots explicitly and gets a result reflecting the page's current
+state, rather than the bridge guessing what it should point at instead.
+
+Every `snapshot` result's nodes (and each `frames` manifest entry) carry a `generation` number so
+a caller can see which pass produced a given ref:
+
+```json
+{"ok": true, "result": {
+  "url": "https://example/admin",
+  "nodes": [{"ref": "f0.e93", "role": "button", "name": "Revoke", "tag": "button", "generation": 3, "frame_id": 0}],
+  "frame_count": 1,
+  "frames": [{"frame_id": 0, "url": "https://example/admin", "title": "Admin", "node_count": 40, "generation": 3}],
+  "unconfirmed_frames": []
+}}
+```
+
+`click`/`type`/`key` fail loud with one of **four distinct, actionable causes** (see
+`extension/ref_registry.mjs` -- the tested reference implementation of this algorithm --
+and `injected.js`'s hand-synced inline copy, kept in sync the same way protocol.py/background.js
+are):
+
+1. **Unknown ref** -- never produced in the current page context. Either the ref string is simply
+   wrong, or a navigation/reload happened since the snapshot that produced it (which destroys
+   `window.__abb` along with the rest of the page's JS context, wiping the ref table entirely):
+   `"unknown element ref: f0.e93 -- never produced in the current page context. If a navigation or
+   reload happened since you last took a snapshot, the ref table was reset -- take a fresh snapshot."`
+2. **Stale ref (superseded generation)** -- this is the bug fix's core case: `"stale ref: e93 was
+   captured by an earlier snapshot (generation 1); the most recent snapshot on this page is
+   generation 2. Refs are only valid from the MOST RECENT snapshot -- take a fresh snapshot and use
+   a ref from that result."`
+3. **Disconnected (same generation)** -- the element left the DOM without any new snapshot
+   happening: `"element for ref e93 is no longer attached to the page (removed from the DOM since
+   it was captured, still generation 2) -- take a fresh snapshot."`
+4. **Identity changed (same generation, still connected)** -- a cheap, additional safety net beyond
+   the generation check: at resolve time, the element's current tag and accessible name are
+   re-derived and compared against what was recorded when the ref was minted. A virtualized/
+   recycled-list UI can reuse the exact same DOM node for different content between snapshots
+   without ever disconnecting it -- an element "still there" under a still-valid-generation ref,
+   but no longer semantically the one the caller inspected, is the same silent-failure class this
+   whole section exists to prevent, just without a generation bump to catch it structurally:
+   `"element for ref e93 no longer matches what was captured (expected tag=BUTTON name=\"Revoke\",
+   now tag=BUTTON name=\"Approve\") -- the DOM node may have been reused for different content since
+   the snapshot. Take a fresh snapshot."` (Trade-off, deliberately accepted: an element whose visible
+   text legitimately changed between snapshot and action -- e.g. a live counter -- will also trip
+   this check. Fail-loud-but-occasionally-conservative beats silently clicking the wrong thing.)
+
+`wait_for`'s own found ref is minted the same way (stamped with whatever generation is currently
+current, without bumping it) -- it stays valid until the *next* real `snapshot` on that frame
+supersedes it, not forever.
 
 **Shadow DOM piercing is unaffected**: `injected.js`'s `deepQueryAll()` still pierces open shadow
 roots within each frame it runs in -- multi-frame traversal is orthogonal to (and composes with)
@@ -672,6 +744,37 @@ real cause is "there is no live renderer here right now," not a permissions prob
   attaches first via the hub's own pre-flight (`_ensure_cdp_attached`), so this happens before the
   real command ever reaches the device.
 
+### Foregrounding a tab for DOM injection (`args.activate`)
+
+Real-world finding: `snapshot` against a heavy enterprise SPA
+(`repos.opensource.microsoft.com`'s Open Source Management Portal) timed out at 170s while the
+tab was backgrounded, and completed in ~2s against the same tab immediately after activating it.
+DOM injection/traversal on a large, fully-hydrated page is viable-when-foreground,
+dead-when-background -- the tab needs to actually be compositing/rendering for
+`chrome.scripting.executeScript` to complete promptly.
+
+Every `PAGE_WORLD_COMMAND` accepts an optional `args.activate` (same tolerant coercion as
+`args.wake`/`args.all_frames` -- see "Boolean argument coercion" below). **Default off.** When
+truthy, `runInPage()` (background.js) activates the tab (`chrome.tabs.update(tabId, {active:
+true})`) *before* any injection happens for that command, then proceeds normally. Like
+`args.wake`, this is **never automatic** -- co-working etiquette (design doc §6.3) forbids
+stealing the human's focus as a hidden side effect of an ordinary read, so this follows the exact
+same precedent as `tab_activate`: the command was explicitly asked to steal focus, so it does,
+and the result says so. Only acts (and only reports it) when the tab wasn't already active --
+activating an already-active tab steals nothing and changes nothing, so nothing is reported:
+
+```json
+{"ok": true, "result": {"url": "...", "title": "...", "nodes": [...], "activated": true}}
+```
+
+**Discoverable, not automatic** (design doc's "Mechanism, not policy" section): when a
+`PAGE_WORLD_COMMAND` times out and `args.activate` was NOT already set, the timeout error names
+every real alternative rather than picking one -- for `read`/`snapshot`: `args.activate=true`
+(fast, exact DOM, steals focus), the agent-surface-only `vision_read` (screenshot + a vision-model
+call, no focus steal, no element refs), or raising `args.timeout_s`/narrowing with
+`args.frame_id`; for `click`/`type`/`key`/others: `args.activate=true` or raising `args.timeout_s`.
+See `Hub._timeout_hint` (hub.py) and "Command timeout" below.
+
 ### Extension self-reload
 
 Unpacked extensions do not pick up file changes on disk automatically -- normally this requires a
@@ -774,8 +877,8 @@ earlier phases. Explicitly supplying any of these is still supported and still w
 ### Boolean argument coercion
 
 Every boolean-intent arg in this system (`args.trusted`, `args.capture_hidden`,
-`args.all_frames`, `args.wake`, `args.multi_page`, `args.active` on `tab_open`) is
-coerced with a shared, tolerant helper -- `truthy()` in
+`args.all_frames`, `args.wake`, `args.activate`, `args.multi_page`, `args.active` on
+`tab_open`) is coerced with a shared, tolerant helper -- `truthy()` in
 `src/amplifier_browser_bridge/args_bool.py` (Python side: hub/CLI) and
 `extension/args_bool.mjs` (JS side: extension) -- rather than a strict `is True`/
 `=== true` identity check. This exists because a caller-supplied value can arrive in
