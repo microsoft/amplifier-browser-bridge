@@ -23,6 +23,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from amplifier_browser_bridge import HubClient, HubError, Target
+from amplifier_browser_bridge.vision import VisionConfigError, VisionError
+from amplifier_browser_bridge.vision_read import vision_read
 from amplifier_core import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -104,7 +106,16 @@ def _target(input_data: dict[str, Any]) -> Target:
 async def _command(
     command: str, args_fn: Callable[[dict[str, Any]], dict[str, Any]], input_data: dict[str, Any]
 ) -> dict[str, Any]:
-    return await _client().command(_target(input_data), command, args_fn(input_data))
+    args = args_fn(input_data)
+    # `timeout_s`, if the caller supplied one, overrides the hub's default
+    # device-round-trip wait for just this call (see hub.py's
+    # DEFAULT_COMMAND_TIMEOUT / protocol.py's HUB_ONLY_ARGS) -- surfaced
+    # uniformly here rather than in every individual args_fn, since it applies
+    # identically to every tab-targeting command. See `_TAB_TARGET_PROPS`.
+    timeout_s = input_data.get("timeout_s")
+    if timeout_s is not None:
+        args = {**args, "timeout_s": timeout_s}
+    return await _client().command(_target(input_data), command, args)
 
 
 def _no_args(_input_data: dict[str, Any]) -> dict[str, Any]:
@@ -122,6 +133,14 @@ _TAB_TARGET_PROPS = {
     **_DEVICE_ID_PROP,
     "tab_id": {"type": "integer", "description": "Tab id, from browser_tabs."},
     "window_id": {"type": "integer", "description": "Optional window id (disambiguates reused tab ids)."},
+    "timeout_s": {
+        "type": "number",
+        "description": (
+            "Optional override of the hub's default device-round-trip wait, in seconds, for this "
+            "command only -- useful for a heavy/slow-hydrating page (see docs/PROTOCOL.md's "
+            "'Command timeout' section)."
+        ),
+    },
 }
 
 
@@ -144,6 +163,12 @@ def _build_tools() -> list[_HubTool]:
             "tab_open",
             {"url": input_data.get("url", "about:blank"), "active": input_data.get("active", False)},
         )
+
+    async def reload_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        return await _client().command(Target(device_id=input_data["device_id"]), "reload", {})
+
+    def read_or_snapshot_args(input_data: dict[str, Any]) -> dict[str, Any]:
+        return {"wake": True} if input_data.get("wake") else {}
 
     def click_args(input_data: dict[str, Any]) -> dict[str, Any]:
         return {"ref": input_data["ref"]}
@@ -169,6 +194,76 @@ def _build_tools() -> list[_HubTool]:
     def wait_text_args(input_data: dict[str, Any]) -> dict[str, Any]:
         return {"text": input_data["text"], "timeout_ms": input_data.get("timeout_ms", 10000)}
 
+    async def fetch_bytes_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        args: dict[str, Any] = {"url": input_data["url"]}
+        if input_data.get("max_bytes") is not None:
+            args["max_bytes"] = input_data["max_bytes"]
+        return await _client().command(Target(device_id=input_data["device_id"]), "fetch_bytes", args)
+
+    async def downloads_list_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        return await _client().command(
+            Target(device_id=input_data["device_id"]),
+            "downloads_list",
+            {"limit": input_data.get("limit", 20)},
+        )
+
+    async def download_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        args: dict[str, Any] = {"url": input_data["url"]}
+        if input_data.get("filename") is not None:
+            args["filename"] = input_data["filename"]
+        return await _client().command(Target(device_id=input_data["device_id"]), "download", args)
+
+    async def wait_download_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        if input_data.get("download_id") is None and input_data.get("since_id") is None:
+            return {"ok": False, "error": "browser_wait_download requires download_id or since_id"}
+        args: dict[str, Any] = {"timeout_ms": input_data.get("timeout_ms", 30000)}
+        if input_data.get("download_id") is not None:
+            args["download_id"] = input_data["download_id"]
+        if input_data.get("since_id") is not None:
+            args["since_id"] = input_data["since_id"]
+        if input_data.get("pattern") is not None:
+            args["pattern"] = input_data["pattern"]
+        return await _client().command(Target(device_id=input_data["device_id"]), "wait_download", args)
+
+    def grab_image_args(input_data: dict[str, Any]) -> dict[str, Any]:
+        args: dict[str, Any] = {"url": input_data["url"]}
+        if input_data.get("max_bytes") is not None:
+            args["max_bytes"] = input_data["max_bytes"]
+        return args
+
+    def screenshot_args(input_data: dict[str, Any]) -> dict[str, Any]:
+        args: dict[str, Any] = {}
+        if input_data.get("capture_hidden"):
+            args["capture_hidden"] = True
+        if input_data.get("frame_id") is not None:
+            args["frame_id"] = input_data["frame_id"]
+        if input_data.get("multi_page"):
+            args["multi_page"] = True
+            args["max_pages"] = input_data.get("max_pages", 10)
+        if input_data.get("scroll_selector") is not None:
+            args["scroll_selector"] = input_data["scroll_selector"]
+        if input_data.get("page_delay_ms") is not None:
+            args["page_delay_ms"] = input_data["page_delay_ms"]
+        return args
+
+    async def vision_read_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        target = _target(input_data)
+        try:
+            return await vision_read(
+                _client(),
+                target,
+                prompt=input_data.get("prompt"),
+                frame_id=input_data.get("frame_id"),
+                multi_page=bool(input_data.get("multi_page", False)),
+                max_pages=input_data.get("max_pages"),
+                scroll_selector=input_data.get("scroll_selector"),
+                page_delay_ms=input_data.get("page_delay_ms"),
+                capture_hidden=bool(input_data.get("capture_hidden", True)),
+                timeout_s=input_data.get("timeout_s"),
+            )
+        except (VisionConfigError, VisionError) as e:
+            return {"ok": False, "error": str(e)}
+
     return [
         _HubTool(
             "browser_devices",
@@ -190,15 +285,31 @@ def _build_tools() -> list[_HubTool]:
             "browser_snapshot",
             "Accessibility-style snapshot of a tab: a tree of elements with stable `ref` ids (e.g. "
             "'e12') you can pass to browser_click/browser_type/browser_key. Refs reset on navigation "
-            "-- take a fresh snapshot after navigating. " + _QUEUE_NOTE,
-            {"type": "object", "properties": _TAB_TARGET_PROPS, "required": ["device_id", "tab_id"]},
-            lambda input_data: _command("snapshot", _no_args, input_data),
+            "-- take a fresh snapshot after navigating. At real-world scale (hundreds of tabs) Edge "
+            "discards background tabs to reclaim memory; a discarded tab fails loud naming the real "
+            "cause (check browser_tabs()'s `discarded` field). Pass wake=true to reload a discarded "
+            "tab and retry -- destroys in-page state, so opt-in only; result reports 'woke': true. "
+            + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {**_TAB_TARGET_PROPS, "wake": {"type": "boolean", "default": False}},
+                "required": ["device_id", "tab_id"],
+            },
+            lambda input_data: _command("snapshot", read_or_snapshot_args, input_data),
         ),
         _HubTool(
             "browser_read",
-            "Read the full visible text of a tab. " + _QUEUE_NOTE,
-            {"type": "object", "properties": _TAB_TARGET_PROPS, "required": ["device_id", "tab_id"]},
-            lambda input_data: _command("read", _no_args, input_data),
+            "Read the full visible text of a tab. At real-world scale (hundreds of tabs) Edge "
+            "discards background tabs to reclaim memory; a discarded tab fails loud naming the real "
+            "cause (check browser_tabs()'s `discarded` field). Pass wake=true to reload a discarded "
+            "tab and retry -- destroys in-page state, so opt-in only; result reports 'woke': true. "
+            + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {**_TAB_TARGET_PROPS, "wake": {"type": "boolean", "default": False}},
+                "required": ["device_id", "tab_id"],
+            },
+            lambda input_data: _command("read", read_or_snapshot_args, input_data),
         ),
         _HubTool(
             "browser_click",
@@ -280,6 +391,17 @@ def _build_tools() -> list[_HubTool]:
             tab_open_runner,
         ),
         _HubTool(
+            "browser_reload",
+            "Reload the extension on a device (chrome.runtime.reload()). Self-service for "
+            "unpacked-extension iteration: after updating extension/ files on the device's "
+            "machine, this picks up the change without a manual click in edge://extensions. "
+            "Note: the very first deployment of this command itself still requires one manual "
+            "reload -- an extension has to already understand `reload` before it can reload "
+            "itself into a version that understands it.",
+            {"type": "object", "properties": _DEVICE_ID_PROP, "required": ["device_id"]},
+            reload_runner,
+        ),
+        _HubTool(
             "browser_tab_close",
             "Close a tab. " + _QUEUE_NOTE,
             {"type": "object", "properties": _TAB_TARGET_PROPS, "required": ["device_id", "tab_id"]},
@@ -295,13 +417,86 @@ def _build_tools() -> list[_HubTool]:
         ),
         _HubTool(
             "browser_screenshot",
-            "Screenshot a tab. In this injection-only phase (no CDP yet), this only succeeds if the "
-            "target tab is already the active tab of a focused window -- it fails loud rather than "
-            "silently activating the tab to comply. Check browser_devices()'s "
-            "capabilities.capture_visible_tab first; on Android this is the ONLY way to see a tab, "
-            "and only ever the currently-active one (design doc section 7). " + _QUEUE_NOTE,
-            {"type": "object", "properties": _TAB_TARGET_PROPS, "required": ["device_id", "tab_id"]},
-            lambda input_data: _command("screenshot", _no_args, input_data),
+            "Screenshot a tab -- returns PIXELS (base64 + format), no model call. This is the "
+            "'return pixels' mechanism: if you (the calling agent) can see images directly, this is "
+            "the cheapest and most faithful option. If you need TEXT extracted from the image "
+            "instead (e.g. you can't process images, or want OCR'd text in context), use "
+            "browser_vision_read instead -- a distinct, explicitly different mechanism that makes a "
+            "real vision-model API call; this tool never does that. capture_hidden=true captures a "
+            "tab that is NOT the active tab of a focused window (auto-escalates to CDP; requires the "
+            "debugger capability -- check browser_devices()'s capabilities.debugger first); without "
+            "it, only the active tab of a focused window can be captured, and this fails loud rather "
+            "than silently activating the tab. frame_id crops the capture to one frame's own "
+            "on-screen region (from a prior browser_snapshot/browser_read's `frames` entries) -- "
+            "requires capture_hidden. multi_page=true scrolls and captures repeatedly (up to "
+            "max_pages, default 10, hard cap 50) until the scrollable region's end is reached -- for "
+            "content that doesn't fit one viewport (e.g. a multi-page document viewer); returns a "
+            "`pages` array plus honest `capped`/`stopped_reason` metadata (never silently returns a "
+            "partial result as if it were complete). scroll_selector targets a specific scrollable "
+            "container (CSS selector); page_delay_ms is the settle delay between scroll and capture. "
+            "On Android (no CDP), only the active tab can ever be captured. " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_TAB_TARGET_PROPS,
+                    "capture_hidden": {"type": "boolean", "default": False},
+                    "frame_id": {"type": "integer", "description": "Crop to this frame's on-screen region."},
+                    "multi_page": {"type": "boolean", "default": False},
+                    "max_pages": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Cap for multi_page (max 50).",
+                    },
+                    "scroll_selector": {"type": "string", "description": "CSS selector of scroll container."},
+                    "page_delay_ms": {
+                        "type": "integer",
+                        "description": "Settle delay between scroll and capture.",
+                    },
+                },
+                "required": ["device_id", "tab_id"],
+            },
+            lambda input_data: _command("screenshot", screenshot_args, input_data),
+        ),
+        _HubTool(
+            "browser_vision_read",
+            "Capture pixels and extract TEXT from them via a vision-capable LLM -- a real, separate "
+            "model-call mechanism, distinct from browser_screenshot (which only returns pixels and "
+            "never calls a model). Use this when the content you need was never present in the DOM "
+            "as text (e.g. a canvas-rendered document viewer, like Word/PowerPoint Online) and you "
+            "want text back rather than an image. Requires a vision provider configured via "
+            "environment variable on the machine running this hub/tool (ANTHROPIC_API_KEY / "
+            "OPENAI_API_KEY / GOOGLE_API_KEY, or ABB_VISION_PROVIDER to pin one) -- fails loud with "
+            "setup instructions ({'ok': false, 'error': ...}) if none is configured; never silently "
+            "returns empty text. capture_hidden defaults to true here (unlike browser_screenshot) -- "
+            "this tool exists specifically to reach tabs you shouldn't activate just to look at. "
+            "frame_id/multi_page/max_pages/scroll_selector/page_delay_ms mean exactly what they mean "
+            "on browser_screenshot. Returns {'ok': true, 'result': {'text': ..., 'vision_provider': "
+            "..., 'vision_model': ..., 'image_count': ..., 'page_count': ..., 'capped': ..., "
+            "'stopped_reason': ...}} on success, or the hub's own queued/error shape if the "
+            "underlying capture itself was queued or failed (the vision model is never called "
+            "without a real captured image in hand). " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_TAB_TARGET_PROPS,
+                    "prompt": {"type": "string", "description": "What to extract/ask about the image(s)."},
+                    "frame_id": {"type": "integer", "description": "Crop to this frame's on-screen region."},
+                    "multi_page": {"type": "boolean", "default": False},
+                    "max_pages": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Cap for multi_page (max 50).",
+                    },
+                    "scroll_selector": {"type": "string", "description": "CSS selector of scroll container."},
+                    "page_delay_ms": {
+                        "type": "integer",
+                        "description": "Settle delay between scroll and capture.",
+                    },
+                    "capture_hidden": {"type": "boolean", "default": True},
+                },
+                "required": ["device_id", "tab_id"],
+            },
+            vision_read_runner,
         ),
         _HubTool(
             "browser_wait_for",
@@ -332,6 +527,104 @@ def _build_tools() -> list[_HubTool]:
                 "required": ["device_id", "tab_id", "text"],
             },
             lambda input_data: _command("wait_text", wait_text_args, input_data),
+        ),
+        _HubTool(
+            "browser_fetch_bytes",
+            "Fetch a URL from the EXTENSION's own context, with credentials included -- rides the "
+            "user's real authenticated session (cookies) for the target origin. No tab_id needed. "
+            "This is the mechanism for retrieving a linked file (.docx/.pdf/binary) that a page only "
+            "links to, using the user's existing login -- distinct from browser_read/browser_snapshot, "
+            "which only ever see text already present in the DOM (a canvas-rendered document, e.g. a "
+            "Word Online viewer, has NO document text in the DOM at all -- this is the way to get its "
+            "content). Returns {url, content_type, byte_length, base64} on success. Refuses (naming the "
+            "limit) past a byte-size cap (default 25MB) -- pass max_bytes to raise it. If the target "
+            "blocks extension-context requests (some CDNs/hotlink protection check the request's "
+            "Referer/Origin), browser_grab_image fetches from the PAGE's own script context instead. "
+            + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "url": {"type": "string"},
+                    "max_bytes": {"type": "integer", "description": "Override the default byte-size cap."},
+                },
+                "required": ["device_id", "url"],
+            },
+            fetch_bytes_runner,
+        ),
+        _HubTool(
+            "browser_grab_image",
+            "Fetch a URL from the PAGE's own main-world script context (not the extension's) -- the "
+            "request carries the page's own Referer and cookie context, defeating hotlink/Referer "
+            "protection an extension-context fetch (browser_fetch_bytes) would trip. Requires a tab_id "
+            "(the page whose script context does the fetching). Use this specifically when "
+            "browser_fetch_bytes fails with an HTTP error, or you already know the target needs the "
+            "page's own session context. Returns {url, content_type, byte_length, base64} on success; "
+            "refuses (naming the limit) past a byte-size cap (default 25MB). " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_TAB_TARGET_PROPS,
+                    "url": {"type": "string"},
+                    "max_bytes": {"type": "integer", "description": "Override the default byte-size cap."},
+                },
+                "required": ["device_id", "tab_id", "url"],
+            },
+            lambda input_data: _command("grab_image", grab_image_args, input_data),
+        ),
+        _HubTool(
+            "browser_downloads_list",
+            "List recent downloads on a device (chrome.downloads.search), plus max_download_id -- the "
+            "highest download id chrome currently knows about. Call this BEFORE an action that "
+            "triggers a native/indirect download (e.g. clicking a page's own Download control) and "
+            "pass its max_download_id as browser_wait_download's since_id, so the new download is "
+            "identified without ever mistaking one the human started themselves for the agent's own. "
+            + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {**_DEVICE_ID_PROP, "limit": {"type": "integer", "default": 20}},
+                "required": ["device_id"],
+            },
+            downloads_list_runner,
+        ),
+        _HubTool(
+            "browser_download",
+            "Trigger a download of a URL directly (chrome.downloads.download) -- returns a download_id "
+            "you already know precisely, since this command started the download itself. Pass it to "
+            "browser_wait_download's download_id to poll for completion. " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "url": {"type": "string"},
+                    "filename": {"type": "string", "description": "Suggested filename for the download."},
+                },
+                "required": ["device_id", "url"],
+            },
+            download_runner,
+        ),
+        _HubTool(
+            "browser_wait_download",
+            "Poll (never sleep blindly) for a completed download. Exactly one of download_id (from a "
+            "prior browser_download call) or since_id (a baseline max_download_id from "
+            "browser_downloads_list, taken BEFORE an action that triggers an indirect download) is "
+            "required -- since_id mode never matches a download at or below the baseline, so it "
+            "structurally cannot claim a download the human started themselves. pattern (optional "
+            "regex) narrows a since_id search by filename. Returns {download_id, filename, url, mime, "
+            "byte_length, state} once complete, or an error if the download was interrupted or the "
+            "timeout_ms deadline passed first. " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "download_id": {"type": "integer"},
+                    "since_id": {"type": "integer", "description": "Baseline max_download_id."},
+                    "pattern": {"type": "string", "description": "Optional regex on the filename."},
+                    "timeout_ms": {"type": "integer", "default": 30000},
+                },
+                "required": ["device_id"],
+            },
+            wait_download_runner,
         ),
         _HubTool(
             "browser_poll",

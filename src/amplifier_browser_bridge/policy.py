@@ -524,6 +524,35 @@ class PolicyEngine:
         # cannot assert its way past a host the hub itself has already recorded.
         self._tab_hosts: dict[tuple[str, int], str] = {}
 
+        # (device_id, tab_id) -> last-observed `discarded` state, from `tabs`
+        # results (see `filter_tabs_result`). Bug 2 case study: at real-profile
+        # scale (500+ tabs), Microsoft/Azure-integrated first-party apps
+        # (SharePoint, OneDrive, internal engineering portals, ...) routinely
+        # perform a top-level, full-page OAuth redirect through
+        # `login.microsoftonline.com/.../oauth2/(v2.0/)authorize` to silently
+        # refresh a session -- normally invisible, completing in milliseconds.
+        # A BACKGROUNDED tab that Edge discards (unloads its renderer to
+        # reclaim memory) mid-round-trip freezes with that intermediate
+        # authorize URL as its last-known `url` forever -- it never gets a
+        # chance to finish redirecting back to the real app page. Verified
+        # live against a real 531-tab profile: 49 tabs, all "auth"-category,
+        # ALL on `login.microsoftonline.com` with `redirect_uri` hosts like
+        # `*.sharepoint.com`, `coreidentity.microsoft.com`,
+        # `ms.portal.azure.com`, internal `*.microsoft.com`/`eng.ms` tools,
+        # and `localhost` dev servers -- ordinary content tabs, not live
+        # credential-entry screens (see docs/POLICY.md and
+        # docs/ISSUE_CASE_STUDIES-equivalent narrative in this repo's PR
+        # history for the full investigation).
+        #
+        # A DISCARDED tab has no live renderer -- nothing is being displayed
+        # to the user right now, so the specific risk the `auth` category
+        # exists to prevent ("the agent reads a live credential-entry
+        # screen") does not apply. `financial`/`healthcare`/
+        # `password_managers` are NOT given this exception: their rationale
+        # is not renderer-liveness, it's not-revealing-which-services-the-
+        # user-uses-at-all, which holds regardless of discard state.
+        self._tab_discarded: dict[tuple[str, int], bool] = {}
+
         # (device_id, tab_id) -> {"url": <url at capture time>, "nodes": {ref:
         # {"label", "tag", "input_type"}}}. Fed by `note_snapshot` (a full
         # `snapshot` result) and `note_ref` (a single resolved `wait_for`
@@ -545,6 +574,16 @@ class PolicyEngine:
         if tab_id is None or not url:
             return
         self._tab_hosts[(device_id, tab_id)] = url
+
+    def note_tab_discarded(self, device_id: str, tab_id: int | None, discarded: bool | None) -> None:
+        """Record the hub's own observation of a tab's `discarded` state, from
+        a `tabs` result (see `filter_tabs_result`, and background.js's
+        `listTabs()`). Used only to narrow the `auth` denylist category's
+        invisibility guarantee -- see this class's `__init__` docstring for
+        `_tab_discarded` for the full case-study reasoning."""
+        if tab_id is None or discarded is None:
+            return
+        self._tab_discarded[(device_id, tab_id)] = bool(discarded)
 
     def note_snapshot(
         self, device_id: str, tab_id: int | None, url: str | None, nodes: list[dict[str, Any]]
@@ -622,16 +661,54 @@ class PolicyEngine:
         for tab in tabs:
             tab_id = tab.get("tab_id")
             url = tab.get("url")
+            discarded = tab.get("discarded") if isinstance(tab.get("discarded"), bool) else None
             if isinstance(tab_id, int):
                 self.note_tab_url(device_id, tab_id, url)
+                self.note_tab_discarded(device_id, tab_id, discarded)
             host = host_of(url) if isinstance(url, str) else None
             deny_hit = self.denylist.match(host)
             if deny_hit is not None:
+                category, matched_domain = deny_hit
+                if category == "auth" and discarded:
+                    # Bug 2 case study (see `_tab_discarded`'s docstring in
+                    # __init__): a discarded tab has no live renderer, so the
+                    # `auth` category's actual rationale ("don't let the
+                    # agent read a LIVE credential-entry screen") does not
+                    # apply -- most commonly this is a background tab frozen
+                    # mid-way through a first-party app's silent OAuth
+                    # session-refresh redirect through this host, not a real
+                    # login prompt. Shown, not hidden -- but still fully
+                    # audited, and still subject to `evaluate()`'s own
+                    # discarded-aware exception (which additionally requires
+                    # an explicit `wake=true` at the extension layer -- see
+                    # background.js's `ensureAwake()` -- before any content
+                    # is actually read).
+                    self._audit.record(
+                        "policy_tab_shown_despite_match",
+                        device_id=device_id,
+                        tab_id=tab_id,
+                        category=category,
+                        matched_domain=matched_domain,
+                        host=host,
+                        reason="discarded_auth_tab",
+                    )
+                    visible.append(tab)
+                    continue
+                # Full detail here -- category, matched rule, and the actual
+                # host -- is the compensating control this project relies on
+                # for broad-by-default access (design doc §6.2, docs/POLICY.md
+                # §6). Previously this recorded `category` only, which is why
+                # the audit log could not explain what was hidden or why (Bug
+                # 2 requirement 3). Safe to log in full: the audit log is for
+                # the human who owns the browser, not the agent -- the
+                # agent-facing DENY_REASON stays generic (see `evaluate()`).
                 self._audit.record(
                     "policy_tab_hidden",
                     device_id=device_id,
                     tab_id=tab_id,
-                    category=deny_hit[0],
+                    category=category,
+                    matched_domain=matched_domain,
+                    host=host,
                 )
                 continue
             visible.append(tab)
@@ -661,15 +738,38 @@ class PolicyEngine:
         deny_hit = self.denylist.match(host)
         if deny_hit is not None:
             category, domain = deny_hit
-            self._audit.record(
-                "policy_denied",
-                device_id=target.device_id,
-                tab_id=target.tab_id,
-                command=command,
-                category=category,
-                matched_domain=domain,
+            is_discarded = (
+                target.tab_id is not None
+                and self._tab_discarded.get((target.device_id, target.tab_id)) is True
             )
-            return PolicyDecision(status="deny", reason=DENY_REASON, category=category)
+            if category == "auth" and is_discarded:
+                # Symmetric with `filter_tabs_result`'s exception -- see
+                # `_tab_discarded`'s docstring in __init__ for the full case
+                # study. This does NOT bypass Bug 1's own fail-loud discarded-
+                # tab check (background.js's `ensureAwake()`): the command
+                # still reaches the device, which still refuses to act on a
+                # discarded tab unless the caller explicitly passed
+                # `wake=true`. This only stops the HUB from blocking the
+                # attempt before it gets that far.
+                self._audit.record(
+                    "policy_allowed_despite_match",
+                    device_id=target.device_id,
+                    tab_id=target.tab_id,
+                    command=command,
+                    category=category,
+                    matched_domain=domain,
+                    reason="discarded_auth_tab",
+                )
+            else:
+                self._audit.record(
+                    "policy_denied",
+                    device_id=target.device_id,
+                    tab_id=target.tab_id,
+                    command=command,
+                    category=category,
+                    matched_domain=domain,
+                )
+                return PolicyDecision(status="deny", reason=DENY_REASON, category=category)
 
         if not skip_gate:
             label = args.get("label") if isinstance(args.get("label"), str) else None

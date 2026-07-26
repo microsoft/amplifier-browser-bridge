@@ -96,9 +96,16 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_tab_close",
         "browser_tab_activate",
         "browser_screenshot",
+        "browser_vision_read",
         "browser_wait_for",
         "browser_wait_text",
         "browser_poll",
+        "browser_reload",
+        "browser_fetch_bytes",
+        "browser_grab_image",
+        "browser_downloads_list",
+        "browser_download",
+        "browser_wait_download",
     }
     assert names == expected
 
@@ -210,6 +217,90 @@ async def test_hub_error_surfaces_as_adapter_failure(monkeypatch: pytest.MonkeyP
 
     assert result.success is False
     assert "unauthorized" in str(result.output)
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_maps_capture_hidden_and_frame_id(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"ok": True, "result": {"tab_id": 7, "base64": "abc"}})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_screenshot")
+    await tool.execute({"device_id": "d1", "tab_id": 7, "capture_hidden": True, "frame_id": 862})
+
+    _, command, args = fake.command_calls[0]
+    assert command == "screenshot"
+    assert args == {"capture_hidden": True, "frame_id": 862}
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_multi_page_defaults_max_pages(monkeypatch: pytest.MonkeyPatch):
+    fake = _FakeHubClient({"ok": True, "result": {"tab_id": 7, "pages": []}})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_screenshot")
+    await tool.execute({"device_id": "d1", "tab_id": 7, "multi_page": True})
+
+    _, _, args = fake.command_calls[0]
+    assert args == {"multi_page": True, "max_pages": 10}
+
+
+@pytest.mark.asyncio
+async def test_browser_vision_read_composes_screenshot_and_extraction(monkeypatch: pytest.MonkeyPatch):
+    import base64
+
+    raw = b"\xff\xd8\xfake-jpeg"
+    b64 = base64.b64encode(raw).decode("ascii")
+    fake = _FakeHubClient(
+        {"ok": True, "result": {"tab_id": 7, "format": "jpeg", "base64": b64, "via": "cdp"}}
+    )
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    async def _fake_extract_text(images, prompt, **kwargs):
+        return {"text": "hi", "provider": "anthropic", "model": "claude-3-5-sonnet-latest", "image_count": 1}
+
+    monkeypatch.setattr("amplifier_browser_bridge.vision_read.extract_text", _fake_extract_text)
+
+    tool = _tool_by_name("browser_vision_read")
+    result = await tool.execute({"device_id": "d1", "tab_id": 7, "prompt": "read this"})
+    output = result.output
+
+    assert result.success is True
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    assert output["result"]["text"] == "hi"
+    _, command, args = fake.command_calls[0]
+    assert command == "screenshot"
+    assert args["capture_hidden"] is True  # vision_read defaults capture_hidden=True
+
+
+@pytest.mark.asyncio
+async def test_browser_vision_read_config_error_returns_ok_false_not_adapter_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import base64
+
+    from amplifier_browser_bridge.vision import VisionConfigError
+
+    b64 = base64.b64encode(b"\xff\xd8\xfake-jpeg").decode("ascii")
+    fake = _FakeHubClient({"ok": True, "result": {"tab_id": 7, "format": "jpeg", "base64": b64}})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    async def _raise(*a, **k):
+        raise VisionConfigError("No vision provider is configured -- set ANTHROPIC_API_KEY, ...")
+
+    monkeypatch.setattr("amplifier_browser_bridge.vision_read.extract_text", _raise)
+
+    tool = _tool_by_name("browser_vision_read")
+    result = await tool.execute({"device_id": "d1", "tab_id": 7})
+    output = result.output
+
+    # VisionConfigError is caught INSIDE vision_read's composition path in the
+    # Amplifier tool module's runner -- this is legitimate data (a config
+    # problem the agent should read and act on), not an adapter-level failure.
+    assert result.success is True
+    assert isinstance(output, dict)
+    assert output["ok"] is False
+    assert "No vision provider is configured" in output["error"]
 
 
 def test_client_uses_env_configured_hub_url(monkeypatch: pytest.MonkeyPatch):
