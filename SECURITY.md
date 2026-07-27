@@ -77,7 +77,7 @@ Tailnet identity is per-*device*, not per-*application* -- any other process or 
 running on an authorized device shares that device's tailnet identity. The per-device shared
 token (`docs/PROTOCOL.md`, "Authentication") exists specifically to narrow that gap. Auth is
 **disabled by default in local development** (loudly logged as such -- see `auth.py`); running
-a hub reachable from more than one device without setting `ABB_HUB_TOKEN` means anything on the
+a hub reachable from more than one device without setting `AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN` means anything on the
 tailnet that can reach the port can issue commands to every connected browser. This is documented
 behavior, not a bug, but it is exactly the kind of misconfiguration worth flagging if you find a
 deployment relying on it.

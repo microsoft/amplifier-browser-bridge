@@ -19,7 +19,7 @@ your request:
 - New command in the existing vocabulary (`docs/PROTOCOL.md`), or something the vocabulary can't
   express today?
 - Does it need a new agent-surface tool (`browser_*` in `docs/AGENT_SURFACES.md`), or is it
-  reachable through the existing `abb cmd` escape hatch?
+  reachable through the existing `amplifier-browser-bridge cmd` escape hatch?
 - Does it interact with the policy engine (`docs/POLICY.md`) -- e.g. should it be gated as an
   irreversible action, or excluded from the denylist for some reason?
 - Does it depend on `chrome.debugger`/CDP (Phase 6, not yet built) -- e.g. trusted input events

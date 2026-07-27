@@ -30,8 +30,8 @@ def test_resolve_provider_fails_loud_with_no_keys_configured(monkeypatch: pytest
         "GOOGLE_API_KEY",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
-        "ABB_VISION_PROVIDER",
-        "ABB_VISION_MODEL",
+        "AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER",
+        "AMPLIFIER_BROWSER_BRIDGE_VISION_MODEL",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -45,7 +45,7 @@ def test_resolve_provider_fails_loud_with_no_keys_configured(monkeypatch: pytest
 
 
 def test_resolve_provider_picks_first_configured_in_priority_order(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ABB_VISION_PROVIDER", raising=False)
+    monkeypatch.delenv("AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
@@ -59,7 +59,7 @@ def test_resolve_provider_picks_first_configured_in_priority_order(monkeypatch: 
 def test_resolve_provider_override_pins_a_specific_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "google-test")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-test")
-    monkeypatch.setenv("ABB_VISION_PROVIDER", "openai")
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER", "openai")
 
     cfg = resolve_provider()
 
@@ -69,7 +69,7 @@ def test_resolve_provider_override_pins_a_specific_provider(monkeypatch: pytest.
 
 def test_resolve_provider_override_without_matching_key_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv("ABB_VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER", "anthropic")
 
     with pytest.raises(VisionConfigError) as exc_info:
         resolve_provider()
@@ -79,7 +79,7 @@ def test_resolve_provider_override_without_matching_key_fails_loud(monkeypatch: 
 def test_resolve_provider_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    monkeypatch.setenv("ABB_VISION_MODEL", "claude-custom-model")
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_VISION_MODEL", "claude-custom-model")
 
     cfg = resolve_provider()
 

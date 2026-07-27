@@ -1,7 +1,7 @@
 // injected.js -- shared command-execution utilities, running in the PAGE's isolated
 // world. Injected via chrome.scripting.executeScript({files: ['injected.js']}) before
 // every page-world command dispatch. Idempotent: re-injection on an already-instrumented
-// page is a safe no-op, because everything is guarded behind `if (!window.__abb)`.
+// page is a safe no-op, because everything is guarded behind `if (!window.__amplifierBrowserBridge)`.
 //
 // This is the ONE shared implementation of shadow-DOM-piercing traversal, element-ref
 // bookkeeping, and per-command logic. The reference implementation this project
@@ -9,12 +9,12 @@
 // scripts; this file exists so there is exactly one copy, everywhere.
 //
 // Element refs are stable only within the lifetime of this object -- i.e. within one
-// page load. A navigation destroys `window.__abb` along with the rest of the page's
+// page load. A navigation destroys `window.__amplifierBrowserBridge` along with the rest of the page's
 // JS context, so refs from a prior snapshot are correctly treated as gone (design doc
 // §6.1: "Element refs are stable within a snapshot").
 
-if (!window.__abb) {
-  window.__abb = (() => {
+if (!window.__amplifierBrowserBridge) {
+  window.__amplifierBrowserBridge = (() => {
     let refCounter = 0;
     const refToElement = new Map(); // ref string -> Element
     const elementToRef = new WeakMap(); // Element -> ref string
@@ -26,7 +26,7 @@ if (!window.__abb) {
     // module docstring for the full rationale and for why this is a hand-synced
     // copy rather than an import (injected.js is loaded as a classic script via
     // chrome.scripting.executeScript({files:...}), which cannot use `import`,
-    // and `window.__abb` must be synchronously ready the instant injection
+    // and `window.__amplifierBrowserBridge` must be synchronously ready the instant injection
     // completes -- a dynamic import would race background.js's very next
     // executeScript call). Keep the two in sync by hand, same discipline
     // CONTRIBUTING.md documents for protocol.py/background.js.
@@ -333,7 +333,7 @@ if (!window.__abb) {
       // `nodes` are frame-local too (background.js qualifies them with this
       // frame's frameId when combining results from allFrames:true -- see
       // frame_refs.js and background.js's combineSnapshot()). `generation` is
-      // this frame's OWN counter (each frame gets its own window.__abb) --
+      // this frame's OWN counter (each frame gets its own window.__amplifierBrowserBridge) --
       // background.js surfaces it per-node/per-frame in the wire result so a
       // superseded ref fails loud instead of silently resolving (Bug 1).
       return {
@@ -392,11 +392,11 @@ if (!window.__abb) {
         // frame's InjectionResult with `result: undefined` instead (measured
         // live: a bogus AND a stale ref both produced `{ok: true, result:
         // null}` before this fix, for exactly this reason). Returning an
-        // explicit `{__abbError}` sentinel is the only way the real message
+        // explicit `{__amplifierBrowserBridgeError}` sentinel is the only way the real message
         // (e.g. "stale ref: ...") survives the executeScript boundary --
-        // background.js's unwrapAbbResult() converts this back into a real
+        // background.js's unwrapAmplifierBrowserBridgeResult() converts this back into a real
         // thrown Error on the extension side. See background.js's cdpClick().
-        return { __abbError: String((err && err.message) || err) };
+        return { __amplifierBrowserBridgeError: String((err && err.message) || err) };
       }
     }
 
@@ -410,7 +410,7 @@ if (!window.__abb) {
         el.focus();
         return { ref };
       } catch (err) {
-        return { __abbError: String((err && err.message) || err) };
+        return { __amplifierBrowserBridgeError: String((err && err.message) || err) };
       }
     }
 
@@ -498,8 +498,8 @@ if (!window.__abb) {
       // bogus one) produced `{ok: true, result: null}` on the wire -- the
       // exact silent-success failure mode this bug is about -- because
       // resolveRef() threw here, but nothing on the extension side ever saw
-      // it. Catching here and returning an explicit `{__abbError}` sentinel
-      // is what lets background.js's unwrapAbbResult() (see its own comment)
+      // it. Catching here and returning an explicit `{__amplifierBrowserBridgeError}` sentinel
+      // is what lets background.js's unwrapAmplifierBrowserBridgeResult() (see its own comment)
       // turn this back into a real `{ok: false, error: ...}` for the caller.
       try {
         switch (command) {
@@ -529,7 +529,7 @@ if (!window.__abb) {
             throw new Error(`unsupported page-world command: ${command}`);
         }
       } catch (err) {
-        return { __abbError: String((err && err.message) || err) };
+        return { __amplifierBrowserBridgeError: String((err && err.message) || err) };
       }
     }
 

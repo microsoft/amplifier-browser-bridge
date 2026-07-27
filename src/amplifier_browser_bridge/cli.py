@@ -1,4 +1,4 @@
-"""abb -- thin CLI adapter over the amplifier_browser_bridge library.
+"""amplifier-browser-bridge -- thin CLI adapter over the amplifier_browser_bridge library.
 
 All logic lives in the lib (hub.py, client.py, addressing.py, ...). This module only
 parses argv, builds a Target/HubClient, prints JSON, and translates library exceptions
@@ -25,14 +25,15 @@ from .auth import extract_token_value, find_sibling_token_files, load_token_stor
 from .client import HubClient, HubError
 from .doctor import run_doctor
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
+from .legacy_env import warn_legacy_env_vars
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
 from .setup import DEFAULT_STAGE_DIR, ExtensionSourceNotFoundError, ensure_token_file, stage_extension
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
-DEFAULT_HUB_URL = os.environ.get("ABB_HUB_URL", "ws://127.0.0.1:8900/agent")
-DEFAULT_TOKEN = os.environ.get("ABB_TOKEN")
+DEFAULT_HUB_URL = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://127.0.0.1:8900/agent")
+DEFAULT_TOKEN = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
 
 
 def _client() -> HubClient:
@@ -76,7 +77,7 @@ SESSION_OPTION = click.option(
     "session_id",
     default=None,
     help=(
-        "Session id from a prior `abb session-establish` call. If given, the hub enforces "
+        "Session id from a prior `amplifier-browser-bridge session-establish` call. If given, the hub enforces "
         "that session's declared write scope against this command before it reaches the "
         "device. Omit for the existing, fully-permissive default."
     ),
@@ -97,7 +98,7 @@ TIMEOUT_OPTION = click.option(
     default=None,
     help=(
         "Override the hub's device-round-trip wait (seconds) for this command only. "
-        "Default: the hub's configured command-timeout (see `abb hub --command-timeout`, "
+        "Default: the hub's configured command-timeout (see `amplifier-browser-bridge hub --command-timeout`, "
         "120s out of the box). Real heavy SPAs have been observed needing more than the "
         "old fixed 30s default even once the tab reports status=complete."
     ),
@@ -106,13 +107,18 @@ TIMEOUT_OPTION = click.option(
 
 @click.group()
 def main() -> None:
-    """abb -- Amplifier Browser Bridge CLI.
+    """amplifier-browser-bridge -- Amplifier Browser Bridge CLI.
 
     Target strings address a command: `device_id`, `device_id/tab_id`, or
     `device_id/window_id/tab_id`, optionally with a trailing `#ref`.
-    Configure the hub via ABB_HUB_URL (default ws://127.0.0.1:8900/agent) and
-    ABB_TOKEN (if the hub has auth enabled).
+    Configure the hub via AMPLIFIER_BROWSER_BRIDGE_HUB_URL (default ws://127.0.0.1:8900/agent) and
+    AMPLIFIER_BROWSER_BRIDGE_TOKEN (if the hub has auth enabled).
     """
+    # Checked before any subcommand logic runs, so a leftover ABB_* variable
+    # (from before this project dropped the acronym) produces this legible
+    # message instead of a confusing downstream default/error several layers
+    # in -- see legacy_env.py's module docstring and MIGRATION.md.
+    warn_legacy_env_vars()
 
 
 @main.command()
@@ -260,7 +266,7 @@ def confirm(confirmation_token: str) -> None:
     (`Hub._handle_agent_confirm`) that an agent's own `confirm` call reaches
     -- running this command is out-of-band with respect to the *protocol*,
     not with respect to the *host*. An agent with a shell on this machine can
-    run `abb confirm <token>` itself; this command grants no protection
+    run `amplifier-browser-bridge confirm <token>` itself; this command grants no protection
     against that.
 
     It can ONLY redeem a confirmation whose session declared `redeem:
@@ -277,7 +283,7 @@ def confirm(confirmation_token: str) -> None:
     human-in-the-loop approval. There is no such substitute in this system
     right now -- if an action must not happen unattended, the way to prevent
     it today is to not grant it in the session's write scope
-    (`abb session-establish --write ...`), not to rely on a gate firing.
+    (`amplifier-browser-bridge session-establish --write ...`), not to rely on a gate firing.
     """
     try:
         result = asyncio.run(_client().confirm(confirmation_token))
@@ -409,7 +415,9 @@ def _save_screenshot_bytes(result: dict[str, Any], out_path: str | None) -> dict
     stem = (
         Path(out_path)
         if out_path
-        else Path(f"{os.environ.get('TMPDIR', '/tmp')}/abb-screenshot-{int(time.time() * 1000)}")
+        else Path(
+            f"{os.environ.get('TMPDIR', '/tmp')}/amplifier-browser-bridge-screenshot-{int(time.time() * 1000)}"
+        )
     )
     ext = ".jpg" if result.get("format", "jpeg") == "jpeg" else f".{result.get('format', 'jpeg')}"
 
@@ -477,7 +485,7 @@ def vision_read_cmd(
     Distinct from `screenshot` (pixels only, no model call) -- use this when the content you
     need was never in the DOM as text (e.g. a canvas-rendered document viewer) and you want
     text back, not an image. Requires a vision provider configured via environment variable
-    (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, or ABB_VISION_PROVIDER to pin one) --
+    (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, or AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to pin one) --
     fails loud with setup instructions if none is configured.
     """
     try:
@@ -595,13 +603,13 @@ def session_establish(
     """Create a new session with a caller-declared write scope
     (docs/designs/confirmation-gate.md, Candidate C). Prints the new
     session_id -- pass it via --session on click/type/navigate/cmd to
-    enforce this scope, or as the first argument to `abb session-narrow` to
+    enforce this scope, or as the first argument to `amplifier-browser-bridge session-narrow` to
     shrink it further later.
 
     The hub ALWAYS mints a fresh session_id and never accepts one you
     supply -- this is what stops re-running this command from silently
     resetting an EXISTING session's scope back to broad. To change an
-    existing session, use `abb session-narrow` instead, which can only ever
+    existing session, use `amplifier-browser-bridge session-narrow` instead, which can only ever
     narrow, never widen.
     """
     read_scope = "*" if read == "*" else [o.strip() for o in read.split(",") if o.strip()]
@@ -685,7 +693,7 @@ def policy_explain(url_or_host: str) -> None:
     """Test a URL (or bare hostname) against the CURRENT denylist, without touching the hub.
 
     Answers "would this be hidden, and why?" directly -- see docs/POLICY.md. Loads the
-    denylist the same way the hub does (ABB_POLICY_FILE / conventional path / built-in
+    denylist the same way the hub does (AMPLIFIER_BROWSER_BRIDGE_POLICY_FILE / conventional path / built-in
     defaults), so this reflects exactly what a running hub would decide.
     """
     denylist = Denylist.load()
@@ -710,7 +718,7 @@ def policy_explain(url_or_host: str) -> None:
 @click.option(
     "--audit-log",
     default=None,
-    help="Path to the JSONL audit log (default: $ABB_AUDIT_LOG or ./abb-audit.jsonl).",
+    help="Path to the JSONL audit log (default: $AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG or ./amplifier-browser-bridge-audit.jsonl).",
 )
 def policy_summary(audit_log: str | None) -> None:
     """Summarize denylist activity from the audit log: counts by category and by matched
@@ -718,7 +726,10 @@ def policy_summary(audit_log: str | None) -> None:
     docs/POLICY.md). Covers both `policy_tab_hidden` (tabs listing) and `policy_denied`
     (a command explicitly targeting a denylisted tab) events.
     """
-    path = Path(audit_log or os.environ.get("ABB_AUDIT_LOG", "./abb-audit.jsonl")).expanduser()
+    path = Path(
+        audit_log
+        or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG", "./amplifier-browser-bridge-audit.jsonl")
+    ).expanduser()
     if not path.is_file():
         raise click.ClickException(f"audit log not found: {path}")
 
@@ -768,7 +779,7 @@ def policy_summary(audit_log: str | None) -> None:
 @click.option(
     "--audit-log",
     default=None,
-    help="Path to the JSONL audit log (default: $ABB_AUDIT_LOG or ./abb-audit.jsonl).",
+    help="Path to the JSONL audit log (default: $AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG or ./amplifier-browser-bridge-audit.jsonl).",
 )
 def gate_summary(audit_log: str | None) -> None:
     """Summarize CONFIRMATION GATE activity from the audit log (FIX 4, product review panel).
@@ -787,7 +798,10 @@ def gate_summary(audit_log: str | None) -> None:
     `policy_confirmed`, `policy_confirmation_expired`, `policy_confirmation_wrong_channel`, and
     `policy_scope_denied` events -- see audit.py's module docstring for the full event table.
     """
-    path = Path(audit_log or os.environ.get("ABB_AUDIT_LOG", "./abb-audit.jsonl")).expanduser()
+    path = Path(
+        audit_log
+        or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG", "./amplifier-browser-bridge-audit.jsonl")
+    ).expanduser()
     if not path.is_file():
         raise click.ClickException(f"audit log not found: {path}")
 
@@ -982,7 +996,7 @@ def reload(device: str) -> None:
     default=None,
     help=f"Directory to stage the extension into (default: {DEFAULT_STAGE_DIR}). Stable across "
     "re-runs -- an unpacked extension's identity (and its chrome.storage.local config) is tied "
-    "to this exact path, so re-running `abb init` after a `git pull` overwrites the JS/HTML/"
+    "to this exact path, so re-running `amplifier-browser-bridge init` after a `git pull` overwrites the JS/HTML/"
     "manifest files here WITHOUT disturbing a previously-configured token/hub-url.",
 )
 @click.option("--token-file", default=None, help="Path to the hub token file (see auth.py docstring).")
@@ -994,25 +1008,28 @@ def reload(device: str) -> None:
     "requires re-pasting it into the extension's options page afterward.",
 )
 @click.option(
-    "--hub-host", default="0.0.0.0", show_default=True, help="Host to print in the printed `abb hub` command."
+    "--hub-host",
+    default="0.0.0.0",
+    show_default=True,
+    help="Host to print in the printed `amplifier-browser-bridge hub` command.",
 )
 @click.option(
     "--hub-port",
     default=DEFAULT_PORT,
     show_default=True,
-    help="Port to print in the printed `abb hub` command.",
+    help="Port to print in the printed `amplifier-browser-bridge hub` command.",
 )
 def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -> None:
     """Print a loud warning if a file that looks like ANOTHER token store sits next
-    to the one `abb init` just wrote/reused, holding a different value.
+    to the one `amplifier-browser-bridge init` just wrote/reused, holding a different value.
 
     This is the concrete failure mode that made "Reusing existing hub token" a lie
-    in practice: the message was true of the file `abb init` actually uses, while an
+    in practice: the message was true of the file `amplifier-browser-bridge init` actually uses, while an
     unrelated file (hand-created, or left over from before this project settled on
     `tokens.json`) sat right beside it, never consulted, holding a token a user might
     reasonably have pasted into the extension instead of the real one. Surfacing
     this HERE -- at the point of first friction -- catches it before a confusing
-    auth failure three commands later (`abb doctor` repeats this same check).
+    auth failure three commands later (`amplifier-browser-bridge doctor` repeats this same check).
     """
     divergent = [
         (path, value)
@@ -1024,7 +1041,7 @@ def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -
         return
     click.echo("")
     click.echo(
-        "WARNING: found other token-like file(s) that abb does NOT read, holding a "
+        "WARNING: found other token-like file(s) that amplifier-browser-bridge does NOT read, holding a "
         "DIFFERENT value than the token above:"
     )
     for path, value in divergent:
@@ -1071,7 +1088,9 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, h
     click.echo("Remaining steps (manual -- Edge has no CLI for these):")
     click.echo("")
     click.echo("  1. Start the hub:")
-    click.echo(f"       ABB_TOKEN_FILE={token_result.token_file} abb hub --host {hub_host} --port {hub_port}")
+    click.echo(
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge hub --host {hub_host} --port {hub_port}"
+    )
     click.echo("")
     click.echo("  2. Load the extension:")
     click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
@@ -1084,16 +1103,18 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, h
     click.echo("       Click Save.")
     click.echo("")
     click.echo("  4. Confirm it worked:")
-    click.echo(f"       ABB_TOKEN={token_result.token} abb doctor --hub-url ws://127.0.0.1:{hub_port}/agent")
+    click.echo(
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:{hub_port}/agent"
+    )
 
 
 @main.command()
 @click.option(
     "--hub-url",
     default=None,
-    help="Hub agent-route URL to check (default: $ABB_HUB_URL or ws://127.0.0.1:8900/agent).",
+    help="Hub agent-route URL to check (default: $AMPLIFIER_BROWSER_BRIDGE_HUB_URL or ws://127.0.0.1:8900/agent).",
 )
-@click.option("--token", default=None, help="Token to check (default: $ABB_TOKEN).")
+@click.option("--token", default=None, help="Token to check (default: $AMPLIFIER_BROWSER_BRIDGE_TOKEN).")
 @click.option("--token-file", default=None, help="Path to the hub's token file, for the local-only checks.")
 def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> None:
     """Diagnose the setup chain: token file, hub reachability, token match, device connected.
@@ -1122,7 +1143,11 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
 @click.option("--host", default="0.0.0.0", show_default=True)
 @click.option("--port", default=DEFAULT_PORT, show_default=True)
 @click.option("--token-file", default=None, help="Path to a token JSON file (see auth.py docstring).")
-@click.option("--audit-log", default=None, help="Path to the JSONL audit log (default: ./abb-audit.jsonl).")
+@click.option(
+    "--audit-log",
+    default=None,
+    help="Path to the JSONL audit log (default: ./amplifier-browser-bridge-audit.jsonl).",
+)
 @click.option(
     "--command-timeout",
     type=float,
@@ -1137,7 +1162,9 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
 def hub(host: str, port: int, token_file: str | None, audit_log: str | None, command_timeout: float) -> None:
     """Run the hub: device registry, per-device command queue, routing, audit log."""
     token_store = load_token_store(token_file)
-    audit_path = audit_log or os.environ.get("ABB_AUDIT_LOG", "./abb-audit.jsonl")
+    audit_path = audit_log or os.environ.get(
+        "AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG", "./amplifier-browser-bridge-audit.jsonl"
+    )
     hub_instance = Hub(
         token_store=token_store, audit_log=AuditLog(audit_path), command_timeout=command_timeout
     )

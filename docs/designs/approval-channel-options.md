@@ -132,7 +132,7 @@ channel without them, the channel is decoration.
 | # | Prerequisite | Current state | Why it is load-bearing |
 |---|---|---|---|
 | **P1** | `PendingConfirmation` must record the token's `redeem` mode, and `_handle_agent_confirm` must refuse an `out_of_band` token on the `/agent` route. | **Missing.** `PendingConfirmation` (`policy.py:486`) has no `redeem` field; `redeem` is computed from `scope.redeem` into `PolicyDecision` and put on the wire (`hub.py:827`), then never consulted again. | Without it, `redeem: "out_of_band"` is advisory text in a JSON response. The agent redeems on `/agent` regardless. **Every candidate below is worthless until this is fixed.** |
-| **P2** | The approver credential must be a *different secret* from `ABB_HUB_TOKEN`. | **Missing.** One `TokenStore` default token validates both the `/device` `hello` and every `/agent` request (`auth.py:38`). | If the approval endpoint accepts the hub token, the agent — which must hold the hub token to send commands at all — holds the approver credential too. |
+| **P2** | The approver credential must be a *different secret* from `AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN`. | **Missing.** One `TokenStore` default token validates both the `/device` `hello` and every `/agent` request (`auth.py:38`). | If the approval endpoint accepts the hub token, the agent — which must hold the hub token to send commands at all — holds the approver credential too. |
 | **P3** | The agent must not be able to drive the approval surface with the browser it already controls. | **Not considered anywhere.** See §2.2. | This is the attack specific to *this* system. It would not be a flaw in any other product. |
 | **P4** | Pending approvals are in-memory (`policy.py:629`, `self._confirmations`) and die on hub restart. | True today; tolerable at the current 300s TTL, less tolerable at the longer TTL §5.1 argues for. | A human who taps Approve after a hub restart gets an unexplained failure. Either persist, or say so honestly in the docs. |
 
@@ -149,7 +149,7 @@ Assume the driving model is prompt-injected through page content. It has:
 
 1. **The hub token.** It must, to issue any command.
 2. **A shell on the agent host,** in the normal Amplifier configuration. This is the fact that
-   reorders the candidate list. A model with `bash` on the hub host can run `abb approve <token>`,
+   reorders the candidate list. A model with `bash` on the hub host can run `amplifier-browser-bridge approve <token>`,
    read `~/.config/amplifier-browser-bridge/tokens.json`, read the audit log, and `curl` any hub
    route.
 3. **Control of the browser.** `navigate`, `tab_open`, `tab_close`, `click`, `type`, `snapshot`,
@@ -225,7 +225,7 @@ constraint from this project's own measurements, not an implementation detail �
 
 | # | Candidate | Who authors the approval | What the model can do to it | Model-immune? |
 |---|---|---|---|---|
-| **A** | Prompt on the agent host (`abb approve`) | Whoever has the TTY | **Run `abb approve` itself** — it has a shell on that host. Also read the approver token from disk. | **No**, unless the agent is sandboxed off the host |
+| **A** | Prompt on the agent host (`amplifier-browser-bridge approve`) | Whoever has the TTY | **Run `amplifier-browser-bridge approve` itself** — it has a shell on that host. Also read the approver token from disk. | **No**, unless the agent is sandboxed off the host |
 | **B** | Push to phone, third-party (FCM/APNs/ntfy/Pushover) | Human, tapping on the phone | Cannot see or dismiss it; cannot approve without the approver credential. Could *spoof* a push if it obtains the topic key (annoyance, not bypass). Can flood gates to induce approval fatigue. | **Yes**, given P2 |
 | **C** | Push to phone, self-hosted on tailnet | Human, on a device they run | Same as B — but see §4.C: **this channel cannot wake a sleeping phone at all**, so on mobile the question is often moot | Yes, but frequently unreachable |
 | **D** | Extension's own UI (badge + popup + `chrome-extension://` page) | Human, clicking inside an extension page — `isTrusted`, in a context `<all_urls>` does not cover | **Suppress**, not forge: `tab_close` the approval tab, `reload` the extension. Cannot script the page. | **Yes** for forgery; **no** for availability |
@@ -251,11 +251,11 @@ constraint from this project's own measurements, not an implementation detail �
 
 ## 4. Per-candidate detail
 
-### A — Prompt on the agent host (`abb approve <token>`)
+### A — Prompt on the agent host (`amplifier-browser-bridge approve <token>`)
 
-**Shape.** A new CLI verb and a hub route the `/agent` protocol does not expose. `abb pending`
-lists open requests; `abb approve <token>` redeems one. Authenticated by an approver token
-distinct from `ABB_HUB_TOKEN` (P2).
+**Shape.** A new CLI verb and a hub route the `/agent` protocol does not expose. `amplifier-browser-bridge pending`
+lists open requests; `amplifier-browser-bridge approve <token>` redeems one. Authenticated by an approver token
+distinct from `AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN` (P2).
 
 **The strongest case for it.** It is the only candidate that works with zero devices connected
 and zero additional software. For the maintainer sitting at the Linux box — which is the actual
@@ -265,12 +265,12 @@ transport is down. Shipping it is not optional; the only question is what it is 
 
 **Why it fails the founding premise.** The human is somewhere else. That is the premise of the
 whole project. Worse, when the agent runs on that same host with a shell — the normal Amplifier
-configuration — the boundary is illusory: the model runs `abb approve` itself. Reading the
+configuration — the boundary is illusory: the model runs `amplifier-browser-bridge approve` itself. Reading the
 approver token from `/dev/tty` rather than stdin raises the bar slightly (a non-interactive
 subprocess has a harder time), but a subprocess generally inherits the controlling terminal, and
 the token file is readable either way.
 
-**Honest label.** `abb approve` is out-of-band with respect to the *protocol* and not with
+**Honest label.** `amplifier-browser-bridge approve` is out-of-band with respect to the *protocol* and not with
 respect to the *host*. It is a real boundary only when the agent cannot execute commands on the
 hub host — i.e. a sandboxed or containerized agent. Say that in the docs, in those words. The
 alternative — shipping it as "human approval" — is precisely the fabricated attestation this

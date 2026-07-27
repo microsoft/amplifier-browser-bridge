@@ -315,7 +315,7 @@ class ClassifierProfile:
     @staticmethod
     def load(path: str | Path | None = None) -> ClassifierProfile:
         """Resolution order mirrors `Denylist.load` (policy.py): explicit
-        `path` -> `ABB_POLICY_FILE` env var -> conventional
+        `path` -> `AMPLIFIER_BROWSER_BRIDGE_POLICY_FILE` env var -> conventional
         `~/.config/amplifier-browser-bridge/policy.json` -> built-in defaults.
         A user file's `"classifier"` key may override `threshold` only in
         this phase -- families/phrases/url_patterns stay code-defined until a
@@ -324,7 +324,9 @@ class ClassifierProfile:
         import json
         import os
 
-        file_path = Path(path or os.environ.get("ABB_POLICY_FILE") or DEFAULT_POLICY_FILE).expanduser()
+        file_path = Path(
+            path or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_POLICY_FILE") or DEFAULT_POLICY_FILE
+        ).expanduser()
         if not file_path.is_file():
             return ClassifierProfile()
         try:

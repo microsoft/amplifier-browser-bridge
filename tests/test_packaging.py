@@ -1,7 +1,7 @@
 """Regression test for Bug A: extension/ assets must ship INSIDE the wheel, not
 just be inferable from an editable-install checkout.
 
-The concrete failure this guards against: `abb init` worked for the developer (an
+The concrete failure this guards against: `amplifier-browser-bridge init` worked for the developer (an
 editable install, `uv pip install -e .`, resolves straight back to the repo
 checkout) but raised `ExtensionSourceNotFoundError` for anyone who installed the
 published package normally (`uv tool install .`, `pip install .`) -- the wheel
@@ -57,7 +57,7 @@ def test_wheel_contains_every_runtime_required_extension_file(tmp_path: Path) ->
     ]
     assert not missing, (
         f"extension file(s) required by stage_extension() are NOT in the built wheel: {missing}. "
-        "This is exactly the Bug A failure mode: `abb init` works from an editable checkout but "
+        "This is exactly the Bug A failure mode: `amplifier-browser-bridge init` works from an editable checkout but "
         "breaks for a real (non-editable) install. Check [tool.hatch.build.targets.wheel."
         "force-include] in pyproject.toml."
     )

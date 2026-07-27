@@ -52,37 +52,37 @@ uv pip install -e ".[dev]"   # or: uv pip install -e . pytest ruff pyright
 Optional extras:
 
 ```bash
-uv pip install -e ".[mcp]"   # MCP server support (abb-mcp)
+uv pip install -e ".[mcp]"   # MCP server support (amplifier-browser-bridge-mcp)
 ```
 
 ### Running the hub locally
 
 ```bash
-abb hub --host 0.0.0.0 --port 8900
+amplifier-browser-bridge hub --host 0.0.0.0 --port 8900
 ```
 
-Auth is disabled by default in dev and this is loudly logged. To enable it, run `abb init`
+Auth is disabled by default in dev and this is loudly logged. To enable it, run `amplifier-browser-bridge init`
 (generates a token, writes it to the hub's token file) and paste the printed token into the
-extension's options page (its toolbar-icon click), and pass `ABB_TOKEN` to the CLI/MCP server.
+extension's options page (its toolbar-icon click), and pass `AMPLIFIER_BROWSER_BRIDGE_TOKEN` to the CLI/MCP server.
 See `docs/PROTOCOL.md` ("Authentication") for the full resolution order.
 
 ### Loading the extension unpacked
 
 Hub URL and token are runtime configuration (`chrome.storage.local`), entered through the
 extension's own options page -- never a tracked source file. See README.md's "Setup" section
-for the full `abb init` / `abb doctor` flow; the short version for local dev:
+for the full `amplifier-browser-bridge init` / `amplifier-browser-bridge doctor` flow; the short version for local dev:
 
 1. In Edge, go to `edge://extensions`, enable Developer mode, choose "Load unpacked", and select
-   the `extension/` directory (or a directory staged by `abb init` -- see below).
+   the `extension/` directory (or a directory staged by `amplifier-browser-bridge init` -- see below).
 2. Click the extension's toolbar icon (its only UI) to open the options page. Enter the hub's
    Hub URL -- a tailnet IP literal, never a MagicDNS name, see `docs/designs/browser-bridge.md`
-   section 4 for why -- and the token from `abb init`/your hub operator, then Save.
-3. Confirm the device shows up via `abb devices` or `abb doctor`.
+   section 4 for why -- and the token from `amplifier-browser-bridge init`/your hub operator, then Save.
+3. Confirm the device shows up via `amplifier-browser-bridge devices` or `amplifier-browser-bridge doctor`.
 
-For iterative development, prefer staging via `abb init --dest <dir>` (or reuse an existing
+For iterative development, prefer staging via `amplifier-browser-bridge init --dest <dir>` (or reuse an existing
 staged directory) over loading directly from `extension/` in this repo checkout -- an unpacked
 extension's identity (and therefore its `chrome.storage.local` config) is tied to the exact
-directory path it was loaded from, so loading from a stable staged path means future `abb init`
+directory path it was loaded from, so loading from a stable staged path means future `amplifier-browser-bridge init`
 re-runs (which re-copy the JS/HTML/manifest files) never disturb a working configuration.
 
 ### Running tests

@@ -133,7 +133,7 @@ class HubClient:
         hub's existing `confirm` agent-route message (`Hub._handle_agent_confirm`,
         already wired at the wire level; this is the first CLI/lib-facing
         caller of it). `redeem: "agent"` (this method) is self-attestation --
-        the caller (a human via `abb confirm`, or an agent process explicitly
+        the caller (a human via `amplifier-browser-bridge confirm`, or an agent process explicitly
         deciding to proceed) makes a second, separately-audited decision.
         `redeem: "unredeemable"` sessions can never be confirmed through this
         method (or any other route in this system) -- there is no human-

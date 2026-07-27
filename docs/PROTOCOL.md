@@ -593,7 +593,7 @@ per-frame manifest (`frame_id`/`url`/`title`/`node_count`) alongside `frame_coun
 reports `other_frames`.
 
 **Frame-qualified refs:** because `injected.js` runs independently in every frame (each frame
-gets its own `window.__abb` with its own ref counter starting at `e1`), a bare `"e12"` in frame 0
+gets its own `window.__amplifierBrowserBridge` with its own ref counter starting at `e1`), a bare `"e12"` in frame 0
 and `"e12"` in frame 7 are NOT the same element. Every ref this system hands back is qualified as
 `"f<frameId>.<ref>"` (e.g. `"f0.e12"`, `"f7.e3"`) -- see `extension/frame_refs.mjs` (pure,
 independently unit-tested with `node --test`, no `chrome.*` dependency) for `qualifyRef`/
@@ -624,7 +624,7 @@ agent believes an action happened and proceeds on a false premise, in a system w
 discipline is fail-loud (design doc §8).
 
 **How it's fixed:** every ref is bound to the *generation* of the snapshot that produced it, not
-just to whether its underlying DOM node still exists. Each frame's own `window.__abb` (one per
+just to whether its underlying DOM node still exists. Each frame's own `window.__amplifierBrowserBridge` (one per
 frame -- see "Frame-qualified refs" above) keeps a generation counter, starting at 0. Every
 `snapshot` call increments it and re-stamps every ref it touches (new or already-known) with the
 new value. **A ref only resolves while its stamped generation still equals that frame's CURRENT
@@ -656,7 +656,7 @@ are):
 
 1. **Unknown ref** -- never produced in the current page context. Either the ref string is simply
    wrong, or a navigation/reload happened since the snapshot that produced it (which destroys
-   `window.__abb` along with the rest of the page's JS context, wiping the ref table entirely):
+   `window.__amplifierBrowserBridge` along with the rest of the page's JS context, wiping the ref table entirely):
    `"unknown element ref: f0.e93 -- never produced in the current page context. If a navigation or
    reload happened since you last took a snapshot, the ref table was reset -- take a fresh snapshot."`
 2. **Stale ref (superseded generation)** -- this is the bug fix's core case: `"stale ref: e93 was
@@ -817,7 +817,7 @@ deliberately keeps them distinct rather than picking one automatically (design d
 1. **Return pixels** -- `screenshot` (above). No model call, ever. A vision-capable MCP client
    consumes the returned image content block directly with zero extra cost.
 2. **Return text extracted from pixels** -- `vision_read`, an **agent-surface-only** operation
-   (CLI `abb vision-read`, MCP tool `browser_vision_read`, Amplifier tool `browser_vision_read`)
+   (CLI `amplifier-browser-bridge vision-read`, MCP tool `browser_vision_read`, Amplifier tool `browser_vision_read`)
    -- **not a wire-protocol command**. It composes an ordinary `screenshot` call (with whatever
    `frame_id`/`multi_page`/etc. args the caller supplies) with a real call to an external
    vision-capable LLM (`src/amplifier_browser_bridge/vision.py`), and returns the extracted text.
@@ -835,8 +835,8 @@ composition means the hub/extension never import an LLM SDK or hold a model API 
 **Provider configuration:** no project-specific model/provider convention exists in this
 standalone repo, so `vision.py` follows the same env-var-configured-provider pattern
 documented in Amplifier's `image-vision` skill: `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` /
-`OPENAI_API_KEY`, checked in that order (first one present wins), or `ABB_VISION_PROVIDER`
-(`gemini`/`anthropic`/`openai`) to pin a specific one, with `ABB_VISION_MODEL` to override the
+`OPENAI_API_KEY`, checked in that order (first one present wins), or `AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER`
+(`gemini`/`anthropic`/`openai`) to pin a specific one, with `AMPLIFIER_BROWSER_BRIDGE_VISION_MODEL` to override the
 default model. **Fails loud** with a message naming exactly which environment variable(s)
 would resolve it if none is configured -- never silently returns empty text.
 
@@ -956,7 +956,7 @@ first and the reload is deferred briefly (~250ms) to give it time to flush over 
 **The very first deployment of this command still requires one manual reload.** An extension has to
 already be running code that understands the `reload` command before it can reload itself into a
 version that understands it -- there is no way around that single bootstrap step. Every subsequent
-iteration is self-service via `abb reload <device_id>`.
+iteration is self-service via `amplifier-browser-bridge reload <device_id>`.
 
 Commands are partitioned into `PAGE_WORLD_COMMANDS` (dispatched into `injected.js` running in
 the page's isolated world) and `BROWSER_LEVEL_COMMANDS` (handled directly by
@@ -978,7 +978,7 @@ same thing):
 
 1. **Hub default** (`hub.py`'s `DEFAULT_COMMAND_TIMEOUT`, now **120.0s**, was 30.0s) -- applies
    to every command that doesn't override it. Configurable per hub process via
-   `abb hub --command-timeout <seconds>`.
+   `amplifier-browser-bridge hub --command-timeout <seconds>`.
 2. **Per-command override** -- any command's `args` may include `timeout_s` (a float, seconds).
    This is a **hub-only** arg (see `protocol.py`'s `HUB_ONLY_ARGS`): `Hub.send_command` pops and
    validates it *before* building the `QueuedCommand` sent to the device -- it never reaches
@@ -998,7 +998,7 @@ same thing):
 ```json
 {
   "ok": false,
-  "error": "timeout waiting 120.0s for device result on command 'read' (device=cb8d..., tab_id=1565892316). The page may still be loading or a heavy SPA may still be hydrating. Raise the limit for just this command with args.timeout_s=<seconds> (CLI: --timeout <seconds>; MCP tools: timeout_s param), up to 600.0s, or raise the hub's own default with `abb hub --command-timeout <seconds>`."
+  "error": "timeout waiting 120.0s for device result on command 'read' (device=cb8d..., tab_id=1565892316). The page may still be loading or a heavy SPA may still be hydrating. Raise the limit for just this command with args.timeout_s=<seconds> (CLI: --timeout <seconds>; MCP tools: timeout_s param), up to 600.0s, or raise the hub's own default with `amplifier-browser-bridge hub --command-timeout <seconds>`."
 }
 ```
 
@@ -1048,13 +1048,13 @@ Every boolean-intent arg in this system (`args.trusted`, `args.capture_hidden`,
 `=== true` identity check. This exists because a caller-supplied value can arrive in
 different native shapes depending on which surface sent it:
 
-- The CLI's `cmd` escape hatch (`abb cmd <target> screenshot --arg capture_hidden=true`)
+- The CLI's `cmd` escape hatch (`amplifier-browser-bridge cmd <target> screenshot --arg capture_hidden=true`)
   parses **every** `--arg key=value` as a plain string -- `"true"`, never the bool `True`.
 - The MCP server / Amplifier tool module pass a real bool from their own typed parameters.
 - A caller scripting the wire protocol directly could send a bare `1`/`0`.
 
 A strict identity check silently treats the first and third cases as `False`. This was a
-real, reported bug: `abb cmd <target> screenshot --arg capture_hidden=true` sent the string
+real, reported bug: `amplifier-browser-bridge cmd <target> screenshot --arg capture_hidden=true` sent the string
 `"true"`; `cdp.py`'s `requires_cdp()` checked `args.get("capture_hidden") is True`, which is
 `False` for a string; the hub never escalated to CDP, and the device failed loud with
 "screenshot requires the target tab to already be active" -- despite the caller passing

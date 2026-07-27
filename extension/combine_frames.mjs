@@ -86,7 +86,7 @@ export function combineRead(frames, unconfirmedFrames) {
  * Each frame's own `generation` (Bug 1: stale refs succeed silently -- see
  * ref_registry.mjs/injected.js) is surfaced on every node it produced and on
  * that frame's manifest entry -- each frame has its OWN independent counter
- * (its own `window.__abb`), so there is no single tab-wide generation number.
+ * (its own `window.__amplifierBrowserBridge`), so there is no single tab-wide generation number.
  *
  * @param {Array<{frameId: number, url: string, title: string, nodes: object[], generation: number}>} frames
  * @param {string[]} unconfirmedFrames

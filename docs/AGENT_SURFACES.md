@@ -54,16 +54,16 @@ CLI/SDK session -- can drive the bridge with zero Amplifier dependency.
 
 ```bash
 uv pip install -e ".[mcp]"   # installs the optional `mcp` dependency
-abb-mcp                       # runs over stdio (the default every MCP client speaks)
+amplifier-browser-bridge-mcp                       # runs over stdio (the default every MCP client speaks)
 ```
 
 Environment variables (same ones the CLI uses):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ABB_HUB_URL` | `ws://127.0.0.1:8900/agent` | Hub's agent-route WebSocket URL |
-| `ABB_TOKEN` | unset | Per-device/agent shared token, if hub auth is enabled |
-| `ABB_MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
+| `AMPLIFIER_BROWSER_BRIDGE_HUB_URL` | `ws://127.0.0.1:8900/agent` | Hub's agent-route WebSocket URL |
+| `AMPLIFIER_BROWSER_BRIDGE_TOKEN` | unset | Per-device/agent shared token, if hub auth is enabled |
+| `AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
 
 ### Pointing an MCP client at it
 
@@ -74,8 +74,8 @@ Claude Desktop-style `mcp_servers.json`:
 {
   "mcpServers": {
     "amplifier-browser-bridge": {
-      "command": "abb-mcp",
-      "env": { "ABB_HUB_URL": "ws://<this machine's tailnet IP>:8900/agent" }
+      "command": "amplifier-browser-bridge-mcp",
+      "env": { "AMPLIFIER_BROWSER_BRIDGE_HUB_URL": "ws://<this machine's tailnet IP>:8900/agent" }
     }
   }
 }
@@ -83,8 +83,8 @@ Claude Desktop-style `mcp_servers.json`:
 
 ### Verified end-to-end (proof)
 
-Run with a real hub (`abb hub`) and a real MCP client (the `mcp` Python SDK's
-`ClientSession` + `stdio_client`, launching `abb-mcp` as a subprocess):
+Run with a real hub (`amplifier-browser-bridge hub`) and a real MCP client (the `mcp` Python SDK's
+`ClientSession` + `stdio_client`, launching `amplifier-browser-bridge-mcp` as a subprocess):
 
 ```
 === TOOL LIST ===

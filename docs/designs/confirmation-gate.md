@@ -256,7 +256,7 @@ channel the driving model cannot reach:
   agent to make a second, explicit, separately-audited decision, which has real value against
   *accidental* action and none against an injected one.
 - `redeem: "out_of_band"` — the token is redeemable only via a distinct hub endpoint that the
-  agent's protocol route does not expose (`abb approve <token>` on the human's own machine, or
+  agent's protocol route does not expose (`amplifier-browser-bridge approve <token>` on the human's own machine, or
   the extension's own options page). The agent receives the token's existence, never a way to
   spend it.
 
@@ -636,10 +636,10 @@ One test keeps passing but changes meaning and needs a companion:
 10. **`scope.py` (Candidate C) is now implemented** (a later PR than the one that originally wrote
     this section). Session establishment, narrow-only/seal-on-first-read enforcement, and
     write-scope denial are wired into `PolicyEngine.evaluate`/`Hub.send_command` and surfaced on
-    the CLI (`abb session-establish`/`abb session-narrow`), the MCP server
+    the CLI (`amplifier-browser-bridge session-establish`/`amplifier-browser-bridge session-narrow`), the MCP server
     (`browser_establish_session`/`browser_narrow_scope`), and the Amplifier tool module. This is
     the one page-immune *prevention* this design promises (§4: "C is the only page-immune
-    prevention"). **Still deferred:** `redeem: "out_of_band"`'s actual redemption channel (`abb
+    prevention"). **Still deferred:** `redeem: "out_of_band"`'s actual redemption channel (`amplifier-browser-bridge
     approve`, §15 step 6 — `redeem` can be *declared* `"out_of_band"` on a session, but nothing
     yet redeems a token that way) and the operator-configured screening hook (Candidate B). Also
     deferred: enforcing `SessionScope.read` against any command — the field exists and
@@ -687,7 +687,7 @@ One test keeps passing but changes meaning and needs a companion:
 | `src/amplifier_browser_bridge/policy.py` | **modify** | Keeps denylist / caches / confirmation lifecycle / kill switch. Delegates gate decisions to `classify` + `scope`. Re-exports `GateRule`/`GATE_RULES` for one release. |
 | `src/amplifier_browser_bridge/hub.py` | **modify** | Session establishment; attach `classification`/`effects` to results; flow-elevation state; `confirm` redemption channels. |
 | `src/amplifier_browser_bridge/client.py` | **modify** | `confirm()`, `establish_session()`. |
-| `src/amplifier_browser_bridge/cli.py` | **modify** | `abb confirm <token>`. (`abb approve <token>` / `abb pending` were planned for the out-of-band channel here; that channel is CANCELLED -- see §17 -- so these were never built and will not be.) |
+| `src/amplifier_browser_bridge/cli.py` | **modify** | `amplifier-browser-bridge confirm <token>`. (`amplifier-browser-bridge approve <token>` / `amplifier-browser-bridge pending` were planned for the out-of-band channel here; that channel is CANCELLED -- see §17 -- so these were never built and will not be.) |
 | `src/amplifier_browser_bridge/mcp_server.py` | **modify** | `browser_confirm` tool; surface `classification`/`effects` in tool results. |
 | `extension/action_descriptor.mjs` | **new** | Pure. Element → descriptor fields. Zero `chrome.*`. Companion `.test.mjs`. |
 | `extension/effects_collector.mjs` | **new** | Pure. Event accumulation + windowing + state-changing determination. Zero `chrome.*`. Companion `.test.mjs`. |
@@ -1206,14 +1206,14 @@ Each step is independently shippable and independently valuable.
    only page-immune signal; ship first even if nothing else does.**
 2. **`classify.py` + descriptor enrichment (D1).** Scoring, families, `unknown` as a real state.
    Retires `GATE_RULES` behind a re-export.
-3. **Confirmation redemption surfaces (D2, part 1).** `abb confirm`, `client.confirm()`,
+3. **Confirmation redemption surfaces (D2, part 1).** `amplifier-browser-bridge confirm`, `client.confirm()`,
    `browser_confirm` MCP tool. Without this, every gate is still a dead end.
 4. **Flow elevation.** Wires 1 and 2 together; makes bland labels catchable.
 5. **`scope.py` (C).** Session establishment, narrow-only, `on_unknown`, seal-on-first-read.
    **Done** — see §9 item 10. `write`-scope enforcement is wired into `PolicyEngine.evaluate`
    and surfaced on all three agent surfaces (CLI/MCP/tool module). `read`-scope enforcement
    remains open (mechanism present, not yet a consumer -- see `scope.py`'s own docstring).
-6. **~~`redeem: out_of_band` (D2, part 2). `abb approve`, the separate redemption channel.~~
+6. **~~`redeem: out_of_band` (D2, part 2). `amplifier-browser-bridge approve`, the separate redemption channel.~~
    CANCELLED (2026-07-26, same day).** A live experiment showed the strongest candidate channel
    could be driven by the very agent it needed to exclude via `chrome.debugger`, and the simpler
    fix (narrow the session via step 5, already done) was available the whole time. See
@@ -1268,12 +1268,12 @@ closed regardless of whether a channel is ever coming. See `tests/test_redeem_ch
 
 Three reviewers converged: a CLI command with a shell on the hub host is not out-of-band with
 respect to the agent, and shipping it without the enforcement above would look like coverage
-where none exists. Resolution: **kept** `abb confirm` (removing it would leave `redeem: "agent"`
+where none exists. Resolution: **kept** `amplifier-browser-bridge confirm` (removing it would leave `redeem: "agent"`
 gates — the majority case — with no redemption surface at all, regressing D2). It is now
 explicitly documented (see `cli.py`'s `confirm` command docstring) as a **host-local operator
 convenience**, honestly labeled as out-of-band with respect to the *protocol*, not the *host* —
 and it is **structurally barred** from redeeming `unredeemable` confirmations by the same
-`consume_confirmation(..., via="agent")` enforcement in §16.1, because `abb confirm` reaches the
+`consume_confirmation(..., via="agent")` enforcement in §16.1, because `amplifier-browser-bridge confirm` reaches the
 identical `Hub._handle_agent_confirm` route an agent's own `confirm` call reaches. This is code
 enforcement, not a docstring promise — see `tests/test_redeem_channel.py`'s
 `test_hub_agent_confirm_route_rejects_unredeemable_token_end_to_end`.

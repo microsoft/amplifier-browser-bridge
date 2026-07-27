@@ -23,7 +23,7 @@ the honest line between the two.
   Tailscale's app settings and confirm Edge Canary (and Edge Canary specifically,
   not just "Edge") is not in the excluded list. A silently-excluded browser
   produces the same symptom as no Tailscale at all: the extension connects to
-  nothing and never appears in `abb devices`.
+  nothing and never appears in `amplifier-browser-bridge devices`.
 - **The hub's tailnet IP literal, never a MagicDNS name**, entered on the extension's
   options page (its toolbar-icon click) AFTER installing on-device -- see design doc
   section 4: MagicDNS was measured to resolve correctly on one device and fail on
@@ -83,7 +83,7 @@ This:
    since it has no system browser at all).
 3. Reuses a **stable signing key** across rebuilds, stored **outside this repo**
    at `~/.config/amplifier-browser-bridge/android-signing-key.pem` by default
-   (override with `ABB_ANDROID_SIGNING_KEY`). Reusing the key keeps the extension
+   (override with `AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY`). Reusing the key keeps the extension
    ID stable across rebuilds -- Android's sideload-by-file flow treats a new ID as
    a different extension, which would otherwise mean losing settings/permissions
    on every rebuild. **Never commit this key.** It is never written into the repo
@@ -170,16 +170,16 @@ with no way to know when (or whether) it will reconnect on its own.
 
 ## What success looks like
 
-1. `abb devices` (from the agent host) lists the phone's device_id with
+1. `amplifier-browser-bridge devices` (from the agent host) lists the phone's device_id with
    `"label": "edge-android"` and `"connected": true` shortly after the extension
    loads and Tailscale is connected.
 2. `hello`'s reported `capabilities` show `"debugger": false` (correctly absent --
    do not treat this as a bug) and the rest (`windows`, `tabs`/`scripting` once a
    real tab exists, `storage`, `alarms`, `downloads`) `true`.
-3. A command like `abb tabs <device_id>` returns a real tab listing from the
+3. A command like `amplifier-browser-bridge tabs <device_id>` returns a real tab listing from the
    phone.
 4. After locking the screen (with the battery exemption applied), the device
-   transitions to `"tier": "intermittent"` in `abb devices`, and a command issued
+   transitions to `"tier": "intermittent"` in `amplifier-browser-bridge devices`, and a command issued
    while it's dark returns `{"status": "queued", ...}` immediately rather than
    hanging -- then drains automatically (see `docs/PROTOCOL.md`'s tier section)
    once the phone's next Doze maintenance window reconnects it.
@@ -191,10 +191,10 @@ with no way to know when (or whether) it will reconnect on its own.
 | Download completes but nothing appears in Downloads/My Files | Trap #1 -- Chromium intercepted the `.crx` MIME type and silently discarded it | Serve as `.bin` with `Content-Type: application/octet-stream`, rename to `.crx` on-device before installing |
 | "Extension install by crx" does nothing -- no dialog, no error, no toast | Trap #2 -- the file isn't a real CRX3 (was a renamed `.zip`, was corrupted in transit, or the rename in step 2 above didn't actually change the extension) | Rebuild with `scripts/package-android.sh` (never hand-roll a `.crx`); re-verify with `scripts/verify_crx.py`; re-download and re-check the file's size/SHA-256 matches what the script printed |
 | "Extension install by crx" prompts for a **URL** instead of accepting your file, or otherwise seems to want a network location | Misreading of the feature -- it requires a **local file path**, confirmed; there is no URL-based install path on Edge Android | Ensure the file is downloaded and renamed locally on the device first, then point the file picker at it |
-| Extension installs, but never appears in `abb devices` | Tailscale not connected on the phone, Edge Canary excluded from the tailnet, the options page was never configured, or the configured Hub URL uses a MagicDNS name instead of an IP literal | Check Tailscale's connection state and per-app exclusion list on the phone; open the extension's options page (toolbar icon) and confirm the Hub URL is set to a tailnet IP literal, not MagicDNS |
+| Extension installs, but never appears in `amplifier-browser-bridge devices` | Tailscale not connected on the phone, Edge Canary excluded from the tailnet, the options page was never configured, or the configured Hub URL uses a MagicDNS name instead of an IP literal | Check Tailscale's connection state and per-app exclusion list on the phone; open the extension's options page (toolbar icon) and confirm the Hub URL is set to a tailnet IP literal, not MagicDNS |
 | Device connects, but goes dark for many minutes with no self-recovery | Battery-optimization exemption not applied ("sleeping apps" still active) | Apply the onboarding requirement above; re-test with the screen locked for a few minutes and confirm the tier transitions to `intermittent` (not stuck `dormant` forever) and self-heals |
 | `capabilities.debugger` is `false` | **This is correct, not a bug.** `chrome.debugger` (CDP) is genuinely absent on Edge Android | No action -- CDP-requiring commands (`trusted` input, `capture_hidden` screenshot) will fail loud with a clear capability-unavailable error; everything else works via injection |
-| Extension ID changes between rebuilds | The signing key wasn't reused -- either it was deleted, or `ABB_ANDROID_SIGNING_KEY` pointed somewhere different between runs | Locate/restore the original key; back it up going forward. A changed ID means Android treats the rebuilt package as a different extension |
+| Extension ID changes between rebuilds | The signing key wasn't reused -- either it was deleted, or `AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY` pointed somewhere different between runs | Locate/restore the original key; back it up going forward. A changed ID means Android treats the rebuilt package as a different extension |
 
 ## What remains unproven (read before believing this "just works")
 

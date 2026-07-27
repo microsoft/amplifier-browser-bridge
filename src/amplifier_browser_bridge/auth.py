@@ -7,9 +7,9 @@ local process on an authorized device could reach the hub with the same identity
 
 Resolution order (first match wins), and NOTHING here is ever committed to the repo:
 
-    1. `ABB_HUB_TOKEN` environment variable -- used as the default token for all
+    1. `AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN` environment variable -- used as the default token for all
        devices/agents unless a device has its own entry in the token file.
-    2. A JSON token file (`ABB_TOKEN_FILE`, default `~/.config/amplifier-browser-bridge/
+    2. A JSON token file (`AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE`, default `~/.config/amplifier-browser-bridge/
        tokens.json`) of the shape `{"default": "...", "devices": {"<device_id>": "..."}}`.
     3. No token configured anywhere -> auth is DISABLED. This is a dev-only mode,
        loud about what it is: fine on a private tailnet during development, not a
@@ -50,9 +50,11 @@ def load_token_store(path: str | Path | None = None) -> TokenStore:
     """Load a TokenStore from env + file, per the resolution order in the module
     docstring. Never raises on a missing file -- a missing file just means "no
     per-device overrides configured," which is a normal state."""
-    default_token = os.environ.get("ABB_HUB_TOKEN")
+    default_token = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN")
 
-    file_path = Path(path or os.environ.get("ABB_TOKEN_FILE") or DEFAULT_TOKEN_FILE).expanduser()
+    file_path = Path(
+        path or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE") or DEFAULT_TOKEN_FILE
+    ).expanduser()
     device_tokens: dict[str, str] = {}
     if file_path.is_file():
         try:
@@ -71,19 +73,21 @@ def load_token_store(path: str | Path | None = None) -> TokenStore:
 def resolve_token_file(path: str | Path | None = None) -> Path:
     """The exact token-file path `load_token_store` would read from, for callers
     (doctor.py, cli.py) that need to DISPLAY it -- must use the identical resolution
-    order (explicit path, then $ABB_TOKEN_FILE, then the default) or the path shown
+    order (explicit path, then $AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE, then the default) or the path shown
     to a user can silently disagree with the one actually consulted."""
-    return Path(path or os.environ.get("ABB_TOKEN_FILE") or DEFAULT_TOKEN_FILE).expanduser()
+    return Path(
+        path or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE") or DEFAULT_TOKEN_FILE
+    ).expanduser()
 
 
 def find_sibling_token_files(active_path: str | Path) -> list[Path]:
     """Other files in the same directory as the active token file whose name
     suggests they might ALSO be a token store (contains "token", case-insensitive).
 
-    This is the concrete failure mode `abb doctor`/`abb init` guard against: a stray
+    This is the concrete failure mode `amplifier-browser-bridge doctor`/`amplifier-browser-bridge init` guard against: a stray
     file -- hand-created, left over from before this project settled on
     `tokens.json`, or copied from somewhere else entirely -- sitting unconsulted
-    beside the one `abb init`/`abb hub`/`abb doctor` actually read from. There is no
+    beside the one `amplifier-browser-bridge init`/`amplifier-browser-bridge hub`/`amplifier-browser-bridge doctor` actually read from. There is no
     other supported token-file name in this project; any match here is, by
     definition, not part of the active configuration.
     """

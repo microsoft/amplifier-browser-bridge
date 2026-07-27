@@ -314,7 +314,7 @@ async def test_browser_vision_read_config_error_returns_ok_false_not_adapter_fai
 
 
 def test_client_uses_env_configured_hub_url(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("ABB_HUB_URL", "ws://100.64.1.2:9000/agent")
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://100.64.1.2:9000/agent")
     # Re-import-free check: _client() reads the module-level constants captured
     # at import time (matches cli.py's own convention), so we assert on those
     # constants directly rather than re-triggering module import machinery.

@@ -62,7 +62,7 @@ def test_unredeemable_confirmation_cannot_be_redeemed_via_agent_channel(tmp_path
     that session, and the agent tries to redeem its own token through the
     ONLY redemption route this codebase has (`consume_confirmation(..., via="agent")`,
     exactly what `Hub._handle_agent_confirm` calls for both an agent's own
-    `confirm` message and a human running `abb confirm`). This must fail,
+    `confirm` message and a human running `amplifier-browser-bridge confirm`). This must fail,
     loudly, every time -- not silently succeed."""
     engine = _engine(tmp_path)
     scope = SessionScope(
@@ -108,7 +108,7 @@ def test_unredeemable_confirmation_cannot_be_redeemed_via_agent_channel(tmp_path
 def test_hub_agent_confirm_route_rejects_unredeemable_token_end_to_end(tmp_path: Any) -> None:
     """Same exploit, but driven through `Hub._handle_agent_confirm` itself --
     the exact code path both an agent's own `confirm` WebSocket message and a
-    human running `abb confirm <token>` (cli.py) reach. Proves the fix holds
+    human running `amplifier-browser-bridge confirm <token>` (cli.py) reach. Proves the fix holds
     at the boundary the exploit actually crosses, not just inside PolicyEngine."""
     hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"))
     scope = hub.establish_session(write=["repos.opensource.microsoft.com"], redeem="unredeemable")
@@ -139,7 +139,7 @@ def test_hub_agent_confirm_route_rejects_unredeemable_token_end_to_end(tmp_path:
         assert gated["status"] == "needs_confirmation"
         assert gated["redeem"] == "unredeemable"
         # The exploit: the agent calls the SAME confirm handler a human's
-        # `abb confirm` CLI invocation reaches.
+        # `amplifier-browser-bridge confirm` CLI invocation reaches.
         return await hub._handle_agent_confirm({"confirmation_token": gated["confirmation_token"]})
 
     result = asyncio.run(run())

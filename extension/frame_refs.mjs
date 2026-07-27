@@ -4,7 +4,7 @@
 //
 // Why this exists: chrome.scripting.executeScript({allFrames: true}) injects
 // injected.js independently into EVERY frame of a tab -- each frame gets its own
-// `window.__abb` with its own ref counter starting at "e1". A bare "e12" in the
+// `window.__amplifierBrowserBridge` with its own ref counter starting at "e1". A bare "e12" in the
 // top frame and "e12" in an embedded iframe are NOT the same element; nothing
 // about the string itself says which frame it came from. Left alone, click/type/key
 // would have no way to know which frame to route a ref back into, and two different

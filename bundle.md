@@ -5,7 +5,7 @@ Amplifier agent the `browser_*` tools described in `docs/AGENT_SURFACES.md`: dri
 the user's real, logged-in Microsoft Edge browser on other devices, over the
 user's own Tailscale network (see `docs/designs/browser-bridge.md`).
 
-This bundle only adds the tool module -- it assumes a hub (`abb hub`, see the
+This bundle only adds the tool module -- it assumes a hub (`amplifier-browser-bridge hub`, see the
 repo README) is already running somewhere reachable, and that at least one Edge
 extension has connected to it. The tools work with zero connected devices too
 (`browser_devices` just returns an empty list), so adding this bundle is safe even
@@ -38,8 +38,8 @@ file):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ABB_HUB_URL` | `ws://127.0.0.1:8900/agent` | The hub's agent-route WebSocket URL. Point this at the hub's tailnet IP (never a MagicDNS name -- see design doc section 4). |
-| `ABB_TOKEN` | unset | Per-device/agent shared token, if the hub has auth enabled (see `auth.py`). |
+| `AMPLIFIER_BROWSER_BRIDGE_HUB_URL` | `ws://127.0.0.1:8900/agent` | The hub's agent-route WebSocket URL. Point this at the hub's tailnet IP (never a MagicDNS name -- see design doc section 4). |
+| `AMPLIFIER_BROWSER_BRIDGE_TOKEN` | unset | Per-device/agent shared token, if the hub has auth enabled (see `auth.py`). |
 
 ## What this bundle provides
 

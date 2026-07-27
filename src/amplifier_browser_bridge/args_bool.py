@@ -3,7 +3,7 @@
 A caller-supplied "boolean" arg (`trusted`, `capture_hidden`, `all_frames`, `wake`, ...)
 can arrive as three different native types depending on which surface sent it:
 
-  - The CLI's `cmd` escape hatch (`abb cmd <target> screenshot --arg capture_hidden=true`)
+  - The CLI's `cmd` escape hatch (`amplifier-browser-bridge cmd <target> screenshot --arg capture_hidden=true`)
     parses EVERY `--arg key=value` as a plain Python STRING -- `args["capture_hidden"]`
     is the string ``"true"``, never the bool ``True``.
   - The MCP server / Amplifier tool module pass a real Python `bool` from their own
@@ -14,7 +14,7 @@ can arrive as three different native types depending on which surface sent it:
 A strict `value is True` identity check silently treats the first and third cases as
 `False` -- the caller supplied unambiguous intent, and the check simply doesn't
 recognize the shape it arrived in. This is the exact bug behind a real, reported
-failure: ``abb cmd <target> screenshot --arg capture_hidden=true`` sent the string
+failure: ``amplifier-browser-bridge cmd <target> screenshot --arg capture_hidden=true`` sent the string
 ``"true"``; `cdp.py`'s `requires_cdp()` checked ``args.get("capture_hidden") is True``,
 which is `False` for a string; the hub never escalated to CDP, and the device's
 `screenshot()` failed loud with "requires the target tab to already be active" --

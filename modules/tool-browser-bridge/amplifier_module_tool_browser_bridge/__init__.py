@@ -28,14 +28,15 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from amplifier_browser_bridge import HubClient, HubError, Target
+from amplifier_browser_bridge.legacy_env import warn_legacy_env_vars
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 from amplifier_core import ToolResult
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HUB_URL = os.environ.get("ABB_HUB_URL", "ws://127.0.0.1:8900/agent")
-DEFAULT_TOKEN = os.environ.get("ABB_TOKEN")
+DEFAULT_HUB_URL = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://127.0.0.1:8900/agent")
+DEFAULT_TOKEN = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
 
 # Repeated verbatim in every tab-acting tool's description below -- see
 # mcp_server.py's module docstring for why this is plain repeated text rather
@@ -538,7 +539,7 @@ def _build_tools() -> list[_HubTool]:
             "as text (e.g. a canvas-rendered document viewer, like Word/PowerPoint Online) and you "
             "want text back rather than an image. Requires a vision provider configured via "
             "environment variable on the machine running this hub/tool (ANTHROPIC_API_KEY / "
-            "OPENAI_API_KEY / GOOGLE_API_KEY, or ABB_VISION_PROVIDER to pin one) -- fails loud with "
+            "OPENAI_API_KEY / GOOGLE_API_KEY, or AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to pin one) -- fails loud with "
             "setup instructions ({'ok': false, 'error': ...}) if none is configured; never silently "
             "returns empty text. capture_hidden defaults to true here (unlike browser_screenshot) -- "
             "this tool exists specifically to reach tabs you shouldn't activate just to look at. "
@@ -777,6 +778,11 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> dict[
     """Mount every browser-bridge tool into the coordinator (the mount() Iron Law:
     each tool is registered via `coordinator.mount("tools", tool, name=tool.name)`).
     """
+    # See legacy_env.py's module docstring and MIGRATION.md -- fails loud (a
+    # logged warning, before any tool is registered) if a pre-rename ABB_*
+    # variable is still set in the Amplifier host process's environment,
+    # rather than silently falling through to a default.
+    warn_legacy_env_vars()
     tools = _build_tools()
     for tool in tools:
         await coordinator.mount("tools", tool, name=tool.name)

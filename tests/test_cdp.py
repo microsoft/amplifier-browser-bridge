@@ -84,7 +84,7 @@ def test_requires_cdp_false_by_default() -> None:
 
 
 def test_requires_cdp_accepts_string_and_int_true_forms() -> None:
-    """Regression test for a real reported bug: `abb cmd <target> screenshot
+    """Regression test for a real reported bug: `amplifier-browser-bridge cmd <target> screenshot
     --arg capture_hidden=true` sends the STRING "true" (the CLI's `cmd` escape
     hatch always parses --arg key=value as strings). Before args_bool.truthy()
     was wired in here, `requires_cdp` used a strict `is True` identity check,

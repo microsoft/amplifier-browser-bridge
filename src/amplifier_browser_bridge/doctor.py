@@ -1,4 +1,4 @@
-"""`abb doctor` -- diagnose exactly which link in the setup chain is broken.
+"""`amplifier-browser-bridge doctor` -- diagnose exactly which link in the setup chain is broken.
 
 Checks run in dependency order and stop naming downstream checks as failures once an
 upstream one has already failed (a hub that's unreachable makes "token match" and
@@ -61,9 +61,9 @@ def _check_token_file_siblings(active_path: Path, store: TokenStore) -> DoctorCh
         return DoctorCheck(
             "token_file_siblings",
             "fail",
-            f"found token-like file(s) beside {active_path} that are NOT read by abb "
+            f"found token-like file(s) beside {active_path} that are NOT read by amplifier-browser-bridge "
             f"init/hub/doctor and hold a different value: {names}. Only {active_path} "
-            "(or $ABB_TOKEN_FILE) is consulted -- if one of these is what you pasted "
+            "(or $AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE) is consulted -- if one of these is what you pasted "
             "into the extension's options page, the hub will reject it. Delete the "
             "stray file or copy its value into the active token file.",
         )
@@ -98,8 +98,8 @@ async def run_doctor(
             DoctorCheck(
                 "token_store",
                 "ok",
-                f"auth DISABLED (no token found at {file_path} or in ABB_HUB_TOKEN) -- fine for "
-                "local dev on a private tailnet, run `abb init` before sharing this hub with "
+                f"auth DISABLED (no token found at {file_path} or in AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN) -- fine for "
+                "local dev on a private tailnet, run `amplifier-browser-bridge init` before sharing this hub with "
                 "another device.",
             )
         )
@@ -116,7 +116,7 @@ async def run_doctor(
                 DoctorCheck(
                     "token_match",
                     "fail",
-                    f"hub rejected the token ({message!r}). Confirm ABB_TOKEN/--token here matches "
+                    f"hub rejected the token ({message!r}). Confirm AMPLIFIER_BROWSER_BRIDGE_TOKEN/--token here matches "
                     f"the token in {file_path}, and matches what's pasted into the extension's "
                     "options page.",
                 )
@@ -127,7 +127,7 @@ async def run_doctor(
                 DoctorCheck(
                     "hub_reachable",
                     "fail",
-                    f"cannot reach hub at {hub_url}: {message}. Is `abb hub` running? Check the "
+                    f"cannot reach hub at {hub_url}: {message}. Is `amplifier-browser-bridge hub` running? Check the "
                     "host/port and that you're on the same tailnet.",
                 )
             )
@@ -139,7 +139,7 @@ async def run_doctor(
             DoctorCheck(
                 "hub_reachable",
                 "fail",
-                f"cannot reach hub at {hub_url}: {e}. Is `abb hub` running? Check the host/port "
+                f"cannot reach hub at {hub_url}: {e}. Is `amplifier-browser-bridge hub` running? Check the host/port "
                 "and that you're on the same tailnet.",
             )
         )

@@ -8,12 +8,12 @@
 //
 // `injected.js` is injected via `chrome.scripting.executeScript({files: ['injected.js']})`
 // as a plain CLASSIC script (no `type: module`) -- it cannot use static `import`.
-// Dynamic `import()` was considered and rejected: `window.__abb` must be
+// Dynamic `import()` was considered and rejected: `window.__amplifierBrowserBridge` must be
 // synchronously available the instant injection completes (background.js's very next
-// `executeScript` call invokes `window.__abb.dispatch(...)` immediately afterward), and
-// an async import introduces a real race between "file injected" and "__abb ready"
+// `executeScript` call invokes `window.__amplifierBrowserBridge.dispatch(...)` immediately afterward), and
+// an async import introduces a real race between "file injected" and "__amplifierBrowserBridge ready"
 // for a savings that's purely about test convenience. So the bookkeeping algorithm
-// below is mirrored, by hand, inside injected.js's `__abb` closure (its own `refFor`/
+// below is mirrored, by hand, inside injected.js's `__amplifierBrowserBridge` closure (its own `refFor`/
 // `resolveRef`) -- exactly the discipline CONTRIBUTING.md already documents for
 // protocol.py/background.js ("keep the two protocol implementations in sync by hand").
 // This module exists so the ALGORITHM'S correctness (not injected.js's literal source)

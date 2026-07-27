@@ -1,7 +1,7 @@
-"""Tests for setup.py -- the `abb init` helpers.
+"""Tests for setup.py -- the `amplifier-browser-bridge init` helpers.
 
 The load-bearing property under test: re-running these functions (simulating an
-`abb init` re-run after `git pull`) must NEVER destroy an existing token or change the
+`amplifier-browser-bridge init` re-run after `git pull`) must NEVER destroy an existing token or change the
 staging directory's path -- that's the exact "update clobbers your config" bug this
 project shipped with (extension/config.js).
 """
@@ -43,7 +43,7 @@ def test_ensure_token_file_creates_new_token(tmp_path: Path) -> None:
 
 
 def test_ensure_token_file_is_idempotent(tmp_path: Path) -> None:
-    """The core regression test: calling this twice (simulating `abb init` run once,
+    """The core regression test: calling this twice (simulating `amplifier-browser-bridge init` run once,
     then re-run after a later `git pull`) must return the SAME token both times."""
     token_path = tmp_path / "tokens.json"
     first = ensure_token_file(token_path)
@@ -64,7 +64,7 @@ def test_ensure_token_file_force_regenerates(tmp_path: Path) -> None:
 
 def test_ensure_token_file_preserves_existing_devices_map(tmp_path: Path) -> None:
     """A hub operator may have hand-added per-device token overrides -- re-running
-    `abb init` without --force must not touch the file at all (not even to reformat
+    `amplifier-browser-bridge init` without --force must not touch the file at all (not even to reformat
     it), so those overrides survive untouched."""
     token_path = tmp_path / "tokens.json"
     token_path.write_text(
@@ -89,14 +89,14 @@ def test_find_extension_source_resolves_to_real_repo_extension_dir() -> None:
 
 def test_find_extension_source_honors_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("ABB_EXTENSION_SRC", str(tmp_path))
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC", str(tmp_path))
     assert find_extension_source() == tmp_path
 
 
 def test_find_extension_source_env_override_missing_manifest_fails_loud(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("ABB_EXTENSION_SRC", str(tmp_path))
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC", str(tmp_path))
     with pytest.raises(ExtensionSourceNotFoundError):
         find_extension_source()
 
@@ -117,7 +117,7 @@ def test_stage_extension_copies_runtime_files(tmp_path: Path) -> None:
 
 def test_stage_extension_is_safe_to_rerun_and_preserves_dest_path(tmp_path: Path) -> None:
     """The core regression test for the update story: re-staging into the SAME dest
-    (simulating a `git pull` + `abb init` re-run) must succeed and leave the directory
+    (simulating a `git pull` + `amplifier-browser-bridge init` re-run) must succeed and leave the directory
     at the same path -- proving file updates never require a new extension identity."""
     dest = tmp_path / "staged"
     first = stage_extension(dest=dest)

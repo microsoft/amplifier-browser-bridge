@@ -346,7 +346,7 @@ def test_incident_replay_elevation_cannot_self_attest_even_when_the_origin_is_in
     inclusion never bypasses classification), but critically its
     confirmation is REFUSED through the ONLY redemption route this system
     has (`Hub._handle_agent_confirm`, reached identically by an agent's own
-    `confirm` call and a human running `abb confirm`) -- proving that a
+    `confirm` call and a human running `amplifier-browser-bridge confirm`) -- proving that a
     broad, legitimate write scope does not implicitly grant the ability to
     self-attest an Administrator escalation on that same origin.
     """
@@ -392,7 +392,7 @@ def test_incident_replay_elevation_cannot_self_attest_even_when_the_origin_is_in
     assert gated_result["redeem"] == "unredeemable"
 
     # The confirm attempt (the same route an agent's own confirm call, or a
-    # human's `abb confirm`, would reach) is refused, never dispatched.
+    # human's `amplifier-browser-bridge confirm`, would reach) is refused, never dispatched.
     assert confirm_attempt_result["ok"] is False
     assert "e2" not in [ref for _cmd, ref in fake_ws.dispatched if ref is not None]
 

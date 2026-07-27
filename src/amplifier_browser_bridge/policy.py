@@ -81,7 +81,7 @@ practice, preceded by a `snapshot` or `wait_for` in this system's intended
 usage (there is no other way to obtain a `ref`), the hub already has the data
 it needs by the time a `click` arrives.
 
-**Staleness, handled conservatively:** `injected.js`'s `window.__abb` (and
+**Staleness, handled conservatively:** `injected.js`'s `window.__amplifierBrowserBridge` (and
 therefore every `ref`) is destroyed on navigation (see injected.js's module
 docstring). If the hub's own last-observed URL for a tab (`_tab_hosts`, fed by
 `navigate`/`snapshot`/`read`/`tabs` results -- never by anything a caller
@@ -330,7 +330,7 @@ class Denylist:
         """Resolution order (design doc + auth.py's TokenStore precedent):
 
             1. explicit `path` argument
-            2. `ABB_POLICY_FILE` environment variable
+            2. `AMPLIFIER_BROWSER_BRIDGE_POLICY_FILE` environment variable
             3. conventional path (~/.config/amplifier-browser-bridge/policy.json)
             4. built-in DEFAULT_DENYLIST if none of the above exist
 
@@ -346,7 +346,9 @@ class Denylist:
         import json
         import os
 
-        file_path = Path(path or os.environ.get("ABB_POLICY_FILE") or DEFAULT_POLICY_FILE).expanduser()
+        file_path = Path(
+            path or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_POLICY_FILE") or DEFAULT_POLICY_FILE
+        ).expanduser()
         if not file_path.is_file():
             return Denylist()
         try:
@@ -1350,7 +1352,7 @@ class PolicyEngine:
         only redemption route this codebase has, or ever will have -- see
         docs/designs/approval-channel-options.md's cancellation note) always
         calls this with `via="agent"`, whether the caller is an agent's own
-        `confirm` message or a human running `abb confirm` from the CLI.
+        `confirm` message or a human running `amplifier-browser-bridge confirm` from the CLI.
 
         A confirmation whose `PendingConfirmation.redeem` is `"unredeemable"`
         is REFUSED here unconditionally -- this is the fix for the live

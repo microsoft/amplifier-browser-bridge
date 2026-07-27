@@ -86,7 +86,7 @@ DEFAULT_PORT = 8900
 # default for real-world pages while still bounding the worst case; a caller
 # with an even heavier page can raise it further per-command via
 # `args.timeout_s` (see protocol.py's HUB_ONLY_ARGS) up to MAX_COMMAND_TIMEOUT,
-# or the hub operator can change the default via `abb hub --command-timeout`.
+# or the hub operator can change the default via `amplifier-browser-bridge hub --command-timeout`.
 DEFAULT_COMMAND_TIMEOUT = 120.0
 # Accepted range for a caller-supplied `args.timeout_s` override (see
 # `Hub._extract_timeout_override`). Floor prevents a mistaken `0`/negative
@@ -232,7 +232,7 @@ class Hub:
         self._session_locks: dict[str, asyncio.Lock] = {}
         if not token_store.auth_enabled:
             logger.warning(
-                "No hub token configured (ABB_HUB_TOKEN / token file) -- running with "
+                "No hub token configured (AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN / token file) -- running with "
                 "auth DISABLED. Fine for local dev on a private tailnet; never ship this way."
             )
 
@@ -659,7 +659,7 @@ class Hub:
             # approval channel (a design was considered and explicitly
             # CANCELLED -- see docs/designs/approval-channel-options.md).
             # Reached by both an agent's own `confirm` call and a human running
-            # `abb confirm` from the CLI; see cli.py's `confirm` docstring.
+            # `amplifier-browser-bridge confirm` from the CLI; see cli.py's `confirm` docstring.
             # `consume_confirmation` refuses any token whose
             # PendingConfirmation.redeem != "agent" -- this is what makes
             # `redeem: "unredeemable"` structurally unredeemable through this
@@ -1156,7 +1156,7 @@ class Hub:
                     "The page may still be loading or a heavy SPA may still be hydrating. Raise "
                     f"the limit for just this command with args.timeout_s=<seconds> (CLI: "
                     f"--timeout <seconds>; MCP tools: timeout_s param), up to {MAX_COMMAND_TIMEOUT}s, "
-                    "or raise the hub's own default with `abb hub --command-timeout <seconds>`."
+                    "or raise the hub's own default with `amplifier-browser-bridge hub --command-timeout <seconds>`."
                     f"{self._timeout_hint(cmd.command, cmd.args)}"
                 ),
             }

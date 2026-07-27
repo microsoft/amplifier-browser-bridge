@@ -74,10 +74,10 @@ uv tool install .
 
 # 2. First-run setup: generates a hub token, stages the extension into a stable directory,
 #    and prints the exact remaining manual steps.
-abb init
+amplifier-browser-bridge init
 ```
 
-`abb init` prints something like:
+`amplifier-browser-bridge init` prints something like:
 
 ```
 Generated new hub token (stored in ~/.config/amplifier-browser-bridge/tokens.json).
@@ -86,7 +86,7 @@ Staged extension -> ~/.local/share/amplifier-browser-bridge/extension
 Remaining steps (manual -- Edge has no CLI for these):
 
   1. Start the hub:
-       ABB_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json abb hub --host 0.0.0.0 --port 8900
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 0.0.0.0 --port 8900
 
   2. Load the extension:
        edge://extensions -> enable Developer mode -> Load unpacked ->
@@ -99,20 +99,20 @@ Remaining steps (manual -- Edge has no CLI for these):
        Click Save.
 
   4. Confirm it worked:
-       ABB_TOKEN=<token> abb doctor --hub-url ws://127.0.0.1:8900/agent
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8900/agent
 ```
 
 Follow those four steps -- step 2 (loading an unpacked extension) is a genuinely manual step;
 Edge has no CLI or API for it. Then issue a command:
 
 ```bash
-abb devices
-abb tabs <device_id>
-abb snapshot <device_id>/<tab_id>
-abb click <device_id>/<tab_id> <ref>
+amplifier-browser-bridge devices
+amplifier-browser-bridge tabs <device_id>
+amplifier-browser-bridge snapshot <device_id>/<tab_id>
+amplifier-browser-bridge click <device_id>/<tab_id> <ref>
 ```
 
-**`abb doctor` diagnoses a stuck setup.** It checks, in order, the token file, hub
+**`amplifier-browser-bridge doctor` diagnoses a stuck setup.** It checks, in order, the token file, hub
 reachability, token match, and whether a device has ever connected -- and stops at the first
 broken link with a specific, actionable message rather than a wall of failures:
 
@@ -138,9 +138,9 @@ fixes a real problem: earlier versions shipped a live-shaped placeholder credent
 `extension/config.js` that had to be hand-edited and that every file update silently clobbered.
 Now:
 
-- **Rotating a token** means running `abb init --force` (regenerates it) and re-pasting it into
+- **Rotating a token** means running `amplifier-browser-bridge init --force` (regenerates it) and re-pasting it into
   the options page -- no tracked file to edit.
-- **Updating the extension** (re-running `abb init` after a `git pull`) re-copies the JS/HTML/
+- **Updating the extension** (re-running `amplifier-browser-bridge init` after a `git pull`) re-copies the JS/HTML/
   manifest files into the same staging directory, which never touches `chrome.storage.local` --
   Chrome/Edge ties that storage to the extension's install path, not to file contents. Verified:
   see "Update survives configuration" below.
@@ -150,9 +150,9 @@ Now:
 
 ### Enabling auth
 
-Auth is disabled by default in dev and this is loudly logged by the hub. `abb init` generates a
-real token and writes it to the hub's token file; pass `ABB_TOKEN` (matching what's on the
-extension's options page) to the CLI, MCP server, or `abb doctor`. See `docs/PROTOCOL.md`
+Auth is disabled by default in dev and this is loudly logged by the hub. `amplifier-browser-bridge init` generates a
+real token and writes it to the hub's token file; pass `AMPLIFIER_BROWSER_BRIDGE_TOKEN` (matching what's on the
+extension's options page) to the CLI, MCP server, or `amplifier-browser-bridge doctor`. See `docs/PROTOCOL.md`
 ("Authentication") for the full resolution order.
 
 ### Verified clean-room install
@@ -160,22 +160,22 @@ extension's options page) to the CLI, MCP server, or `abb doctor`. See `docs/PRO
 Run 2026-07-26 with a genuinely NON-editable install -- the exact `uv tool install .` path a
 real user takes, not `uv pip install -e .` (which resolves straight back to a checkout and
 would silently mask a packaging bug like the one this transcript is proving fixed). New
-virtualenv, `ABB_EXTENSION_SRC` explicitly unset, and a separate hub on port 8901 with its own
+virtualenv, `AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC` explicitly unset, and a separate hub on port 8901 with its own
 token file and its own `$HOME` -- never touching the real deployment's port 8900 hub or
 `~/.config/amplifier-browser-bridge/`:
 
 ```console
-$ uv venv /tmp/abb-cleanroom/.venv --python 3.12
-$ uv pip install --python /tmp/abb-cleanroom/.venv/bin/python /path/to/amplifier-browser-bridge
+$ uv venv /tmp/amplifier-browser-bridge-cleanroom/.venv --python 3.12
+$ uv pip install --python /tmp/amplifier-browser-bridge-cleanroom/.venv/bin/python /path/to/amplifier-browser-bridge
 Resolved 13 packages in 86ms
    Building amplifier-browser-bridge @ file:///path/to/amplifier-browser-bridge
       Built amplifier-browser-bridge @ file:///path/to/amplifier-browser-bridge
 Installed 13 packages
 
-$ env -u ABB_EXTENSION_SRC HOME=/tmp/abb-cleanroom/home \
-    /tmp/abb-cleanroom/.venv/bin/abb init --hub-host 127.0.0.1 --hub-port 8901
-Generated new hub token (stored in /tmp/abb-cleanroom/home/.config/amplifier-browser-bridge/tokens.json).
-Staged extension -> /tmp/abb-cleanroom/home/.local/share/amplifier-browser-bridge/extension
+$ env -u AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC HOME=/tmp/amplifier-browser-bridge-cleanroom/home \
+    /tmp/amplifier-browser-bridge-cleanroom/.venv/bin/amplifier-browser-bridge init --hub-host 127.0.0.1 --hub-port 8901
+Generated new hub token (stored in /tmp/amplifier-browser-bridge-cleanroom/home/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /tmp/amplifier-browser-bridge-cleanroom/home/.local/share/amplifier-browser-bridge/extension
 
 Remaining steps (manual -- Edge has no CLI for these):
   1. Start the hub: ...
@@ -183,16 +183,16 @@ Remaining steps (manual -- Edge has no CLI for these):
   3. Configure it: ...
   4. Confirm it worked: ...
 
-$ ls /tmp/abb-cleanroom/home/.local/share/amplifier-browser-bridge/extension/
+$ ls /tmp/amplifier-browser-bridge-cleanroom/home/.local/share/amplifier-browser-bridge/extension/
 args_bool.mjs  background.js  combine_frames.mjs  config_validate.mjs  download_claim.mjs
 fetch_utils.mjs  frame_refs.mjs  injected.js  manifest.json  options.html  options.js
 ref_registry.mjs
 
-$ ABB_TOKEN_FILE=.../tokens.json abb hub --host 127.0.0.1 --port 8901
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=.../tokens.json amplifier-browser-bridge hub --host 127.0.0.1 --port 8901
 amplifier-browser-bridge hub listening on ws://127.0.0.1:8901/device (extensions) and
-ws://127.0.0.1:8901/agent (agents); audit log -> ./abb-audit.jsonl
+ws://127.0.0.1:8901/agent (agents); audit log -> ./amplifier-browser-bridge-audit.jsonl
 
-$ ABB_HUB_URL=ws://127.0.0.1:8901/agent ABB_TOKEN=<token> abb doctor --hub-url ws://127.0.0.1:8901/agent
+$ AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://127.0.0.1:8901/agent AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8901/agent
 [ok]   token_store: auth enabled; token file: .../tokens.json
 [ok]   token_file_siblings: no other token-like files found alongside .../tokens.json
 [ok]   hub_reachable: hub reachable at ws://127.0.0.1:8901/agent
@@ -200,10 +200,10 @@ $ ABB_HUB_URL=ws://127.0.0.1:8901/agent ABB_TOKEN=<token> abb doctor --hub-url w
 [FAIL] device_connected: no browser device has ever connected to this hub. ...
 ```
 
-Before this fix, the `abb init` step above raised `ExtensionSourceNotFoundError` on a
+Before this fix, the `amplifier-browser-bridge init` step above raised `ExtensionSourceNotFoundError` on a
 non-editable install -- the wheel didn't contain `extension/` at all (see
 `[tool.hatch.build.targets.wheel.force-include]` in `pyproject.toml` and
-`tests/test_packaging.py`, which builds a real wheel and asserts every file `abb init` needs
+`tests/test_packaging.py`, which builds a real wheel and asserts every file `amplifier-browser-bridge init` needs
 is actually inside it).
 
 The extension was loaded via Playwright's headless Chromium (`--load-extension=./extension
@@ -214,7 +214,7 @@ The extension was loaded via Playwright's headless Chromium (`--load-extension=.
   `chrome.runtime.openOptionsPage()`), with no manual click needed to discover it exists.
 - Filling in the Hub URL and token fields and clicking Save (the exact UI a real user drives)
   persisted both values into `chrome.storage.local`, confirmed by reading it back directly:
-  `{"abb_hub_url": "ws://127.0.0.1:8910/device", "abb_hub_token": "<set>"}`.
+  `{"amplifier_browser_bridge_hub_url": "ws://127.0.0.1:8910/device", "amplifier_browser_bridge_hub_token": "<set>"}`.
 - The extension's own status check (the same message the options page polls) correctly reported
   `configured: true` with a real generated `device_id`.
 
@@ -227,26 +227,26 @@ instantly. This is an environment-specific sandboxing artifact of that one conta
 defect in the extension -- the identical mechanism (raw `ws://` from an MV3 service worker) is
 independently measured working on real Edge installs on macOS and Android (see
 `docs/designs/browser-bridge.md` section 2). The live device-handshake step of this proof could
-not be completed in that specific sandbox; every other step -- install, `abb init`, `abb hub`,
-`abb doctor`'s diagnostic chain, extension load, options-page auto-open, and config persistence
+not be completed in that specific sandbox; every other step -- install, `amplifier-browser-bridge init`, `amplifier-browser-bridge hub`,
+`amplifier-browser-bridge doctor`'s diagnostic chain, extension load, options-page auto-open, and config persistence
 via the real UI -- was verified with real commands and real output as shown above.
 
 ### Update survives configuration (verified)
 
 To prove the fix for the original bug (editing `extension/config.js` and copying it over a
 running install silently wiped the working token), the clean-room extension directory was
-re-staged in place -- `abb init` re-run with the same `--dest` after a source file changed,
+re-staged in place -- `amplifier-browser-bridge init` re-run with the same `--dest` after a source file changed,
 simulating a `git pull` + reinstall:
 
 ```console
-$ abb init --dest ./extension --token-file ./tokens.json ...
+$ amplifier-browser-bridge init --dest ./extension --token-file ./tokens.json ...
 Reusing existing hub token (stored in ./tokens.json).   # <- NOT regenerated
 Staged extension -> ./extension                          # <- same path, files updated in place
 ```
 
 The already-loaded browser profile's `chrome.storage.local` was re-checked afterward (same
 profile directory, extension reloaded from the now-updated staging directory) and found
-**unchanged**: `abb_hub_url`, `abb_hub_token`, and the extension's own generated `abb_device_id`
+**unchanged**: `amplifier_browser_bridge_hub_url`, `amplifier_browser_bridge_hub_token`, and the extension's own generated `amplifier_browser_bridge_device_id`
 all held the exact same values as before the update. The token file's `default` token was also
 confirmed byte-for-byte unchanged. This is the structural fix: configuration lives in
 `chrome.storage.local`, keyed to the extension's stable install path -- never in a file that an
@@ -264,7 +264,7 @@ first-class concept the agent surface exposes honestly, not an implementation de
 | `dormant` | Mobile without the exemption, or a device never seen | Same queued shape -- drains whenever the device next reconnects, which may be much longer |
 
 **A command to a non-live device never blocks.** It returns instantly with a queued status; use
-`abb cmd` / `browser_poll` to check on it later. A tool call that silently hangs for two minutes
+`amplifier-browser-bridge cmd` / `browser_poll` to check on it later. A tool call that silently hangs for two minutes
 is indistinguishable from a broken system -- this project treats that as unacceptable.
 
 **On Android, the battery-optimization exemption is an onboarding requirement, not a tip.**
@@ -301,7 +301,7 @@ exclude. That same section names the two conditions that would reopen it: a chan
 security property is measured against every capability the agent holds (not just the one this
 experiment tested), or a per-session way to deny `chrome.debugger` entirely so an agent can't reach
 CDP at all. Absent either, **the only real lever today is session scope** -- declare a narrow
-`write` scope up front (`abb session-establish`) so the action is denied outright, rather than
+`write` scope up front (`amplifier-browser-bridge session-establish`) so the action is denied outright, rather than
 relying on a gate that a human will never actually see.
 
 ## Platform support
@@ -335,7 +335,7 @@ tests/                           unit tests for everything testable without a li
 
 ## Agent surfaces
 
-Beyond the CLI shown above, the same lib is exposed as an MCP server (`abb-mcp`, for any
+Beyond the CLI shown above, the same lib is exposed as an MCP server (`amplifier-browser-bridge-mcp`, for any
 MCP-speaking client) and an Amplifier tool module (`modules/tool-browser-bridge/`, composed via
 `bundle.md`). Both are thin adapters -- all logic lives in the Python lib. See
 [docs/AGENT_SURFACES.md](docs/AGENT_SURFACES.md) for how to run and configure each, and for the
@@ -343,7 +343,7 @@ proof that both work end-to-end against a real hub.
 
 ```bash
 uv pip install -e ".[mcp]"
-abb-mcp   # runs over stdio, the default every MCP client speaks
+amplifier-browser-bridge-mcp   # runs over stdio, the default every MCP client speaks
 ```
 
 ## Testing

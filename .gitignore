@@ -10,14 +10,14 @@ dist/
 build/
 
 # Secrets and local runtime state -- NEVER commit tokens or audit logs
-.abb/
+.amplifier-browser-bridge/
 tokens.json
 *.token
-abb-audit.jsonl
+amplifier-browser-bridge-audit.jsonl
 audit*.jsonl
 # Android CRX signing key (scripts/package-android.sh) -- defense in depth; the
 # default location is already outside the repo (~/.config/...), this guards
-# against ABB_ANDROID_SIGNING_KEY ever pointing inside it by mistake.
+# against AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY ever pointing inside it by mistake.
 *.pem
 
 # Editors / OS

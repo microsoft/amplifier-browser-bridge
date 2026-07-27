@@ -1,6 +1,6 @@
 """FIX 4 (product review panel FAIL): "'a gate that fires often will be disabled' -- presented
 as the deciding rationale for cancelling Phase 6, with zero cited firing-rate or disablement
-data." This is the instrument: `abb gate-summary` reads the existing audit log and reports the
+data." This is the instrument: `amplifier-browser-bridge gate-summary` reads the existing audit log and reports the
 numbers the panel said were missing, so the next person deciding whether the gate is too noisy
 or too quiet has a number instead of an aphorism.
 
@@ -24,7 +24,7 @@ def _write_audit_log(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def test_gate_summary_reports_firing_redemption_and_escalation_counts(tmp_path: Any) -> None:
-    audit_path = tmp_path / "abb-audit.jsonl"
+    audit_path = tmp_path / "amplifier-browser-bridge-audit.jsonl"
     _write_audit_log(
         audit_path,
         [
@@ -71,7 +71,7 @@ def test_gate_summary_missing_audit_log_fails_loud(tmp_path: Any) -> None:
 
 
 def test_gate_summary_empty_log_reports_all_zeros(tmp_path: Any) -> None:
-    audit_path = tmp_path / "abb-audit.jsonl"
+    audit_path = tmp_path / "amplifier-browser-bridge-audit.jsonl"
     audit_path.write_text("", encoding="utf-8")
 
     runner = CliRunner()

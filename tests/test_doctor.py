@@ -1,4 +1,4 @@
-"""Tests for doctor.py -- `abb doctor`'s diagnostic checks.
+"""Tests for doctor.py -- `amplifier-browser-bridge doctor`'s diagnostic checks.
 
 Runs a real Hub over a real (localhost, ephemeral-port) aiohttp test server so
 HubClient exercises the actual wire protocol -- not a fake/mock -- for the
@@ -39,7 +39,7 @@ def token_file(tmp_path: Path) -> Path:
 async def test_doctor_all_ok_with_no_devices_connected(tmp_path: Path, token_file: Path) -> None:
     """A freshly-started hub with a valid token and zero devices: reachable and
     token-match both pass, device_connected fails with an actionable message --
-    this is the exact state right after `abb init` + `abb hub`, before the
+    this is the exact state right after `amplifier-browser-bridge init` + `amplifier-browser-bridge hub`, before the
     extension has been configured yet."""
     hub = Hub(
         token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
@@ -123,7 +123,7 @@ async def test_doctor_reports_unreachable_hub_distinctly(tmp_path: Path, token_f
 
     hub_check = _by_name(checks, "hub_reachable")
     assert not hub_check.ok
-    assert "Is `abb hub` running" in hub_check.message
+    assert "Is `amplifier-browser-bridge hub` running" in hub_check.message
     assert _by_name(checks, "token_match").status == "skipped"
     assert _by_name(checks, "device_connected").status == "skipped"
     assert all_ok(checks) is False
@@ -183,12 +183,12 @@ def test_doctor_token_file_path_honors_env_var_not_just_hardcoded_default(
 ) -> None:
     """Regression for a second Bug-C-adjacent inconsistency: the path doctor
     DISPLAYS must be the same one `load_token_store` actually reads -- previously
-    the displayed path ignored $ABB_TOKEN_FILE and always showed the hardcoded
+    the displayed path ignored $AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE and always showed the hardcoded
     default, so a user following an env-var-based setup saw the wrong path in every
     message."""
     custom_path = tmp_path / "custom-tokens.json"
     custom_path.write_text(json.dumps({"default": "tok", "devices": {}}), encoding="utf-8")
-    monkeypatch.setenv("ABB_TOKEN_FILE", str(custom_path))
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE", str(custom_path))
 
     checks = asyncio.run(run_doctor("ws://127.0.0.1:1/agent", None, None))
 

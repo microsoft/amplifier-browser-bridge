@@ -83,7 +83,7 @@ def test_content_extraction_commands_are_browser_level() -> None:
     """None of the new content-extraction commands are dispatched into
     injected.js's page-world path -- fetch_bytes/downloads_list/download/
     wait_download are device-only, and grab_image runs in the page's MAIN
-    world via its own executeScript call, not window.__abb.dispatch()."""
+    world via its own executeScript call, not window.__amplifierBrowserBridge.dispatch()."""
     for name in ("fetch_bytes", "grab_image", "downloads_list", "download", "wait_download"):
         assert name in BROWSER_LEVEL_COMMANDS
         assert name not in PAGE_WORLD_COMMANDS

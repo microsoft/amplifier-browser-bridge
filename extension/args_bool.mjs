@@ -11,7 +11,7 @@
 // background.js's `wantsAllFrames()`/`wantsWake()` each independently
 // reinvented the same `=== true || === "true" || === 1` check, while the
 // HUB's CDP-escalation check (cdp.py's `requires_cdp`) used a STRICT `is
-// True` identity check instead -- exactly the asymmetry that let `abb cmd
+// True` identity check instead -- exactly the asymmetry that let `amplifier-browser-bridge cmd
 // <target> screenshot --arg capture_hidden=true` (the CLI's escape hatch,
 // which always sends STRING args) silently fail to escalate to CDP: the
 // hub never saw a recognized "true", so it never set `_cdp` on the

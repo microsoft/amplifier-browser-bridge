@@ -1,5 +1,5 @@
 """Tests for the shared boolean-arg coercion helper (args_bool.py) -- the fix for a
-real reported bug: `abb cmd <target> screenshot --arg capture_hidden=true` sent the
+real reported bug: `amplifier-browser-bridge cmd <target> screenshot --arg capture_hidden=true` sent the
 STRING "true" (the CLI's `cmd` escape hatch always sends string args), but
 `cdp.py`'s `requires_cdp()` checked `args.get("capture_hidden") is True`, which is
 `False` for a string. The hub never escalated to CDP.

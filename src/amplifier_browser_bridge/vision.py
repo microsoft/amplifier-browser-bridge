@@ -32,8 +32,8 @@ standalone OSS project, not bound to any single agent framework's provider
 config) -- this follows the same env-var-configured-provider pattern
 documented in Amplifier's `image-vision` skill: try providers in a fixed
 priority order (fastest/cheapest first), first one with an API key present
-wins. `ABB_VISION_PROVIDER` pins a specific provider and skips the
-auto-detect order. `ABB_VISION_MODEL` overrides the default model for
+wins. `AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER` pins a specific provider and skips the
+auto-detect order. `AMPLIFIER_BROWSER_BRIDGE_VISION_MODEL` overrides the default model for
 whichever provider is selected.
 
 Fails loud, naming exactly which environment variable(s) would satisfy it, if
@@ -90,22 +90,22 @@ def resolve_provider() -> VisionConfig:
     """Pick a vision provider from the environment. Raises `VisionConfigError`
     naming exactly what's missing if none is usable -- never returns a
     half-configured result."""
-    override = os.environ.get("ABB_VISION_PROVIDER")
-    model_override = os.environ.get("ABB_VISION_MODEL")
+    override = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER")
+    model_override = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_VISION_MODEL")
 
     if override:
         override = override.strip().lower()
         if override not in _ENV_VAR_BY_PROVIDER:
             raise VisionConfigError(
-                f"ABB_VISION_PROVIDER={override!r} is not a recognized provider. "
+                f"AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER={override!r} is not a recognized provider. "
                 f"Valid values: {sorted(_ENV_VAR_BY_PROVIDER)}."
             )
         env_var = _ENV_VAR_BY_PROVIDER[override]
         api_key = os.environ.get(env_var)
         if not api_key:
             raise VisionConfigError(
-                f"ABB_VISION_PROVIDER={override!r} was requested, but {env_var} is not set. "
-                f"Set {env_var} to a valid API key, or unset ABB_VISION_PROVIDER to auto-detect "
+                f"AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER={override!r} was requested, but {env_var} is not set. "
+                f"Set {env_var} to a valid API key, or unset AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to auto-detect "
                 "another configured provider."
             )
         return VisionConfig(
@@ -120,7 +120,7 @@ def resolve_provider() -> VisionConfig:
     checked = ", ".join(env_var for env_var, _, _ in _PROVIDER_ORDER)
     raise VisionConfigError(
         "No vision provider is configured -- vision-based extraction requires an API key for one "
-        f"of: {checked}. Set one of those environment variables (or ABB_VISION_PROVIDER + its "
+        f"of: {checked}. Set one of those environment variables (or AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER + its "
         "matching key, to pin a specific provider) and retry. This is a distinct, opt-in mechanism "
         "(see docs/PROTOCOL.md's 'Vision-based extraction' section) -- screenshot/fetch_bytes/"
         "grab_image/read/snapshot all work with no vision provider configured at all."

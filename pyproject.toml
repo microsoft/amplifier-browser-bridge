@@ -37,13 +37,13 @@ dependencies = [
 mcp = ["mcp>=1.6"]
 
 [project.scripts]
-abb = "amplifier_browser_bridge.cli:main"
-abb-mcp = "amplifier_browser_bridge.mcp_server:main"
+amplifier-browser-bridge = "amplifier_browser_bridge.cli:main"
+amplifier-browser-bridge-mcp = "amplifier_browser_bridge.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/amplifier_browser_bridge"]
 
-# Ship the extension/ source tree inside the wheel so `abb init` can stage it from a
+# Ship the extension/ source tree inside the wheel so `amplifier-browser-bridge init` can stage it from a
 # real (non-editable) install, not just an editable checkout -- see setup.py's
 # find_extension_source(). The whole directory is force-included (not a curated file
 # list) so the packaged set can never drift from what's actually needed: adding a new

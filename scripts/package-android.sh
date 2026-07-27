@@ -20,18 +20,18 @@
 # Reuses a stable signing key across rebuilds so the extension ID doesn't change
 # every time this script runs (Android's sideload-by-crx flow treats a new ID as a
 # different extension). The key is NEVER written into this repo -- default location
-# is under $HOME/.config, override with ABB_ANDROID_SIGNING_KEY. Never commit it.
+# is under $HOME/.config, override with AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY. Never commit it.
 #
 # Usage:
 #   scripts/package-android.sh
 #   CHROME_BIN=/path/to/chrome scripts/package-android.sh
-#   ABB_ANDROID_SIGNING_KEY=/secure/path/key.pem scripts/package-android.sh
+#   AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY=/secure/path/key.pem scripts/package-android.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTENSION_SRC="$REPO_ROOT/extension"
 DIST_DIR="$REPO_ROOT/dist/android"
-KEY_PATH="${ABB_ANDROID_SIGNING_KEY:-$HOME/.config/amplifier-browser-bridge/android-signing-key.pem}"
+KEY_PATH="${AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY:-$HOME/.config/amplifier-browser-bridge/android-signing-key.pem}"
 
 # --------------------------------------------------------------------------
 # Locate a Chromium/Chrome/Edge binary capable of --pack-extension. Playwright's
@@ -72,7 +72,7 @@ echo "Using browser binary: $CHROME_BIN" >&2
 # (renamed to manifest.json -- --pack-extension packs whatever manifest.json it
 # finds in the directory it's given; it has no notion of "which manifest variant").
 # --------------------------------------------------------------------------
-STAGE_DIR="$(mktemp -d /tmp/abb-android-build.XXXXXX)"
+STAGE_DIR="$(mktemp -d /tmp/amplifier-browser-bridge-android-build.XXXXXX)"
 STAGE_EXT="$STAGE_DIR/extension"
 mkdir -p "$STAGE_EXT"
 cleanup() { rm -rf "$STAGE_DIR"; }

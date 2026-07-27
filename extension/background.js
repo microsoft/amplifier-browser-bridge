@@ -25,7 +25,7 @@ import { EffectsCollector, EFFECTS_WINDOW_MS, emptyEffectsReport } from "./effec
 const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 15000; // measured to hold a desktop MV3 worker alive
 // indefinitely (165 min, zero gaps) when paired with the hub's 20s ping.
-const ALARM_NAME = "abb-revive";
+const ALARM_NAME = "amplifier-browser-bridge-revive";
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 
@@ -45,32 +45,50 @@ let effectsTier = "none";
 
 // ---------------------------------------------------------------------------
 // Runtime configuration -- hub URL + shared token, read from chrome.storage.local
-// (keys: abb_hub_url, abb_hub_token), entered once through options.html/options.js.
+// (keys: amplifier_browser_bridge_hub_url, amplifier_browser_bridge_hub_token), entered once through options.html/options.js.
 //
 // This used to be a tracked source file (extension/config.js) with a real-looking
 // placeholder credential (HUB_TOKEN = "dev-local-token-change-me") that a user had to
 // hand-edit, and that every `git pull` / file-copy update silently overwrote -- see
 // SCRATCH.md and the README's "Setup" section for the incident that motivated this.
 // chrome.storage.local is keyed to the extension's install identity (stable as long as
-// an unpacked install is loaded from the same directory path -- see `abb init`'s staging
+// an unpacked install is loaded from the same directory path -- see `amplifier-browser-bridge init`'s staging
 // directory), not to any file on disk, so re-copying extension/*.js over an existing
 // install can never destroy a configured token/hub-url the way overwriting config.js did.
 //
 // `configured` gates whether connect() ever attempts a WebSocket at all (see connect()
 // below and this module's "fail loud when unconfigured" section) -- this is deliberately
 // NOT the same thing as "the hub will accept it"; that's `token_match`, checked by
-// `abb doctor`, not something the extension can know in advance of trying.
+// `amplifier-browser-bridge doctor`, not something the extension can know in advance of trying.
 let hubUrl = null;
 let hubToken = null;
 let configured = false;
+// True when the OLD (pre-rename) storage keys hold a value but the new ones don't --
+// i.e. this is a pre-existing install whose config needs re-entering, not a fresh
+// unconfigured install. See loadConfig() below and connect()'s "fail loud when
+// unconfigured" section -- distinguishing these two cases is the whole point: a
+// silent connect loop that looks identical to "never configured" would hide exactly
+// the failure mode this project's fail-loud discipline exists to prevent. See
+// MIGRATION.md.
+let legacyConfigDetected = false;
 
 async function loadConfig() {
-  const stored = await chrome.storage.local.get(["abb_hub_url", "abb_hub_token"]);
-  const validation = validateHubUrl(stored.abb_hub_url);
-  configured = isConfigured({ hubUrl: stored.abb_hub_url });
+  const stored = await chrome.storage.local.get([
+    "amplifier_browser_bridge_hub_url",
+    "amplifier_browser_bridge_hub_token",
+    // Pre-rename key names (this extension used to be named "abb"). Read ONLY to
+    // detect their presence for the migration message below -- NEVER used as the
+    // actual config; see this file's module docstring on why config.js's old
+    // hand-edited-placeholder incident makes any such silent fallback unacceptable.
+    "abb_hub_url",
+    "abb_hub_token",
+  ]);
+  const validation = validateHubUrl(stored.amplifier_browser_bridge_hub_url);
+  configured = isConfigured({ hubUrl: stored.amplifier_browser_bridge_hub_url });
+  legacyConfigDetected = !configured && !!(stored.abb_hub_url || stored.abb_hub_token);
   hubUrl = validation.valid ? validation.normalized : null;
-  hubToken = typeof stored.abb_hub_token === "string" ? stored.abb_hub_token : "";
-  return { configured, hubUrl, hubToken, error: validation.error };
+  hubToken = typeof stored.amplifier_browser_bridge_hub_token === "string" ? stored.amplifier_browser_bridge_hub_token : "";
+  return { configured, hubUrl, hubToken, error: validation.error, legacyConfigDetected };
 }
 
 // ---------------------------------------------------------------------------
@@ -78,11 +96,15 @@ async function loadConfig() {
 // "unconfigured" and "connection error" are LEGIBLE at a glance instead of a silent
 // connect loop the user has no way to diagnose (the specific failure mode a real
 // deployment hit: auth silently failed and the only symptom was the extension simply
-// never showing up in `abb devices`, with nothing in the UI explaining why).
+// never showing up in `amplifier-browser-bridge devices`, with nothing in the UI explaining why).
 // ---------------------------------------------------------------------------
 
 const BADGE_STATE = {
   unconfigured: { text: "!", color: "#d9534f", title: "Amplifier Browser Bridge: NOT CONFIGURED -- click the toolbar icon to set the hub URL and token." },
+  // Distinct from "unconfigured": the old (pre-rename) storage keys hold a value, but the
+  // new ones don't. Telling the user to migrate here IS the fail-loud behavior -- see
+  // connect()'s legacyConfigDetected branch and MIGRATION.md.
+  legacy_config: { text: "!", color: "#d9534f", title: "Amplifier Browser Bridge: configuration key names changed -- click the toolbar icon to re-enter your hub URL and token (see MIGRATION.md)." },
   connecting: { text: "\u2026", color: "#f0ad4e", title: "Amplifier Browser Bridge: connecting..." },
   connected: { text: "", color: "#5cb85c", title: "Amplifier Browser Bridge: connected." },
   error: { text: "\u00d7", color: "#d9534f", title: "Amplifier Browser Bridge: connection error -- click the toolbar icon for options." },
@@ -108,11 +130,11 @@ async function getOrCreateId(key) {
 }
 
 async function ensureIdentity() {
-  deviceId = await getOrCreateId("abb_device_id");
+  deviceId = await getOrCreateId("amplifier_browser_bridge_device_id");
   // profile_id is best-effort -- see addressing.py's module docstring for the full
   // honest accounting of what this field actually distinguishes today (not much,
   // yet, given the APIs an MV3 extension has available).
-  profileId = await getOrCreateId("abb_profile_id");
+  profileId = await getOrCreateId("amplifier_browser_bridge_profile_id");
 }
 
 // ---------------------------------------------------------------------------
@@ -388,15 +410,30 @@ async function connect() {
   if (!configured) {
     // Fail loud and legibly, never a silent connect loop against an undefined/invalid
     // URL. The real incident this guards against: auth silently failed and the only
-    // symptom was the extension never appearing in `abb devices`, with nothing in the
+    // symptom was the extension never appearing in `amplifier-browser-bridge devices`, with nothing in the
     // UI explaining why. See this module's "Runtime configuration" section above --
     // storage.onChanged (wired at the bottom of this file) re-triggers connect() the
     // moment the options page saves a valid config, so no manual reload is needed.
-    console.warn(
-      "amplifier-browser-bridge: not configured (no valid Hub URL in chrome.storage.local). " +
-        "Click the extension's toolbar icon to open its options page and set the Hub URL/token."
-    );
-    setBadge("unconfigured");
+    //
+    // legacyConfigDetected distinguishes "never configured" from "configured under the
+    // OLD (pre-rename) key names" -- these are NOT the same failure and must not share a
+    // message. The old keys are never read as config (no silent fallback -- see
+    // MIGRATION.md); this is the fail-loud message telling the user exactly what to do.
+    if (legacyConfigDetected) {
+      console.warn(
+        "amplifier-browser-bridge: configuration not found (this extension renamed its " +
+          "chrome.storage.local keys in a recent version -- the old abb_hub_url/abb_hub_token " +
+          "values are no longer read). Open the options page (click the toolbar icon) and " +
+          "re-enter your Hub URL and token. See MIGRATION.md."
+      );
+      setBadge("legacy_config");
+    } else {
+      console.warn(
+        "amplifier-browser-bridge: not configured (no valid Hub URL in chrome.storage.local). " +
+          "Click the extension's toolbar icon to open its options page and set the Hub URL/token."
+      );
+      setBadge("unconfigured");
+    }
     return;
   }
 
@@ -656,16 +693,16 @@ function requireTabId(target) {
 // injected.js's resolveRef() threw, but nothing on this side ever saw it.
 //
 // The fix: injected.js's dispatch()/rectFor()/focusFor() catch their own
-// errors and return an explicit `{__abbError: message}` sentinel instead of
+// errors and return an explicit `{__amplifierBrowserBridgeError: message}` sentinel instead of
 // letting the promise reject (see injected.js's rectFor() comment).
-// unwrapAbbResult() is the single choke point that turns that sentinel back
+// unwrapAmplifierBrowserBridgeResult() is the single choke point that turns that sentinel back
 // into a real thrown Error on THIS side, so executeCommand()'s existing
 // try/catch reports it as `{ok: false, error: <the real message>}` --
 // preserving the specific, actionable cause (stale generation, disconnected,
 // identity mismatch, unknown ref) rather than a generic fallback.
-function unwrapAbbResult(result) {
-  if (result && typeof result === "object" && typeof result.__abbError === "string") {
-    throw new Error(result.__abbError);
+function unwrapAmplifierBrowserBridgeResult(result) {
+  if (result && typeof result === "object" && typeof result.__amplifierBrowserBridgeError === "string") {
+    throw new Error(result.__amplifierBrowserBridgeError);
   }
   return result;
 }
@@ -700,7 +737,7 @@ async function runInPage(target, command, args) {
   // applied here (a real, deliberate per-tab engagement), never blanket-
   // applied to every tab a `tabs` listing happens to enumerate.
   markEngaged(tabId);
-  // Idempotent: injected.js guards its own definitions behind `if (!window.__abb)`,
+  // Idempotent: injected.js guards its own definitions behind `if (!window.__amplifierBrowserBridge)`,
   // so re-injecting on a page (or frame) that already has it is a safe no-op.
   //
   // Performance finding (live, against a heavy real-world SPA): unconditionally
@@ -741,7 +778,7 @@ async function runInPage(target, command, args) {
     await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
     const results = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
-      func: (cmd, a) => window.__abb.dispatch(cmd, a),
+      func: (cmd, a) => window.__amplifierBrowserBridge.dispatch(cmd, a),
       args: [command, args],
     });
     const single = results[0];
@@ -762,7 +799,7 @@ async function runInPage(target, command, args) {
     // multi-frame read/snapshot path -- see docs/PROTOCOL.md's "Frames" section.
     const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (cmd, a) => window.__abb.dispatch(cmd, a),
+      func: (cmd, a) => window.__amplifierBrowserBridge.dispatch(cmd, a),
       args: [command, args],
     });
     const singleResult = results[0];
@@ -794,7 +831,7 @@ async function runInPage(target, command, args) {
 // reports this identically instead of separate copies of the same tagging logic.
 function attachEngagementInfo(result, tab, activated) {
   let out = result;
-  if (tab.__abbWoke && out && typeof out === "object") {
+  if (tab.__amplifierBrowserBridgeWoke && out && typeof out === "object") {
     out = { ...out, woke: true, wake_reason: "tab was discarded; reloaded to satisfy wake=true" };
   }
   if (activated && out && typeof out === "object") {
@@ -813,7 +850,7 @@ async function runInFrame(tabId, command, args) {
   const bareArgs = { ...args, ref: bareRef };
   const results = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
-    func: (cmd, a) => window.__abb.dispatch(cmd, a),
+    func: (cmd, a) => window.__amplifierBrowserBridge.dispatch(cmd, a),
     args: [command, bareArgs],
   });
   if (results.length === 0) {
@@ -832,10 +869,10 @@ async function runInFrame(tabId, command, args) {
   // unknown/disconnected/identity-mismatch errors) back as a thrown error --
   // it silently resolves with `result: undefined` instead. Measured live:
   // clicking a stale OR a bogus ref both produced `{ok: true, result: null}`
-  // before this fix. unwrapAbbResult() converts injected.js's `{__abbError}`
+  // before this fix. unwrapAmplifierBrowserBridgeResult() converts injected.js's `{__amplifierBrowserBridgeError}`
   // sentinel (see its module comment) back into a real thrown Error here, so
   // executeCommand()'s existing try/catch reports it as `{ok: false, error}`.
-  const result = unwrapAbbResult(results[0].result);
+  const result = unwrapAmplifierBrowserBridgeResult(results[0].result);
   if (result && typeof result === "object" && typeof result.ref === "string") {
     // injected.js's click()/type() echo back the BARE ref it resolved
     // (e.g. "e12") -- report the qualified ref the caller actually used
@@ -869,7 +906,7 @@ async function runInFrame(tabId, command, args) {
 // `read`/`snapshot` result's `frames` entry) remains the precise escape hatch
 // for going straight to one known frame without re-fetching every frame.
 async function runMultiFrame(tabId, command, args) {
-  // Accept a numeric string too (e.g. `abb cmd ... --arg frame_id=762`, or any
+  // Accept a numeric string too (e.g. `amplifier-browser-bridge cmd ... --arg frame_id=762`, or any
   // caller that only has string-typed args to work with) -- coerced once,
   // here, rather than requiring every caller to send a real JS number.
   const requestedFrameId =
@@ -881,7 +918,7 @@ async function runMultiFrame(tabId, command, args) {
   if (requestedFrameId !== undefined) {
     const targeted = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [requestedFrameId] },
-      func: (cmd, a) => window.__abb.dispatch(cmd, a),
+      func: (cmd, a) => window.__amplifierBrowserBridge.dispatch(cmd, a),
       args: [command, args],
     });
     if (targeted.length === 0 || !targeted[0].result) {
@@ -895,7 +932,7 @@ async function runMultiFrame(tabId, command, args) {
 
   const results = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
-    func: (cmd, a) => window.__abb.dispatch(cmd, a),
+    func: (cmd, a) => window.__amplifierBrowserBridge.dispatch(cmd, a),
     args: [command, args],
   });
   const frames = results
@@ -982,7 +1019,7 @@ function isAsleep(tab) {
 
 // Returns the (possibly post-reload) chrome.tabs.Tab; throws a specific,
 // actionable error for a discarded tab when the caller did not opt into
-// waking it. Sets `.__abbWoke` on the returned object (an extra field on our
+// waking it. Sets `.__amplifierBrowserBridgeWoke` on the returned object (an extra field on our
 // own local copy, never sent back to chrome.tabs) so callers can tell the
 // result reflects a fresh reload.
 async function ensureAwake(tabId, args) {
@@ -991,7 +1028,7 @@ async function ensureAwake(tabId, args) {
   if (!wantsWake(args)) throw discardedTabError(tabId);
   await chrome.tabs.reload(tabId);
   tab = await waitForTabAwake(tabId, 15000);
-  tab.__abbWoke = true;
+  tab.__amplifierBrowserBridgeWoke = true;
   return tab;
 }
 
@@ -1066,7 +1103,7 @@ async function tabOpen(args) {
   // never spawn something in front of the human uninvited.
   //
   // truthy() (not `!!args.active`): the old `!!` coercion treated ANY non-empty
-  // string as true, so `abb cmd <device> tab_open --arg active=false` (a
+  // string as true, so `amplifier-browser-bridge cmd <device> tab_open --arg active=false` (a
   // legitimate request to open a BACKGROUND tab via the escape hatch, which
   // always sends string args) was silently opened as the ACTIVE tab instead --
   // the same bug class as the capture_hidden/trusted CDP-escalation miss.
@@ -1701,7 +1738,7 @@ async function cdpDetach(tabId) {
 // CDP has no per-frame targeting concept for input dispatch), but resolving a
 // ref to a rect/focusing it still has to run inside the SPECIFIC frame that
 // ref was qualified with (frame_refs.js) -- otherwise a frame-qualified ref
-// from a non-zero frame would be looked up in the wrong frame's window.__abb
+// from a non-zero frame would be looked up in the wrong frame's window.__amplifierBrowserBridge
 // and reported as stale.
 
 async function cdpClick(tabId, ref) {
@@ -1715,15 +1752,15 @@ async function cdpClick(tabId, ref) {
   await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
   const [{ result: rawRect }] = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
-    func: (r) => window.__abb.rectFor(r),
+    func: (r) => window.__amplifierBrowserBridge.rectFor(r),
     args: [bareRef],
   });
-  // Bug 1 fix, part 2: rectFor() returns a `{__abbError}` sentinel (rather
+  // Bug 1 fix, part 2: rectFor() returns a `{__amplifierBrowserBridgeError}` sentinel (rather
   // than throwing) for exactly this reason -- see injected.js's rectFor()
-  // comment. unwrapAbbResult() surfaces the REAL cause (stale generation,
+  // comment. unwrapAmplifierBrowserBridgeResult() surfaces the REAL cause (stale generation,
   // disconnected, identity mismatch, unknown ref) instead of the old generic
   // "stale or unknown element ref" that discarded which of those it was.
-  const rect = unwrapAbbResult(rawRect);
+  const rect = unwrapAmplifierBrowserBridgeResult(rawRect);
   await cdpAttach(tabId);
   const x = rect.x + rect.width / 2;
   const y = rect.y + rect.height / 2;
@@ -1753,15 +1790,15 @@ async function cdpType(tabId, ref, text) {
   await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
   const [{ result: focusResult }] = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
-    func: (r) => window.__abb.focusFor(r),
+    func: (r) => window.__amplifierBrowserBridge.focusFor(r),
     args: [bareRef],
   });
   // Bug 1 fix, part 2: this previously ignored focusFor's result entirely --
   // a stale/unknown/disconnected ref would silently fall through to
   // Input.insertText typing into whatever (if anything) currently had focus,
-  // the same silent-failure class as the click bug. unwrapAbbResult() fails
+  // the same silent-failure class as the click bug. unwrapAmplifierBrowserBridgeResult() fails
   // loud instead, before any CDP input is dispatched.
-  unwrapAbbResult(focusResult);
+  unwrapAmplifierBrowserBridgeResult(focusResult);
   await chrome.debugger.sendCommand({ tabId }, "Input.insertText", { text });
   return { ref, trusted: true };
 }
@@ -1776,11 +1813,11 @@ async function cdpKey(tabId, ref, keyName) {
     await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ["injected.js"] });
     const [{ result: focusResult }] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
-      func: (r) => window.__abb.focusFor(r),
+      func: (r) => window.__amplifierBrowserBridge.focusFor(r),
       args: [bareRef],
     });
     // Bug 1 fix, part 2 -- see cdpType()'s identical comment above.
-    unwrapAbbResult(focusResult);
+    unwrapAmplifierBrowserBridgeResult(focusResult);
   }
   await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyDown", key: keyName });
   await chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", { type: "keyUp", key: keyName });
@@ -1855,7 +1892,7 @@ chrome.action.onClicked.addListener(() => {
 // waiting for the next alarm tick (up to 30s) -- see options.js's save handler.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if ("abb_hub_url" in changes || "abb_hub_token" in changes) {
+  if ("amplifier_browser_bridge_hub_url" in changes || "amplifier_browser_bridge_hub_token" in changes) {
     reconnectAttempt = 0;
     if (ws) {
       try {
@@ -1872,12 +1909,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // directly from chrome.storage.local itself for prefill; this is purely "are we
 // connected right now" for the options page's live status line).
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message && message.type === "abb_get_status") {
+  if (message && message.type === "amplifier_browser_bridge_get_status") {
     sendResponse({
       configured,
       connected: !!(ws && ws.readyState === WebSocket.OPEN),
       hubUrl,
       deviceId,
+      legacyConfigDetected,
     });
     return true;
   }

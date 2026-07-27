@@ -49,7 +49,7 @@ where the real cause turned out to be something else entirely).
 
 ### Case study: 49 ordinary tabs hidden as "auth" on a real 531-tab profile
 
-Investigated against a real, heavily-used Edge profile (2026-07-26): `abb tabs` on a device with
+Investigated against a real, heavily-used Edge profile (2026-07-26): `amplifier-browser-bridge tabs` on a device with
 531 visible tabs also produced 49 `policy_tab_hidden` audit events, **all** category `auth`, **all**
 matching `login.microsoftonline.com`. 49/580 (~8%) hidden under one identity-provider host is not
 implausible on its face for a Microsoft-365-heavy user -- but the actual URLs told a different
@@ -139,7 +139,7 @@ itself sent, not from agent input.
 User-editable JSON (not YAML -- see "Why JSON, not YAML" below) at:
 
 1. An explicit path passed to `Denylist.load(path)` (library callers only in this phase)
-2. `ABB_POLICY_FILE` environment variable
+2. `AMPLIFIER_BROWSER_BRIDGE_POLICY_FILE` environment variable
 3. `~/.config/amplifier-browser-bridge/policy.json` (conventional default, matching
    `auth.py`'s `tokens.json` precedent)
 4. Built-in `DEFAULT_DENYLIST` if none of the above exist
@@ -221,7 +221,7 @@ second, real incident motivates it, per the two-implementation rule). When a cla
 in this set, `PolicyEngine.evaluate` forces the confirmation's redemption mode to
 `redeem="unredeemable"` -- **regardless of write scope, and regardless of the session's own
 declared `redeem`** -- unless the session was explicitly established with
-`allow_self_attested_escalation=True` (`abb session-establish --allow-self-attested-escalation`;
+`allow_self_attested_escalation=True` (`amplifier-browser-bridge session-establish --allow-self-attested-escalation`;
 `browser_establish_session(allow_self_attested_escalation=True)`). This field is structurally
 separate from `write`: `write` answers "what origins may this session mutate"; this field answers
 "may this session confirm its OWN privilege escalations," and the two are never conflatable. Like
@@ -292,7 +292,7 @@ the hint args.
   hint is discarded rather than trusted, degrading to the same "no signal" case). Both fall back
   to the pre-Phase-4 behavior: allowed through, not gated, because the hub genuinely has no
   reliable signal.
-- **Staleness is handled conservatively, not ignored.** `injected.js`'s `window.__abb` (and every
+- **Staleness is handled conservatively, not ignored.** `injected.js`'s `window.__amplifierBrowserBridge` (and every
   `ref`) is destroyed on navigation. If the hub's own last-observed URL for a tab differs from
   the URL recorded when a ref's label was captured, the label is discarded -- the hub does not
   claim a click is safe, and does not claim a stale label is real. See policy.py's "Label hints

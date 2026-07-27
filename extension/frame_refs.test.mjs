@@ -137,7 +137,7 @@ test("qualifySnapshotResult is a safe no-op for results with no nodes array (e.g
 
 test("qualifyRef/parseQualifiedRef round-trip through many frames without collision", () => {
   // Simulates a snapshot spanning many frames with overlapping local ref
-  // counters (every frame's own window.__abb starts counting at e1).
+  // counters (every frame's own window.__amplifierBrowserBridge starts counting at e1).
   const seen = new Set();
   for (let frameId = 0; frameId < 30; frameId++) {
     for (let n = 1; n <= 5; n++) {

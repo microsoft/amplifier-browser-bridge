@@ -17,13 +17,13 @@ models that have already seen Playwright MCP recognize most of this vocabulary.
 
 Run it:
 
-    abb-mcp                       # stdio transport (the default every MCP client speaks)
-    ABB_MCP_TRANSPORT=sse abb-mcp # or streamable-http, if a client needs it
+    amplifier-browser-bridge-mcp                       # stdio transport (the default every MCP client speaks)
+    AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT=sse amplifier-browser-bridge-mcp # or streamable-http, if a client needs it
 
 Configure the hub connection via the same env vars the CLI uses:
 
-    ABB_HUB_URL   -- e.g. ws://<your tailnet IP>:8900/agent (default ws://127.0.0.1:8900/agent)
-    ABB_TOKEN     -- per-device/agent shared token, if the hub has auth enabled
+    AMPLIFIER_BROWSER_BRIDGE_HUB_URL   -- e.g. ws://<your tailnet IP>:8900/agent (default ws://127.0.0.1:8900/agent)
+    AMPLIFIER_BROWSER_BRIDGE_TOKEN     -- per-device/agent shared token, if the hub has auth enabled
 """
 
 from __future__ import annotations
@@ -36,11 +36,12 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from .addressing import Target
 from .client import HubClient, HubError
+from .legacy_env import warn_legacy_env_vars
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
-DEFAULT_HUB_URL = os.environ.get("ABB_HUB_URL", "ws://127.0.0.1:8900/agent")
-DEFAULT_TOKEN = os.environ.get("ABB_TOKEN")
+DEFAULT_HUB_URL = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://127.0.0.1:8900/agent")
+DEFAULT_TOKEN = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
 
 mcp = FastMCP(
     name="amplifier-browser-bridge",
@@ -566,7 +567,7 @@ async def browser_vision_read(
 
     Requires a vision provider configured via environment variable on the machine
     running this MCP server (ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, or
-    ABB_VISION_PROVIDER to pin a specific one) -- fails loud with setup instructions
+    AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to pin a specific one) -- fails loud with setup instructions
     (as {"ok": false, "error": ...}) if none is configured; never silently returns
     empty text.
 
@@ -943,11 +944,15 @@ async def browser_narrow_scope(
 
 
 def main() -> None:
-    """Console-script entry point (`abb-mcp`). Runs over stdio by default -- the
+    """Console-script entry point (`amplifier-browser-bridge-mcp`). Runs over stdio by default -- the
     transport every MCP client (Claude Desktop, Amplifier, `mcp` CLI, ...) speaks
-    without extra configuration. Set ABB_MCP_TRANSPORT=sse or streamable-http to
+    without extra configuration. Set AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT=sse or streamable-http to
     use a different transport."""
-    transport = os.environ.get("ABB_MCP_TRANSPORT", "stdio")
+    # See legacy_env.py's module docstring and MIGRATION.md -- fails loud (to
+    # stderr, before the transport starts) if a pre-rename ABB_* variable is
+    # still set, rather than silently falling through to a default.
+    warn_legacy_env_vars()
+    transport = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT", "stdio")
     mcp.run(transport=transport)  # type: ignore[arg-type]
 
 

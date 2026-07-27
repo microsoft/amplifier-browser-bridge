@@ -1,12 +1,12 @@
 """Tests for auth.py's sibling-token-file detection (Bug C).
 
-The concrete failure mode under test: `abb init` reported "Reusing existing hub
+The concrete failure mode under test: `amplifier-browser-bridge init` reported "Reusing existing hub
 token" -- true of the token file it actually reads (`tokens.json`) -- while an
 unrelated file sitting right beside it (e.g. a hand-created `hub.token`) held a
 DIFFERENT value and was never consulted by anything. A user who pasted the wrong
 file's contents into the extension's options page would only discover the mismatch
 through a confusing auth failure. `find_sibling_token_files`/`extract_token_value`
-are the detection primitives `abb doctor` and `abb init` both use to catch this
+are the detection primitives `amplifier-browser-bridge doctor` and `amplifier-browser-bridge init` both use to catch this
 proactively instead.
 """
 
@@ -86,14 +86,14 @@ def test_mask_token_handles_short_tokens() -> None:
 def test_resolve_token_file_honors_env_var(tmp_path: Path, monkeypatch) -> None:
     """The core regression for the doctor.py display bug: the path shown to a user
     must come from the SAME resolution order `load_token_store` uses, including
-    $ABB_TOKEN_FILE -- not just an explicit --token-file or the hardcoded default."""
+    $AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE -- not just an explicit --token-file or the hardcoded default."""
     custom = tmp_path / "custom-tokens.json"
-    monkeypatch.setenv("ABB_TOKEN_FILE", str(custom))
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE", str(custom))
     assert resolve_token_file(None) == custom
 
 
 def test_resolve_token_file_explicit_path_wins_over_env(tmp_path: Path, monkeypatch) -> None:
     env_path = tmp_path / "env-tokens.json"
     explicit_path = tmp_path / "explicit-tokens.json"
-    monkeypatch.setenv("ABB_TOKEN_FILE", str(env_path))
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE", str(env_path))
     assert resolve_token_file(explicit_path) == explicit_path

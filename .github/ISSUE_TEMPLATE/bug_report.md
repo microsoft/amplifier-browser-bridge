@@ -20,7 +20,7 @@ What you expected to happen instead, and where that expectation comes from (a se
 - Edge version and build channel (stable / beta / dev / canary):
 - Platform: (Windows / macOS / Linux / Android, and OS version)
 - Device connectivity tier at the time, if known (`live` / `intermittent` / `dormant` -- check
-  `abb devices` or the `devices` response):
+  `amplifier-browser-bridge devices` or the `devices` response):
 - How you're running the hub (local dev, version/commit):
 - Agent surface in use (CLI / MCP server / Amplifier tool module):
 

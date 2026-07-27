@@ -14,15 +14,15 @@ const statusEl = document.getElementById("status");
 const saveButton = document.getElementById("save");
 
 async function loadCurrentValues() {
-  const stored = await chrome.storage.local.get(["abb_hub_url", "abb_hub_token"]);
-  urlInput.value = stored.abb_hub_url || "";
-  tokenInput.value = stored.abb_hub_token || "";
+  const stored = await chrome.storage.local.get(["amplifier_browser_bridge_hub_url", "amplifier_browser_bridge_hub_token"]);
+  urlInput.value = stored.amplifier_browser_bridge_hub_url || "";
+  tokenInput.value = stored.amplifier_browser_bridge_hub_token || "";
 }
 
 async function refreshStatus() {
   let response;
   try {
-    response = await chrome.runtime.sendMessage({ type: "abb_get_status" });
+    response = await chrome.runtime.sendMessage({ type: "amplifier_browser_bridge_get_status" });
   } catch {
     // Service worker not woken up / no listener yet -- transient, not an error worth
     // showing the user; the next poll (or their own Save click) will pick it up.
@@ -31,8 +31,18 @@ async function refreshStatus() {
   if (!response) return;
 
   if (!response.configured) {
-    statusEl.className = "warn";
-    statusEl.textContent = "Not configured -- enter a Hub URL below and click Save.";
+    if (response.legacyConfigDetected) {
+      // Distinct from the generic "never configured" message: this install HAD a working
+      // config under the old (pre-rename) storage keys, which are no longer read. See
+      // background.js's loadConfig()/legacyConfigDetected and MIGRATION.md.
+      statusEl.className = "warn";
+      statusEl.textContent =
+        "Configuration key names changed in this version -- your previous Hub URL/token are " +
+        "no longer read. Re-enter them below and click Save.";
+    } else {
+      statusEl.className = "warn";
+      statusEl.textContent = "Not configured -- enter a Hub URL below and click Save.";
+    }
     return;
   }
   if (response.connected) {
@@ -42,7 +52,7 @@ async function refreshStatus() {
     statusEl.className = "warn";
     statusEl.textContent =
       `Configured for ${response.hubUrl}, but not currently connected -- ` +
-      "is the hub running and reachable? Run `abb doctor` from the CLI for a full check.";
+      "is the hub running and reachable? Run `amplifier-browser-bridge doctor` from the CLI for a full check.";
   }
 }
 
@@ -66,8 +76,8 @@ saveButton.addEventListener("click", async () => {
   }
 
   await chrome.storage.local.set({
-    abb_hub_url: urlValidation.normalized,
-    abb_hub_token: tokenInput.value,
+    amplifier_browser_bridge_hub_url: urlValidation.normalized,
+    amplifier_browser_bridge_hub_token: tokenInput.value,
   });
 
   statusEl.className = "unknown";

@@ -1,4 +1,4 @@
-"""First-run setup helpers for `abb init` (see cli.py).
+"""First-run setup helpers for `amplifier-browser-bridge init` (see cli.py).
 
 This is the fix for the concrete gap that made this project unusable by anyone who
 wasn't us: the only way to configure a token used to be hand-editing a tracked source
@@ -14,7 +14,7 @@ directory path it was loaded from. Loading directly from a git checkout means ev
 `git pull` that changes the checkout path (a fresh clone, a rename) creates a *new*
 extension identity with empty storage -- update wipes the configuration. Staging to a
 stable, non-repo path (default `~/.local/share/amplifier-browser-bridge/extension`)
-and re-copying files into that SAME path on every `abb init` re-run means the
+and re-copying files into that SAME path on every `amplifier-browser-bridge init` re-run means the
 extension's identity -- and its stored config -- never changes across updates.
 """
 
@@ -58,7 +58,7 @@ def find_extension_source() -> Path:
     """Locate the `extension/` directory to stage from.
 
     Resolution order:
-        1. `ABB_EXTENSION_SRC` environment variable, if set -- always wins, for the
+        1. `AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC` environment variable, if set -- always wins, for the
            rare case of a moved/custom extension source.
         2. Packaged alongside the installed module: `pyproject.toml` force-includes
            the whole `extension/` tree into the wheel at
@@ -77,13 +77,13 @@ def find_extension_source() -> Path:
     Raises `ExtensionSourceNotFoundError` (never guesses) if none of these resolve to
     a real directory containing `manifest.json`.
     """
-    override = os.environ.get("ABB_EXTENSION_SRC")
+    override = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC")
     if override:
         candidate = Path(override).expanduser()
         if (candidate / "manifest.json").is_file():
             return candidate
         raise ExtensionSourceNotFoundError(
-            f"ABB_EXTENSION_SRC={override!r} does not contain manifest.json -- check the path."
+            f"AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC={override!r} does not contain manifest.json -- check the path."
         )
 
     packaged = Path(__file__).resolve().parent / "extension"
@@ -99,7 +99,7 @@ def find_extension_source() -> Path:
         f"copy at {packaged} and a dev checkout at {dev_checkout}, and found neither. "
         "This should not happen for a normal `pip install`/`uv tool install` of this "
         "package -- if you've moved the extension source elsewhere (or are running "
-        "from a nonstandard layout), set ABB_EXTENSION_SRC to its path."
+        "from a nonstandard layout), set AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC to its path."
     )
 
 
@@ -148,12 +148,14 @@ def ensure_token_file(path: str | Path | None = None, *, force: bool = False) ->
 
     Does NOT regenerate (and clobber) an existing token unless `force=True` -- an
     existing token likely already matches what's pasted into a browser's options
-    page; silently rotating it on every `abb init` re-run would be its own version
+    page; silently rotating it on every `amplifier-browser-bridge init` re-run would be its own version
     of the "update destroys your working config" bug this project is fixing.
     """
     import json
 
-    file_path = Path(path or os.environ.get("ABB_TOKEN_FILE") or DEFAULT_TOKEN_FILE).expanduser()
+    file_path = Path(
+        path or os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE") or DEFAULT_TOKEN_FILE
+    ).expanduser()
 
     if not force and file_path.is_file():
         store = load_token_store(file_path)
