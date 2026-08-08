@@ -5,11 +5,19 @@ real, logged-in Microsoft Edge browser on another device -- over the user's own 
 tailnet. The agent is a second operator sharing a live browsing session, not a robot driving a
 disposable browser it launched for itself.
 
-No vendor product does this today: Claude in Chrome, Edge Copilot Mode, Gemini in Chrome, and
+No **vendor** product does this today: Claude in Chrome, Edge Copilot Mode, Gemini in Chrome, and
 Playwright MCP's extension mode all run the control plane on the machine the human is sitting
 at. Driving the browser on a phone from a workstation across the room -- or across the country --
-is the gap this project fills. See `docs/designs/browser-bridge.md` section 9 for the full
-positioning against each of these.
+is the gap this project fills among vendor-shipped tools.
+
+**This claim narrows to exclude one real prior-art project:** [`browser-relay`](https://github.com/reliefeai/browser-relay)
+(MIT) already does cross-device browser control today, via a public Cloudflare Worker relay
+authenticated by a bearer Device ID that its own README calls *"a capability -- anyone with it
+can control this browser."* This project does not claim to be first; its honest differentiator
+is replacing that public relay with the user's own Tailscale tailnet -- no third-party relay in
+the path, no long-lived bearer capability traveling the public internet, device-level network
+ACLs instead of a single shared secret. See `docs/designs/browser-bridge.md` section 9 for the
+full positioning against `browser-relay`, Playwright MCP, and every vendor tool above.
 
 ## Status
 
