@@ -26,6 +26,7 @@ from .client import HubClient, HubError
 from .doctor import run_doctor
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
 from .legacy_env import warn_legacy_env_vars
+from .netinfo import detect_tailscale_ip, is_wildcard_bind, wildcard_bind_warning
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
 from .setup import DEFAULT_STAGE_DIR, ExtensionSourceNotFoundError, ensure_token_file, stage_extension
@@ -252,6 +253,51 @@ def navigate(target: str, url: str, session_id: str | None, timeout: float | Non
 def tab_open(device: str, url: str, active: bool, timeout: float | None) -> None:
     """Open a new tab on a device. Target is device-only; no tab exists yet to address."""
     _run_command(device, "tab_open", {"url": url, "active": active}, timeout=timeout)
+
+
+@main.group(name="kill-switch")
+def kill_switch() -> None:
+    """Hub-level stop-all (docs/POLICY.md section 5): halts new dispatch and
+    rejects every queued command immediately. Does NOT recall a command
+    already in flight to a device -- see `Hub.engage_kill_switch`'s docstring.
+
+    A4 fix (security review finding): README's consent table always listed
+    the kill switch as an available control, but no operator running the
+    shipped CLI, and no agent over the wire protocol, had any way to reach
+    it -- it was reachable only by an embedding app calling
+    `Hub.engage_kill_switch()` directly in-process. These subcommands are
+    the fix: same `/agent` route, same token check, as every other command.
+    """
+
+
+@kill_switch.command(name="engage")
+def kill_switch_engage() -> None:
+    """Halt all future dispatch and reject every currently-queued command."""
+    try:
+        result = asyncio.run(_client().kill_switch_engage())
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    _print(result)
+
+
+@kill_switch.command(name="disengage")
+def kill_switch_disengage() -> None:
+    """Restore normal dispatch after `kill-switch engage`."""
+    try:
+        result = asyncio.run(_client().kill_switch_disengage())
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    _print(result)
+
+
+@kill_switch.command(name="status")
+def kill_switch_status() -> None:
+    """Report whether the kill switch is currently engaged, without changing it."""
+    try:
+        result = asyncio.run(_client().kill_switch_status())
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    _print(result)
 
 
 @main.command()
@@ -990,35 +1036,6 @@ def reload(device: str) -> None:
     _run_command(device, "reload", {})
 
 
-@main.command()
-@click.option(
-    "--dest",
-    default=None,
-    help=f"Directory to stage the extension into (default: {DEFAULT_STAGE_DIR}). Stable across "
-    "re-runs -- an unpacked extension's identity (and its chrome.storage.local config) is tied "
-    "to this exact path, so re-running `amplifier-browser-bridge init` after a `git pull` overwrites the JS/HTML/"
-    "manifest files here WITHOUT disturbing a previously-configured token/hub-url.",
-)
-@click.option("--token-file", default=None, help="Path to the hub token file (see auth.py docstring).")
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Regenerate the token even if one already exists at --token-file. Rotating a token "
-    "requires re-pasting it into the extension's options page afterward.",
-)
-@click.option(
-    "--hub-host",
-    default="0.0.0.0",
-    show_default=True,
-    help="Host to print in the printed `amplifier-browser-bridge hub` command.",
-)
-@click.option(
-    "--hub-port",
-    default=DEFAULT_PORT,
-    show_default=True,
-    help="Port to print in the printed `amplifier-browser-bridge hub` command.",
-)
 def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -> None:
     """Print a loud warning if a file that looks like ANOTHER token store sits next
     to the one `amplifier-browser-bridge init` just wrote/reused, holding a different value.
@@ -1052,7 +1069,42 @@ def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -
     )
 
 
-def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, hub_port: int) -> None:
+@main.command()
+@click.option(
+    "--dest",
+    default=None,
+    help=f"Directory to stage the extension into (default: {DEFAULT_STAGE_DIR}). Stable across "
+    "re-runs -- an unpacked extension's identity (and its chrome.storage.local config) is tied "
+    "to this exact path, so re-running `amplifier-browser-bridge init` after a `git pull` overwrites the JS/HTML/"
+    "manifest files here WITHOUT disturbing a previously-configured token/hub-url.",
+)
+@click.option("--token-file", default=None, help="Path to the hub token file (see auth.py docstring).")
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Regenerate the token even if one already exists at --token-file. Rotating a token "
+    "requires re-pasting it into the extension's options page afterward.",
+)
+@click.option(
+    "--hub-host",
+    default=None,
+    help=(
+        "Host to print in the printed `amplifier-browser-bridge hub` command and the extension's Hub URL. "
+        "Default: auto-detect this machine's Tailscale IP (`tailscale ip -4`) -- reachable from the "
+        "tailnet, reachable from nowhere else. Falls back to 127.0.0.1 (loopback only -- NOT reachable "
+        "from another device) if Tailscale isn't detected. Passing a wildcard address (0.0.0.0, ::) "
+        "binds every network interface this machine has, not just the tailnet -- printed with a loud, "
+        "specific warning if you do (security review finding: this used to be the silent default)."
+    ),
+)
+@click.option(
+    "--hub-port",
+    default=DEFAULT_PORT,
+    show_default=True,
+    help="Port to print in the printed `amplifier-browser-bridge hub` command.",
+)
+def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | None, hub_port: int) -> None:
     """First-run setup: generate a hub token, stage the extension, print next steps.
 
     Does three things, each idempotent (safe to re-run, e.g. after `git pull`):
@@ -1084,13 +1136,43 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, h
 
     _warn_divergent_token_siblings(token_result.token_file, token_result.token)
 
+    # A1 fix (security review finding): this command used to default
+    # --hub-host to "0.0.0.0" and print that back as the recommended `amplifier-browser-bridge hub`
+    # invocation -- silently recommending every user bind every network interface
+    # on their machine, not just their Tailscale tailnet. Resolve a SAFE, still
+    # cross-device-reachable default instead of a silent wildcard:
+    #   1. an explicit --hub-host always wins (loudly warned if it's a wildcard)
+    #   2. else, auto-detect this machine's own Tailscale IP (netinfo.py) --
+    #      reachable from the tailnet, reachable from nowhere else
+    #   3. else, fall back to 127.0.0.1 (safe, but NOT cross-device -- say so
+    #      loudly, since cross-device operation is this project's whole point)
+    detected_note: str | None = None
+    resolved_host = hub_host
+    if resolved_host is None:
+        tailnet_ip = detect_tailscale_ip()
+        if tailnet_ip is not None:
+            resolved_host = tailnet_ip
+            detected_note = f"(auto-detected this machine's Tailscale IP via `tailscale ip -4`: {tailnet_ip})"
+        else:
+            resolved_host = "127.0.0.1"
+            detected_note = (
+                "(could not detect a Tailscale IP -- `tailscale ip -4` is unavailable or failed -- "
+                "defaulting to 127.0.0.1, which is NOT reachable from another device; for cross-device "
+                "use, re-run with --hub-host <this machine's tailnet IP>)"
+            )
+    if is_wildcard_bind(resolved_host):
+        click.echo("")
+        click.echo(wildcard_bind_warning(resolved_host, hub_port))
+
     click.echo("")
     click.echo("Remaining steps (manual -- Edge has no CLI for these):")
     click.echo("")
     click.echo("  1. Start the hub:")
     click.echo(
-        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge hub --host {hub_host} --port {hub_port}"
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge hub --host {resolved_host} --port {hub_port}"
     )
+    if detected_note:
+        click.echo(f"       {detected_note}")
     click.echo("")
     click.echo("  2. Load the extension:")
     click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
@@ -1098,7 +1180,7 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str, h
     click.echo("")
     click.echo("  3. Configure it:")
     click.echo("       Click the extension's toolbar icon (its only UI) to open the options page.")
-    click.echo("       Hub URL: ws://<this machine's tailnet IP>:" + f"{hub_port}/device")
+    click.echo(f"       Hub URL: ws://{resolved_host}:{hub_port}/device")
     click.echo(f"       Token:   {token_result.token}")
     click.echo("       Click Save.")
     click.echo("")
@@ -1140,7 +1222,19 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
 
 
 @main.command()
-@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help=(
+        "Interface to bind. Safe by default (loopback only -- reachable from THIS machine only, "
+        "not the tailnet). For cross-device use, pass this machine's own Tailscale IP explicitly "
+        "(see `tailscale ip -4`, or run `amplifier-browser-bridge init` for an auto-detected recommendation). "
+        "Passing a wildcard address (0.0.0.0, ::) binds every network interface this machine has -- "
+        "home Wi-Fi, hotel Wi-Fi, a corporate LAN, not just the tailnet -- and prints a loud warning "
+        "naming that exposure (security review finding: this was previously the silent default)."
+    ),
+)
 @click.option("--port", default=DEFAULT_PORT, show_default=True)
 @click.option("--token-file", default=None, help="Path to a token JSON file (see auth.py docstring).")
 @click.option(
@@ -1161,6 +1255,14 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
 )
 def hub(host: str, port: int, token_file: str | None, audit_log: str | None, command_timeout: float) -> None:
     """Run the hub: device registry, per-device command queue, routing, audit log."""
+    if is_wildcard_bind(host):
+        # A1 fix (security review finding): --host default changed from the
+        # silently-permissive "0.0.0.0" to loopback-only "127.0.0.1". A caller
+        # who explicitly chooses a wildcard bind still can -- it's a legitimate
+        # choice on some setups (e.g. a container/VM whose only route to the
+        # tailnet IS via a wildcard bind) -- but the exposure is now named
+        # loudly, every time, rather than being an invisible default.
+        click.echo(wildcard_bind_warning(host, port), err=True)
     token_store = load_token_store(token_file)
     audit_path = audit_log or os.environ.get(
         "AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG", "./amplifier-browser-bridge-audit.jsonl"
