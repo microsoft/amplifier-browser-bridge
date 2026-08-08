@@ -73,7 +73,7 @@ from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .scope import SCOPE_FIELDS, ScopeError, SessionScope
-from .tiers import Tier
+from .tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
 
@@ -1210,12 +1210,35 @@ class Hub:
             # section): _timeout_hint NAMES an alternative mechanism the
             # caller may choose -- it never retries or substitutes one for
             # another itself.
+            #
+            # Bug fix (real-world finding: airplane mode killed a phone's radio
+            # mid-command; the hub still believed the device was live and this
+            # message unconditionally blamed "a heavy SPA hydrating" -- actively
+            # misleading when the real cause was a dead connection). Diagnose
+            # from the record's OWN silence at the moment of timeout instead of
+            # assuming one cause. Compared against `LIVE_SILENCE_TIMEOUT_SECONDS`
+            # (tiers.py) -- the SAME threshold that demotes a stale-but-open
+            # socket out of Tier.LIVE -- rather than against this command's own
+            # `effective_timeout`: a short caller-chosen timeout (1s, 5s) racing
+            # a merely slow page is not evidence of connectivity loss, but total
+            # silence past the tiering threshold is, regardless of how this
+            # command's own timeout was configured.
+            silence = record.seconds_since_last_seen
+            if silence is not None and silence >= LIVE_SILENCE_TIMEOUT_SECONDS:
+                cause_hint = (
+                    f" The device has not been heard from (no heartbeat, result, or event) in "
+                    f"{silence:.0f}s -- consistent with a lost connection (e.g. radio disabled, "
+                    "network dropped) rather than a slow page; check `devices`/`doctor` for this "
+                    "device's current tier."
+                )
+            else:
+                cause_hint = " The page may still be loading or a heavy SPA may still be hydrating."
             return {
                 "ok": False,
                 "error": (
                     f"timeout waiting {effective_timeout}s for device result on command "
-                    f"'{cmd.command}' (device={record.device_id}, tab_id={cmd.target.tab_id}). "
-                    "The page may still be loading or a heavy SPA may still be hydrating. Raise "
+                    f"'{cmd.command}' (device={record.device_id}, tab_id={cmd.target.tab_id})."
+                    f"{cause_hint} Raise "
                     f"the limit for just this command with args.timeout_s=<seconds> (CLI: "
                     f"--timeout <seconds>; MCP tools: timeout_s param), up to {MAX_COMMAND_TIMEOUT}s, "
                     "or raise the hub's own default with `amplifier-browser-bridge hub --command-timeout <seconds>`."
