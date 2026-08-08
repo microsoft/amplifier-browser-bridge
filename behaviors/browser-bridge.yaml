@@ -1,0 +1,22 @@
+bundle:
+  name: browser-bridge-behavior
+  version: 0.1.0
+  description: >-
+    Adds the tool-browser-bridge Amplifier tool module (25 browser_* tools
+    wrapping amplifier-browser-bridge's HubClient) plus a thin always-on
+    awareness pointer covering the addressing model, the three-tier
+    connectivity model, and the queued-result hazard every browser_* tool
+    caller must know about.
+
+tools:
+  - module: tool-browser-bridge
+    # NOTE: relative paths resolve against THIS FILE's own directory
+    # (behaviors/), not the repo root -- verified by loading this bundle
+    # with amplifier_foundation.load_bundle() and inspecting the resolved
+    # tool source. "../modules/..." is correct; "./modules/..." silently
+    # resolved to behaviors/modules/tool-browser-bridge (nonexistent).
+    source: ../modules/tool-browser-bridge
+
+context:
+  include:
+    - browser-bridge:context/awareness.md
