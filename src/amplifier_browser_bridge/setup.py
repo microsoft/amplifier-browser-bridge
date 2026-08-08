@@ -46,6 +46,14 @@ _EXTENSION_FILES = (
     "args_bool.mjs",
     "fetch_utils.mjs",
     "download_claim.mjs",
+    # Added by the confirmation-gate feature (commit 87ce68d): background.js imports
+    # this at module top level. Omitting it here was a real, shipped bug -- any
+    # staged install missing it fails to import background.js entirely on the NEXT
+    # service-worker (re)instantiation (extension reload, browser restart, or MV3
+    # idle eviction), silently killing every listener including the one
+    # options.js's status query depends on. See docs/ISSUE_CASE_STUDIES.md-style
+    # note in options.js/background.js for the full failure chain this caused.
+    "effects_collector.mjs",
     "manifest.json",
 )
 

@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Not used by the browser (manifest.json's background.type='module' already tells the browser these are ES modules, independent of this file). Exists only so Node's ESM loader treats plain .js files here (background.js, options.js, injected.js) as ES modules when a *.test.mjs file dynamically imports one -- without it, Node treats a bare .js import as CommonJS and 'import' statements inside it fail with 'Cannot use import statement outside a module'. Not staged into any browser install -- see setup.py's _EXTENSION_FILES."
+}

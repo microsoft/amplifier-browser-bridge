@@ -1908,15 +1908,30 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Status query for options.js -- never echoes the token back (options.js reads that
 // directly from chrome.storage.local itself for prefill; this is purely "are we
 // connected right now" for the options page's live status line).
+//
+// Defensive try/catch (bug report, 2026-08): this handler responds synchronously, so
+// `return true` here is belt-and-suspenders (sendResponse has already fired either
+// way) -- but if reading `ws`/`configured`/etc. ever threw for any reason, an
+// uncaught exception here would leave the message channel open with no response
+// ever sent, and the sender's `chrome.runtime.sendMessage` promise would hang until
+// Chrome eventually closes the port with "message port closed before a response was
+// received" -- indistinguishable, from options.js's side, from the background script
+// never having run at all. Catching and reporting the error explicitly closes that
+// gap; see options.js's queryStatusOnce()/pollStatusUntilKnown() for the client-side
+// half of this fail-loud guarantee.
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.type === "amplifier_browser_bridge_get_status") {
-    sendResponse({
-      configured,
-      connected: !!(ws && ws.readyState === WebSocket.OPEN),
-      hubUrl,
-      deviceId,
-      legacyConfigDetected,
-    });
+    try {
+      sendResponse({
+        configured,
+        connected: !!(ws && ws.readyState === WebSocket.OPEN),
+        hubUrl,
+        deviceId,
+        legacyConfigDetected,
+      });
+    } catch (err) {
+      sendResponse({ error: String((err && err.message) || err) });
+    }
     return true;
   }
   return false;
