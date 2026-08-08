@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from amplifier_browser_bridge.auth import (
+    TokenStore,
+    _tokens_equal,
     extract_token_value,
     find_sibling_token_files,
     mask_token,
@@ -97,3 +100,46 @@ def test_resolve_token_file_explicit_path_wins_over_env(tmp_path: Path, monkeypa
     explicit_path = tmp_path / "explicit-tokens.json"
     monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE", str(env_path))
     assert resolve_token_file(explicit_path) == explicit_path
+
+
+# --- A7 fix: constant-time token comparison (security review finding) ---
+
+
+def test_tokens_equal_matches_identical_strings() -> None:
+    assert _tokens_equal("abc123", "abc123") is True
+
+
+def test_tokens_equal_rejects_mismatched_strings() -> None:
+    assert _tokens_equal("abc123", "abc124") is False
+    assert _tokens_equal("abc123", "abc1234") is False  # different length too
+    assert _tokens_equal("abc123", "xyz") is False
+
+
+def test_tokens_equal_treats_none_as_never_matching() -> None:
+    assert _tokens_equal(None, "abc123") is False
+    assert _tokens_equal("abc123", None) is False
+    # Two Nones would both normalize to "" and compare equal -- but this is
+    # never reached in practice: TokenStore.validate() never calls
+    # _tokens_equal with a None default_token (auth_enabled gates that).
+    assert _tokens_equal(None, None) is True
+
+
+def test_tokens_equal_uses_hmac_compare_digest_not_bare_equality() -> None:
+    """Regression for the actual finding: `==` leaks timing information. Assert
+    the constant-time primitive is what's actually called, not just that the
+    end result happens to be correct (a bare `==` would also pass the tests
+    above)."""
+    with patch("amplifier_browser_bridge.auth.hmac.compare_digest", return_value=True) as spy:
+        assert _tokens_equal("a", "b") is True  # would be False under `==`
+    spy.assert_called_once_with("a", "b")
+
+
+def test_token_store_validate_uses_constant_time_comparison_for_default_and_device_tokens() -> None:
+    store = TokenStore(default_token="shared-secret", device_tokens={"dev-1": "device-secret"})
+    with patch(
+        "amplifier_browser_bridge.auth.hmac.compare_digest", wraps=__import__("hmac").compare_digest
+    ) as spy:
+        assert store.validate("shared-secret") is True
+        assert store.validate("device-secret", device_id="dev-1") is True
+        assert store.validate("wrong", device_id="dev-1") is False
+    assert spy.called

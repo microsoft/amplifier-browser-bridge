@@ -18,12 +18,30 @@ Resolution order (first match wins), and NOTHING here is ever committed to the r
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_TOKEN_FILE = Path("~/.config/amplifier-browser-bridge/tokens.json")
+
+
+def _tokens_equal(a: str | None, b: str | None) -> bool:
+    """Constant-time token comparison (security review finding: `==` on a
+    secret token leaks timing information proportional to the length of the
+    matching prefix -- classic timing side-channel on an auth check reachable
+    over the network). `hmac.compare_digest` is the stdlib's own answer to
+    exactly this problem (it's what it exists for) -- see IMPLEMENTATION_PHILOSOPHY.md's
+    library-vs-custom-code judgment: this is a solved, security-sensitive
+    primitive, not something to hand-rebuild.
+
+    `compare_digest` requires both arguments be the same type (str or
+    bytes); `None` is normalized to `""` first so a missing token never
+    raises, it just never matches (a `None`/`""` token was never going to
+    validate against a real secret anyway).
+    """
+    return hmac.compare_digest(a or "", b or "")
 
 
 @dataclass
@@ -38,12 +56,18 @@ class TokenStore:
     def validate(self, token: str | None, device_id: str | None = None) -> bool:
         """True if `token` is acceptable for `device_id` (or as a general agent token
         when device_id is None). If no token is configured anywhere, auth is disabled
-        and every request is accepted -- see module docstring."""
+        and every request is accepted -- see module docstring.
+
+        Comparison is constant-time (`_tokens_equal`, `hmac.compare_digest`)
+        -- see that function's docstring for why `==` was a real finding here,
+        not a style nit: this check is reachable directly over the network on
+        every device `hello` and every agent request.
+        """
         if not self.auth_enabled:
             return True
         if device_id and device_id in self.device_tokens:
-            return token == self.device_tokens[device_id]
-        return token is not None and token == self.default_token
+            return _tokens_equal(token, self.device_tokens[device_id])
+        return token is not None and _tokens_equal(token, self.default_token)
 
 
 def load_token_store(path: str | Path | None = None) -> TokenStore:
