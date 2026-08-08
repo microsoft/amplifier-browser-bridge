@@ -203,7 +203,42 @@ if (!window.__amplifierBrowserBridge) {
       return seen;
     }
 
+    // B1 fix (security review finding, classifier extraction gap): an
+    // element's accessible name can come from `aria-labelledby` -- a
+    // space-separated list of OTHER elements' ids whose text is the name --
+    // not just a direct `aria-label` attribute or the element's own text
+    // content. An icon-only button with no `aria-label` but
+    // `aria-labelledby="lbl"` pointing at `<span id="lbl">Elevate to
+    // Administrator</span>` elsewhere on the page previously extracted as
+    // empty. This mirrors accessible_name.mjs's `computeAccessibleName` by
+    // hand (that file is the TESTED twin -- see its module docstring for
+    // exactly which subset of the W3C accname spec this implements, and
+    // which parts it deliberately does not).
+    function resolveLabelledByTexts(el) {
+      const attr = el.getAttribute && el.getAttribute("aria-labelledby");
+      if (!attr) return [];
+      const ids = attr.trim().split(/\s+/).filter(Boolean);
+      if (ids.length === 0) return [];
+      // Referenced ids are looked up in the element's own root (its shadow
+      // root if it has one via getRootNode(), else the document) -- an
+      // aria-labelledby reference does not cross shadow-DOM boundaries per
+      // spec, and `getElementById` on `document` would silently miss an id
+      // that only exists inside a shadow tree.
+      const root = (el.getRootNode && el.getRootNode()) || document;
+      return ids.map((id) => {
+        const ref = (root.getElementById && root.getElementById(id)) || document.getElementById(id);
+        return ref ? ref.textContent : null;
+      });
+    }
+
     function nameOf(el) {
+      const labelledByTexts = resolveLabelledByTexts(el);
+      const joined = labelledByTexts
+        .filter((t) => typeof t === "string" && t.trim().length > 0)
+        .map((t) => t.trim())
+        .join(" ")
+        .trim();
+      if (joined) return joined.slice(0, 120);
       const aria = el.getAttribute("aria-label");
       if (aria) return aria;
       if (el.tagName === "IMG") return el.getAttribute("alt") || "";
