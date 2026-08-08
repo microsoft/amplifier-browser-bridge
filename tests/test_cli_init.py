@@ -13,6 +13,7 @@ Also covers the A1/A4 fixes' CLI-level wiring: `hub --host` default, and the
 
 from __future__ import annotations
 
+import re
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -102,6 +103,95 @@ def test_init_warns_loudly_when_explicit_hub_host_is_a_wildcard(tmp_path) -> Non
     assert result.exit_code == 0, result.output
     assert "WARNING" in result.output
     assert "EVERY network interface" in result.output
+
+
+def _extract_hosts(output: str) -> tuple[str, str]:
+    """Pulls the host `init` printed in step 1's `hub --host` invocation and the
+    host it printed in step 4's `doctor --hub-url` invocation, so a test can
+    assert they agree without depending on exact surrounding wording."""
+    hub_match = re.search(r"amplifier-browser-bridge hub --host (\S+) --port", output)
+    doctor_match = re.search(r"doctor --hub-url ws://([^:/]+):", output)
+    assert hub_match, f"could not find step 1's `hub --host` line in output:\n{output}"
+    assert doctor_match, f"could not find step 4's `doctor --hub-url` line in output:\n{output}"
+    return hub_match.group(1), doctor_match.group(1)
+
+
+def test_init_doctor_url_agrees_with_the_hub_host_it_just_printed_explicit_host(tmp_path) -> None:
+    """Regression test: step 4's `doctor --hub-url` used to hardcode ws://127.0.0.1,
+    independent of whatever host step 1 told the user to bind the hub to -- so
+    following the printed steps verbatim always produced `[FAIL] hub_reachable`
+    whenever step 1 bound anything other than loopback (e.g. a real Tailscale IP).
+    """
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "init",
+            "--dest",
+            str(tmp_path / "extension"),
+            "--token-file",
+            str(tmp_path / "tokens.json"),
+            "--hub-host",
+            "100.124.126.19",
+            "--hub-port",
+            "8900",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    hub_host, doctor_host = _extract_hosts(result.output)
+    assert hub_host == "100.124.126.19"
+    assert doctor_host == hub_host, (
+        f"step 1 told the user to bind the hub to {hub_host!r} but step 4's doctor "
+        f"check points at {doctor_host!r} -- following the steps verbatim would fail"
+    )
+
+
+def test_init_doctor_url_agrees_with_auto_detected_tailscale_host(tmp_path) -> None:
+    """Same regression, via the auto-detect path (no --hub-host given) -- this is
+    exactly the scenario from the bug report: `tailscale ip -4` resolves a real
+    tailnet IP for step 1, and step 4 must point at that same IP, not loopback."""
+    runner = CliRunner()
+    with patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.124.126.19"):
+        result = runner.invoke(
+            cli.main,
+            [
+                "init",
+                "--dest",
+                str(tmp_path / "extension"),
+                "--token-file",
+                str(tmp_path / "tokens.json"),
+                "--hub-port",
+                "8900",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    hub_host, doctor_host = _extract_hosts(result.output)
+    assert hub_host == "100.124.126.19"
+    assert doctor_host == hub_host
+
+
+def test_init_doctor_url_agrees_with_loopback_fallback(tmp_path) -> None:
+    """Same regression, via the loopback-fallback path (Tailscale undetected) --
+    both steps must agree on 127.0.0.1 here, same as any other host."""
+    runner = CliRunner()
+    with patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value=None):
+        result = runner.invoke(
+            cli.main,
+            [
+                "init",
+                "--dest",
+                str(tmp_path / "extension"),
+                "--token-file",
+                str(tmp_path / "tokens.json"),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    hub_host, doctor_host = _extract_hosts(result.output)
+    assert hub_host == "127.0.0.1"
+    assert doctor_host == hub_host
 
 
 def test_hub_command_defaults_to_loopback_only() -> None:

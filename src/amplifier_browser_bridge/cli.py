@@ -1180,7 +1180,8 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
     click.echo("")
     click.echo("  4. Confirm it worked:")
     click.echo(
-        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:{hub_port}/agent"
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+        f"--hub-url ws://{resolved_host}:{hub_port}/agent"
     )
 
 
