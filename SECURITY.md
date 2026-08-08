@@ -112,6 +112,47 @@ If you find a way to reach the hub, an extension, or a command result from outsi
 intended boundary without a valid token, or a way to defeat the token check itself, that is a
 critical finding.
 
+### The Android build now embeds a live hub credential in the artifact itself
+
+`scripts/package-android.sh` bakes the current hub URL and token into
+`bundled_config.json` inside its build-time staging directory (never into the
+tracked `extension/` source tree -- see that script's own comments) so a freshly
+sideloaded Android install already knows where to connect, with no options-page
+visit required. See `docs/ANDROID.md`'s "Zero-configuration builds" section for the
+mechanics and `extension/bundled_config.mjs`'s docstring for the first-run-only
+adoption logic (a bundled value is a DEFAULT, never applied over an existing or
+user-edited config).
+
+**This means the built `.crx` (and the `.bin` it is temporarily served as during
+transfer to the phone -- see docs/ANDROID.md's serving instructions) is now a
+bearer credential, not just an installer.** Anyone who obtains that file can
+extract `bundled_config.json` and connect to the hub as that device, exactly as if
+they had read the token file directly. This is an accepted trade-off under this
+project's stated trust model -- broad access by default to anyone who already has
+access to the desktop and browser profiles this hub protects -- not an oversight:
+
+- The packaging script restricts the artifact's permissions (`chmod 600` on both
+  `bundled_config.json` during staging and the final `.crx`, `chmod 700` on the
+  staging directory and `dist/android/`) as defense in depth, but this does **not**
+  survive the file being copied, emailed, or uploaded somewhere else -- treat the
+  `.crx`/`.bin` the same way you would treat the token file itself once it leaves
+  this machine.
+- If a baked artifact is ever exposed unintentionally (uploaded to a public
+  location, sent over an insecure channel, left in a world-readable directory),
+  **rotate the token** (`amplifier-browser-bridge init --force`) and rebuild -- the
+  old baked token keeps working against the hub until the hub's own token file
+  changes.
+- Building with `--allow-no-token` (explicitly opted into, only when no token is
+  found) produces an artifact with auth **disabled** baked in -- anyone who can
+  reach the hub's bind address connects as this device with no credential check at
+  all. `scripts/package-android.sh` prints a loud warning when this happens; do not
+  distribute a build made this way.
+
+If you find a way for the baked token to leak through a channel other than the
+artifact file itself (e.g. logged in cleartext somewhere it shouldn't be, readable
+by another local user despite the permission hardening above), treat that as a
+finding under this document's existing reporting instructions.
+
 ### The classifier's label-extraction gap is bounded, not closed -- read this before relying on the confirmation gate
 
 **This is the single most important paragraph in this document.** The confirmation-gate

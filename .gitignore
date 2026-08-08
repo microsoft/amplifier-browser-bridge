@@ -19,6 +19,11 @@ audit*.jsonl
 # default location is already outside the repo (~/.config/...), this guards
 # against AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY ever pointing inside it by mistake.
 *.pem
+# Baked Android hub URL/token (scripts/package-android.sh, android_bake.py) -- defense
+# in depth; this file is only ever generated inside a temp build-stage directory
+# outside the repo (see that script), this guards against it ever landing in
+# extension/ (the tracked source tree) by mistake.
+extension/bundled_config.json
 
 # Editors / OS
 .DS_Store
