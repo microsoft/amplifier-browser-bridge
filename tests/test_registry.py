@@ -18,6 +18,9 @@ class _FakeWebSocket:
     async def send_json(self, data: object, /) -> None:
         pass
 
+    async def close(self) -> None:
+        pass
+
 
 def test_two_devices_do_not_clobber_each_other() -> None:
     registry = DeviceRegistry()

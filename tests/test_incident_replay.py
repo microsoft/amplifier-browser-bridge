@@ -105,6 +105,9 @@ class _IngestingFakeDeviceSocket:
         self.click_results_by_ref = click_results_by_ref
         self.dispatched: list[tuple[str, str | None]] = []
 
+    async def close(self) -> None:
+        pass
+
     async def send_json(self, data: dict[str, Any], /) -> None:
         ref = (data.get("target") or {}).get("ref")
         self.dispatched.append((data["command"], ref))

@@ -96,6 +96,23 @@ MIN_COMMAND_TIMEOUT = 1.0
 MAX_COMMAND_TIMEOUT = 600.0
 DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS = 30.0
 
+# Keepalive sweep cadence (docs/PROTOCOL.md's `ping` entry, docs/designs/
+# browser-bridge.md \u00a74: "hub pings every 20s, extension heartbeats every
+# 15s"). Deliberately app-level, not aiohttp's transport-level `heartbeat`
+# param (see `_handle_device_ws`'s `WebSocketResponse(heartbeat=None)`) --
+# `extension/background.js`'s `onMessage` already replies to a `{"type":
+# "ping"}` frame with a fresh `heartbeat` (same code path as its own 15s
+# timer), shipped to every real connected device (desktop + Android) before
+# this hub-side sweep existed. Re-enabling aiohttp's transport-level ping
+# instead would (a) require zero extension changes too, but (b) introduce a
+# SECOND, independent staleness clock -- aiohttp's own internal ping/pong
+# bookkeeping -- that never updates `DeviceRecord.last_seen`, so tier
+# inference (`tiers.py`'s `compute_tier`) and dead-socket detection would be
+# answering the same question ("is this connection alive?") from two
+# uncorrelated sources of truth. Staying app-level keeps ONE number
+# (`last_seen`) driving both.
+DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 20.0
+
 # Commands whose successful device result carries a `url` field directly usable
 # to update the policy engine's tab-host cache (see policy.py's "Observation
 # intake" section). `tabs` is handled separately since its result is a *list* of
@@ -207,6 +224,7 @@ class Hub:
         policy: PolicyEngine | None = None,
         cdp_idle_seconds: float = DEFAULT_SOFT_DETACH_IDLE_SECONDS,
         soft_detach_sweep_interval: float = DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS,
+        keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS,
     ) -> None:
         self.registry = DeviceRegistry()
         self.token_store = token_store
@@ -219,6 +237,12 @@ class Hub:
         self.cdp = CdpRegistry(idle_seconds=cdp_idle_seconds)
         self.soft_detach_sweep_interval = soft_detach_sweep_interval
         self._soft_detach_task: asyncio.Task[None] | None = None
+        # Keepalive sweep (see DEFAULT_KEEPALIVE_INTERVAL_SECONDS above and
+        # `keepalive_sweep`/`keepalive_loop` below) -- pings every connected
+        # device on this cadence and proactively closes any that have gone
+        # silent past LIVE_SILENCE_TIMEOUT_SECONDS.
+        self.keepalive_interval = keepalive_interval
+        self._keepalive_task: asyncio.Task[None] | None = None
         # command_id -> the QueuedCommand that was sent, kept only long enough to
         # know (a) whether a returning device result needs tabs-filtering / cache
         # updates, and (b) nothing more -- popped as soon as the result arrives.
@@ -266,6 +290,13 @@ class Hub:
         # loop's real sleep interval -- see tests/test_cdp.py.
         app.on_startup.append(self._start_soft_detach_task)
         app.on_cleanup.append(self._stop_soft_detach_task)
+        # Keepalive sweep (see DEFAULT_KEEPALIVE_INTERVAL_SECONDS and
+        # `keepalive_sweep`/`keepalive_loop` below) -- same lifecycle pattern
+        # as the soft-detach sweep above. Tests call `keepalive_sweep()`
+        # directly instead of relying on this loop's real sleep interval --
+        # see tests/test_hub.py.
+        app.on_startup.append(self._start_keepalive_task)
+        app.on_cleanup.append(self._stop_keepalive_task)
         return app
 
     async def _start_soft_detach_task(self, app: web.Application) -> None:
@@ -275,6 +306,14 @@ class Hub:
         if self._soft_detach_task is not None:
             self._soft_detach_task.cancel()
             self._soft_detach_task = None
+
+    async def _start_keepalive_task(self, app: web.Application) -> None:
+        self._keepalive_task = asyncio.create_task(self.keepalive_loop())
+
+    async def _stop_keepalive_task(self, app: web.Application) -> None:
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
 
     # ------------------------------------------------------------------
     # HTTP
@@ -313,10 +352,11 @@ class Hub:
             # close -- e.g. an old TCP socket finally giving up seconds after
             # a reconnect already replaced it -- would wipe out the live
             # connection a newer `hello` had already bound. This was rare
-            # when closes only happened as the OS reported them; a
-            # forthcoming active keepalive sweep will proactively close
-            # silent connections, which will exercise this exit path far
-            # more often, so the race must be closed first.
+            # when closes only happened as the OS reported them; the
+            # keepalive sweep (`keepalive_sweep` below) now proactively
+            # closes silent connections, which exercises this exit path far
+            # more often, so the race had to be closed before that sweep
+            # could ship safely.
             if record is not None and record.ws is ws:
                 record.unbind()
                 self.audit.record("device_disconnected", device_id=device_id)
@@ -1369,6 +1409,109 @@ class Hub:
                 await self.soft_detach_idle_tabs()
             except Exception:
                 logger.exception("soft-detach sweep failed")
+
+    # ------------------------------------------------------------------
+    # Keepalive sweep -- closes the structural gap this fix exists for: the
+    # hub previously only ever INFERRED a dead connection (tiers.py's
+    # `compute_tier` demoting a silent-but-open socket out of Tier.LIVE).
+    # Nothing ever actively detected one -- the documented "hub pings every
+    # 20s" keepalive (docs/PROTOCOL.md, docs/designs/browser-bridge.md \u00a74)
+    # was never implemented; `_handle_device_ws` explicitly disabled
+    # aiohttp's own transport-level heartbeat in favour of an app-level one
+    # that didn't exist yet. See DEFAULT_KEEPALIVE_INTERVAL_SECONDS above for
+    # why app-level (not aiohttp's `heartbeat=`) was the right call, and
+    # `_handle_device_ws`'s exit-handler comment for the race this sweep
+    # required fixing first: proactively closing connections makes the
+    # "does this close belong to the connection the record still holds"
+    # question come up far more often than waiting on the OS ever did.
+    # ------------------------------------------------------------------
+
+    async def keepalive_sweep(self) -> list[str]:
+        """One sweep across every currently-connected device.
+
+        For a device heard from recently: send a `ping` (docs/PROTOCOL.md's
+        `ping` entry) -- the extension's `background.js` already replies to
+        this with a `heartbeat`, the same message its own 15s timer sends,
+        so this requires no extension-side change.
+
+        For a device that has gone silent past `LIVE_SILENCE_TIMEOUT_SECONDS`
+        (tiers.py) despite that ping: proactively close the connection --
+        detection, not merely the existing distrust. Deliberately reuses
+        `LIVE_SILENCE_TIMEOUT_SECONDS`, the SAME threshold `compute_tier`
+        already demotes a stale socket at, rather than inventing a second
+        number: below it, a connected socket is still trusted; above it, the
+        hub now backs that distrust with an actual teardown instead of only
+        an internal reclassification. That threshold is 4x the measured
+        healthy heartbeat ceiling (15.1s) -- generous enough to absorb
+        ordinary jitter, but well under the shortest interval a mobile
+        device would need to notice and reconnect on its own.
+
+        This method does NOT call `record.unbind()` itself. Closing a
+        `WebSocketResponse` here makes the SAME `_handle_device_ws`
+        coroutine that owns this connection's `async for msg in ws` loop
+        observe the close and run its own (race-guarded, see that method's
+        comment) post-loop cleanup -- unbind, `device_disconnected` audit
+        entry, queue left untouched. Keeping unbind() to that single call
+        site is what the race guard depends on: exactly one code path ever
+        sets `record.ws = None`.
+
+        Any command already queued for a device closed this way is
+        unaffected -- `DeviceCommandQueue` lives on the record, survives
+        `unbind()` by design (registry.py), and drains automatically the
+        next time that device's `hello` rebinds the record
+        (`_handle_device_message`'s `hello` branch already calls
+        `_drain_queue`; proven end-to-end by the airplane-mode fix this PR
+        builds on).
+
+        Returns the device_ids proactively closed this sweep (tests and
+        diagnostics; not part of the wire protocol).
+        """
+        closed: list[str] = []
+        for record in self.registry.all():
+            if not record.connected:
+                continue
+            assert record.ws is not None  # `connected` implies this
+            silence = record.seconds_since_last_seen
+            if silence is not None and silence >= LIVE_SILENCE_TIMEOUT_SECONDS:
+                self.audit.record(
+                    "keepalive_timeout_closing",
+                    device_id=record.device_id,
+                    silence_seconds=silence,
+                )
+                logger.info(
+                    "closing silent device connection: %s (no traffic in %.0fs, threshold %.0fs)",
+                    record.device_id,
+                    silence,
+                    LIVE_SILENCE_TIMEOUT_SECONDS,
+                )
+                try:
+                    await record.ws.close()
+                except Exception:
+                    # The transport may already be dead in exactly the way
+                    # that got us here -- closing an already-broken socket
+                    # must not crash the sweep. `_handle_device_ws`'s own
+                    # loop will still notice and clean up independently.
+                    logger.exception("close() raised for already-silent device %s", record.device_id)
+                closed.append(record.device_id)
+                continue
+            try:
+                await record.ws.send_json({"v": PROTOCOL_VERSION, "id": new_id(), "type": "ping"})
+            except ConnectionResetError:
+                pass  # transport died between the `connected` check and this send;
+                # next sweep's silence check (or the natural disconnect handler) will catch it.
+        return closed
+
+    async def keepalive_loop(self, *, interval_seconds: float | None = None) -> None:
+        """Background task started by `build_app`'s `on_startup` hook --
+        periodically runs `keepalive_sweep`. Not used by tests, which call
+        `keepalive_sweep()` directly instead of running a real timer loop."""
+        interval = interval_seconds if interval_seconds is not None else self.keepalive_interval
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.keepalive_sweep()
+            except Exception:
+                logger.exception("keepalive sweep failed")
 
     # ------------------------------------------------------------------
     # Devices snapshot -- enriches DeviceRegistry.snapshot() with per-tab CDP

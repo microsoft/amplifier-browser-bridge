@@ -166,8 +166,11 @@ Two layers, because one is insufficient:
    Without this, any other extension or local process on an authorized device reaches the hub
    with the same identity.
 
-Keepalive: hub pings every 20s, extension heartbeats every 15s. Measured to hold a desktop
-service worker alive indefinitely (165 min, zero gaps).
+Keepalive: hub pings every 20s (`Hub.keepalive_sweep`), extension heartbeats every 15s.
+Measured to hold a desktop service worker alive indefinitely (165 min, zero gaps). A connected
+device that stays silent past `LIVE_SILENCE_TIMEOUT_SECONDS` (60s) despite the ping is
+proactively closed rather than merely reclassified -- see docs/PROTOCOL.md's `ping` section and
+tiers.py for the shared threshold this reuses.
 
 ---
 

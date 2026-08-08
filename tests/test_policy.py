@@ -57,6 +57,9 @@ class FakeDeviceSocket:
         # for different in-flight commands (e.g. two different `tabs` calls).
         self.overrides: dict[str, dict[str, Any]] = {}
 
+    async def close(self) -> None:
+        pass
+
     async def send_json(self, data: dict[str, Any], /) -> None:
         self.sent.append(data)
         fut = self.record.pending.get(data["id"])

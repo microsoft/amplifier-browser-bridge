@@ -165,9 +165,28 @@ defined so the vocabulary doesn't need a breaking change to add it later:
 {"v": 1, "id": "...", "type": "ping"}
 ```
 
-Sent by the hub every 20s to any connected device as a keepalive. The extension replies with a
-`heartbeat`. Measured to hold a desktop MV3 service worker alive indefinitely (165 min, zero
-gaps in the underlying probe work -- see design doc §2).
+Sent by the hub every 20s to any connected device as a keepalive (`Hub.keepalive_sweep`,
+`hub.py`). The extension replies with a `heartbeat` -- the same `background.js` code path its
+own 15s timer already uses (`onMessage`'s `ping` branch), so no extension-side change was
+needed to wire this up. Measured to hold a desktop MV3 service worker alive indefinitely (165
+min, zero gaps in the underlying probe work -- see design doc §2).
+
+App-level, deliberately, not aiohttp's transport-level `heartbeat=` option
+(`_handle_device_ws` explicitly sets `heartbeat=None`) -- a raw WS ping/pong frame never
+updates `DeviceRecord.last_seen`, which would leave tier inference (`tiers.py`) and dead-socket
+detection answering "is this connection alive?" from two uncorrelated clocks. Staying app-level
+keeps one number, `last_seen`, driving both.
+
+**Detection, not just distrust.** If a connected device stays silent -- no heartbeat, result,
+or event, despite this ping -- for `LIVE_SILENCE_TIMEOUT_SECONDS` (60s, `tiers.py`; the same
+threshold `compute_tier` already uses to demote a stale-but-open socket out of `Tier.LIVE`),
+the hub proactively closes the connection rather than merely waiting for the OS to eventually
+notice (which airplane mode, and similar abrupt radio-off events, may never do -- see
+`tiers.py`'s module docstring). This is recorded as a `keepalive_timeout_closing` audit entry,
+followed by the normal `device_disconnected` unbind once the closed connection's own handler
+loop observes the close. Any command already queued for that device is unaffected -- the queue
+lives on the device record, survives the unbind, and drains automatically on the device's next
+`hello`.
 
 ---
 

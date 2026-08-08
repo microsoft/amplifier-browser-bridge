@@ -42,6 +42,9 @@ class FakeDeviceSocket:
         if fut is not None and not fut.done():
             fut.set_result({**self.canned_result, "id": data["id"]})
 
+    async def close(self) -> None:
+        pass
+
 
 def _hub(tmp_path: Any) -> Hub:
     return Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"))
@@ -282,6 +285,9 @@ class _IngestingFakeDeviceSocket:
             env = self.hub._ingest_result(self.record.device_id, data["id"], raw_env)
             fut.set_result(env)
 
+    async def close(self) -> None:
+        pass
+
 
 def test_read_snapshot_seals_the_session_and_blocks_further_narrowing(tmp_path: Any) -> None:
     """The load-bearing anti-injection property, exercised end-to-end through
@@ -423,6 +429,9 @@ class _SlowIngestingFakeDeviceSocket:
             env = self.hub._ingest_result(self.record.device_id, data["id"], raw_env)
             fut.set_result(env)
 
+    async def close(self) -> None:
+        pass
+
 
 def test_concurrent_commands_on_same_session_serialize_through_the_session_lock(tmp_path: Any) -> None:
     """Two commands sharing a session_id, dispatched concurrently (command A,
@@ -523,6 +532,9 @@ class _NeverRespondingSocket:
     async def send_json(self, data: dict[str, Any], /) -> None:
         self.sent.append(data)
         # Deliberately never resolves record.pending[data["id"]].
+
+    async def close(self) -> None:
+        pass
 
 
 def test_timeout_s_override_fires_before_the_hub_default(tmp_path: Any) -> None:

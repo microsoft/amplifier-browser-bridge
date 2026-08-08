@@ -75,6 +75,9 @@ async def test_doctor_reports_device_connected_when_live(tmp_path: Path, token_f
         async def send_json(self, data: dict) -> None:
             pass
 
+        async def close(self) -> None:
+            pass
+
     record.ws = _FakeSocket()
     record.touch()
 

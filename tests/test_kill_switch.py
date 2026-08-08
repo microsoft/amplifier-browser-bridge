@@ -37,6 +37,9 @@ class FakeDeviceSocket:
         if fut is not None and not fut.done():
             fut.set_result({**self.canned_result, "id": data["id"]})
 
+    async def close(self) -> None:
+        pass
+
 
 def _hub(tmp_path: Path) -> Hub:
     return Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"))

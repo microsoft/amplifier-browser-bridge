@@ -48,6 +48,9 @@ class FakeDeviceSocket:
         env = self.hub._ingest_result(self.record.device_id, data["id"], raw_env)
         fut.set_result(env)
 
+    async def close(self) -> None:
+        pass
+
 
 def _hub(tmp_path: Any, **kwargs: Any) -> Hub:
     return Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), **kwargs)

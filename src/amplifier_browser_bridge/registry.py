@@ -21,14 +21,28 @@ from .tiers import Tier, compute_tier
 
 @runtime_checkable
 class DeviceConnection(Protocol):
-    """The only thing the registry actually needs from a live connection: the
-    ability to send a JSON-serializable envelope. Deliberately NOT aiohttp's
-    concrete `WebSocketResponse` type -- that would leak a transport-layer
-    dependency into the registry, and it would make this class untestable
-    without a real websocket. Any object with an async `send_json` satisfies
-    this (aiohttp's WebSocketResponse does; so does a test fake)."""
+    """The only things the registry/hub actually need from a live connection:
+    the ability to send a JSON-serializable envelope, and the ability to close
+    it. Deliberately NOT aiohttp's concrete `WebSocketResponse` type -- that
+    would leak a transport-layer dependency into the registry, and it would
+    make this class untestable without a real websocket. Any object with
+    async `send_json`/`close` satisfies this (aiohttp's WebSocketResponse
+    does; so does a test fake).
+
+    `close` was added alongside the hub's keepalive sweep (`Hub.keepalive_sweep`,
+    hub.py) -- the mechanism that proactively tears down a device connection
+    that has gone silent past `LIVE_SILENCE_TIMEOUT_SECONDS`, rather than
+    merely distrusting it as `tiers.py`'s `compute_tier` already did. See
+    hub.py's module docstring."""
 
     async def send_json(self, data: Any, /) -> None: ...
+
+    # Return type is deliberately `object`, not `None` -- aiohttp's real
+    # `WebSocketResponse.close()` returns `bool`, and a Protocol method's
+    # return type must be covariant with every real implementation's return
+    # type. We never inspect the return value; `object` is simply the
+    # widest type any implementation's return value is guaranteed to satisfy.
+    async def close(self, /) -> object: ...
 
 
 @dataclass

@@ -124,6 +124,9 @@ def test_hub_agent_confirm_route_rejects_unredeemable_token_end_to_end(tmp_path:
             if fut is not None and not fut.done():
                 fut.set_result({"ok": True, "id": data["id"], "result": {"ref": "e1"}})
 
+        async def close(self) -> None:
+            pass
+
     record.ws = _FakeWs()
     record.touch()
 

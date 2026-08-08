@@ -43,6 +43,9 @@ class FakeDeviceSocket:
         self.canned_result = canned_result or {"ok": True, "result": {"stub": True}}
         self.overrides: dict[str, dict[str, Any]] = {}
 
+    async def close(self) -> None:
+        pass
+
     async def send_json(self, data: dict[str, Any], /) -> None:
         self.sent.append(data)
         fut = self.record.pending.get(data["id"])
