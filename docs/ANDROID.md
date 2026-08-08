@@ -1,5 +1,32 @@
 # Android operator runbook
 
+> ## Android support is EXPERIMENTAL
+>
+> This is not a supported install path. Edge on the **desktop** is the supported
+> platform (see [INSTALL.md](../INSTALL.md)); everything in this document is an
+> experimental sideload with sharp edges, and this extension's own code has never
+> been confirmed running on a real Android device.
+>
+> **Three things to know before you start:**
+>
+> 1. **Edge Android *stable* cannot install this extension.** Edge for Android
+>    gained extension support in March 2025 (v134), but only for a **small,
+>    Microsoft-curated set** of extensions -- roughly two dozen, chosen by
+>    Microsoft. **This extension is not on that list**, and no public process for
+>    getting onto it is documented. There is no "enable developer mode on stable"
+>    workaround; the curated set is the whole surface stable exposes.
+> 2. **Sideloading requires Edge Canary or Beta on Android**, through a hidden
+>    developer-options flow: Settings -> About Microsoft Edge -> tap the build
+>    number **5 times** -> Developer Options -> **"Extension install by crx"**.
+>    Microsoft does not document this flow anywhere public -- it is known from
+>    community reporting and from this project's own testing. Whether it is
+>    genuinely *exclusive* to Canary/Beta is **inferred, not confirmed** by
+>    Microsoft; this runbook assumes Canary, which is the only channel it was
+>    exercised on.
+> 3. **The install is not "unzip and load unpacked".** It needs a packed CRX3
+>    served as `.bin` and renamed on the phone, plus a battery-optimization
+>    exemption that is a requirement rather than a tip. Both are explained below.
+
 **Read this before attempting to sideload.** This document is the accumulated,
 hard-won knowledge of packaging and sideloading this extension onto Edge Canary on
 Android -- some of it (the packaging traps) was proven by direct experimentation on
@@ -10,9 +37,13 @@ the honest line between the two.
 
 ## Prerequisites
 
-- **Edge Canary or Beta on Android.** Arbitrary/unpacked or sideloaded extension
-  loading is **not available on stable Edge Android** as of this writing. Install
-  Edge Canary from the Play Store.
+- **Edge Canary or Beta on Android.** Stable Edge Android *does* have extension
+  support (since v134, March 2025), but only for a **Microsoft-curated set of
+  roughly two dozen extensions** -- arbitrary/unpacked/sideloaded loading is not
+  part of that, and this extension is not on the curated list. Install Edge Canary
+  from the Play Store. (Whether the sideload flow is strictly Canary/Beta-only is
+  inferred from community reporting, not confirmed by Microsoft; Canary is the only
+  channel this runbook was exercised on.)
 - **Tailscale installed and connected on the phone.** The extension dials out to
   the hub over the tailnet; if Tailscale isn't connected, or isn't routing traffic
   for Edge, the extension will never reach the hub no matter how correctly it's
@@ -204,6 +235,22 @@ device. That is a genuinely different question -- see the final section.
    # then, on the phone's browser, fetch:
    # http://<this-machine's-tailnet-IP>:8765/amplifier-browser-bridge-android-v0.4.0.bin
    ```
+
+   **Preferred: serve the `/setup` page instead of a bare directory listing.**
+   `scripts/serve-android-setup.py` serves the same artifact plus a phone-sized
+   instruction page carrying the same experimental framing this document opens
+   with -- so a person handed only a URL sees the Canary/Beta requirement and the
+   stable-channel limitation before they download anything, rather than after they
+   fail:
+   ```bash
+   python3 scripts/serve-android-setup.py \
+     --root dist/android \
+     --artifact amplifier-browser-bridge-android-v0.4.0.bin \
+     --host "$(tailscale ip -4)" --port 8686
+   # then, on the phone's browser: http://<that tailnet IP>:8686/setup
+   ```
+   It refuses to start if the named artifact is missing, and serves everything
+   except `/setup` as an opaque `application/octet-stream` attachment.
 2. **On the phone**, once the `.bin` file is downloaded, use a file manager (e.g.
    My Files) to rename it back to `.crx` before the install step below.
 3. **Enable Developer Options in Edge Canary**, if not already done: Settings ->
@@ -298,6 +345,11 @@ so treat it as evidence that the *platform* behaves this way, not as proof that
   accepted and ran it."
 - Whether CRX sideload works on Edge Android **stable**, or only on
   Canary/Beta -- untested; Canary is the only channel this runbook assumes.
+  Microsoft documents neither the developer-options flow nor its channel
+  restriction, so "Canary/Beta only" is inferred from community reporting plus
+  this project's own testing, not confirmed. What *is* documented is that stable
+  ships a Microsoft-curated extension list, which this extension is not on --
+  so stable is closed to it either way.
 - Whether Edge Add-ons store review would pass a browser-remote-control
   extension at all (relevant only if store distribution, rather than sideload,
   is later pursued).

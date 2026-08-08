@@ -81,15 +81,25 @@ deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brie
 `uv pip install -e .` (an *editable* install) is the CONTRIBUTOR path for iterating on this
 repo's own source -- see CONTRIBUTING.md's "Dev setup" if that's what you're doing instead.
 
-Every command below was run verbatim against a fresh, non-editable install with no prior
-configuration -- see "Verified clean-room install" below for the full transcript.
+You need [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and Python 3.12 or
+newer. **This package is not on PyPI yet** (see "Status" above -- no packaged release), so the
+only install path that works today is from a local clone.
+
+Every command below was run verbatim on a clean machine with no prior configuration -- see
+"Verified clean-room install" below for the full transcript, captured from a real run.
 
 ```bash
-# 1. Install (a real, non-editable install -- from PyPI once published, or from a local
-#    checkout via `uv tool install .`; either way, NOT `uv pip install -e .`)
+# 1. Clone. The repo is public; no credentials needed.
+git clone https://github.com/bkrabach/amplifier-browser-bridge.git
+cd amplifier-browser-bridge
+
+# 2. Install (a real, non-editable install -- NOT `uv pip install -e .`).
+#    Once this package is published to PyPI, `uv tool install amplifier-browser-bridge`
+#    will work from anywhere and steps 1-2 collapse into that one command. It does not
+#    work yet.
 uv tool install .
 
-# 2. First-run setup: generates a hub token, stages the extension into a stable directory,
+# 3. First-run setup: generates a hub token, stages the extension into a stable directory,
 #    and prints the exact remaining manual steps.
 amplifier-browser-bridge init
 ```
@@ -141,17 +151,34 @@ amplifier-browser-bridge snapshot <device_id>/<tab_id>
 amplifier-browser-bridge click <device_id>/<tab_id> <ref>
 ```
 
-**`amplifier-browser-bridge doctor` diagnoses a stuck setup.** It checks, in order, the token file, hub
-reachability, token match, and whether a device has ever connected -- and stops at the first
-broken link with a specific, actionable message rather than a wall of failures:
+**`amplifier-browser-bridge doctor` diagnoses a stuck setup.** It runs six checks in dependency
+order -- the token file, other token-like files sitting next to it, this machine's network
+exposure and Tailscale ACL posture, hub reachability, token match, and whether a device has
+ever connected. It stops at the first broken link and marks everything downstream `skipped`
+with a reason, so you see ONE actionable thing to fix rather than a wall of failures.
+
+Immediately after `init`, before you have loaded the extension into Edge, the expected result
+is five `[ok]` and one `[FAIL]` on `device_connected`. **That final `[FAIL]` is not a
+malfunction -- it is `doctor` telling you the setup is incomplete and naming the step you have
+not done yet.** `doctor` exits non-zero in this state, which is correct: the chain is not
+finished. This is the real output of that run (`network_exposure`'s message is long; it is
+reproduced in full here because it is the check people most often assume is boilerplate):
 
 ```
-[ok]   token_store: auth enabled; token file: ~/.config/amplifier-browser-bridge/tokens.json
+[ok]   token_store: auth enabled; token file: /root/.config/amplifier-browser-bridge/tokens.json
+[ok]   token_file_siblings: no other token-like files found alongside /root/.config/amplifier-browser-bridge/tokens.json
+[ok]   network_exposure: this doctor invocation targets a loopback host ('127.0.0.1'). Note: this
+       check can only see what host YOU pointed doctor at -- it cannot prove the running hub
+       process isn't ALSO bound to a wider address (e.g. started with --host 0.0.0.0). Confirm
+       separately how the hub you're diagnosing was actually started. could not detect a Tailscale
+       IP on this machine (`tailscale ip -4` unavailable or failed). [...Tailscale default-ACL
+       disclosure continues; see docs/tailscale-acl-example.hujson...]
 [ok]   hub_reachable: hub reachable at ws://127.0.0.1:8900/agent
 [ok]   token_match: token accepted by hub
 [FAIL] device_connected: no browser device has ever connected to this hub. Load the extension
        unpacked (edge://extensions -> Developer mode -> Load unpacked), click its toolbar icon,
        and set the Hub URL/token on the options page.
+Error: one or more checks failed -- see above.
 ```
 
 See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full command vocabulary and target-addressing
@@ -186,48 +213,98 @@ extension's options page) to the CLI, MCP server, or `amplifier-browser-bridge d
 
 ### Verified clean-room install
 
-Run 2026-07-26 with a genuinely NON-editable install -- the exact `uv tool install .` path a
-real user takes, not `uv pip install -e .` (which resolves straight back to a checkout and
-would silently mask a packaging bug like the one this transcript is proving fixed). New
-virtualenv, `AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC` explicitly unset, and a separate hub on port 8901 with its own
-token file and its own `$HOME` -- never touching the real deployment's port 8900 hub or
-`~/.config/amplifier-browser-bridge/`:
+Run 2026-08-08 on a **throwaway Ubuntu 24.04 container with nothing pre-installed** -- no copy
+of this package, no `~/.config/amplifier-browser-bridge/`, no repo checkout, no GitHub
+credentials, no SSH key, no `~/.netrc`, no `~/.gitconfig`. Only `git`, `curl`, Python 3.12, and
+`uv` were present, which is what a stranger's machine looks like. The repo was cloned
+anonymously over HTTPS and the Quickstart above was then executed **verbatim**, in order, with
+nothing substituted:
 
 ```console
-$ uv venv /tmp/amplifier-browser-bridge-cleanroom/.venv --python 3.12
-$ uv pip install --python /tmp/amplifier-browser-bridge-cleanroom/.venv/bin/python /path/to/amplifier-browser-bridge
-Resolved 13 packages in 86ms
-   Building amplifier-browser-bridge @ file:///path/to/amplifier-browser-bridge
-      Built amplifier-browser-bridge @ file:///path/to/amplifier-browser-bridge
-Installed 13 packages
+$ git clone https://github.com/bkrabach/amplifier-browser-bridge.git
+Cloning into 'amplifier-browser-bridge'...
+$ cd amplifier-browser-bridge && git rev-parse HEAD
+8605536c3e8ceb2f126adff2fcb0e514e625a71b
 
-$ env -u AMPLIFIER_BROWSER_BRIDGE_EXTENSION_SRC HOME=/tmp/amplifier-browser-bridge-cleanroom/home \
-    /tmp/amplifier-browser-bridge-cleanroom/.venv/bin/amplifier-browser-bridge init --hub-host 127.0.0.1 --hub-port 8901
-Generated new hub token (stored in /tmp/amplifier-browser-bridge-cleanroom/home/.config/amplifier-browser-bridge/tokens.json).
-Staged extension -> /tmp/amplifier-browser-bridge-cleanroom/home/.local/share/amplifier-browser-bridge/extension
+$ uv tool install .
+Resolved 13 packages in 222ms
+   Building amplifier-browser-bridge @ file:///root/amplifier-browser-bridge
+Downloading aiohttp (1.7MiB)
+ Downloaded aiohttp
+      Built amplifier-browser-bridge @ file:///root/amplifier-browser-bridge
+Prepared 11 packages in 319ms
+Installed 13 packages in 4ms
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + amplifier-browser-bridge==0.1.0 (from file:///root/amplifier-browser-bridge)
+ + attrs==26.1.0
+ + click==8.4.2
+ + frozenlist==1.8.0
+ + idna==3.18
+ + multidict==6.7.1
+ + propcache==0.5.2
+ + typing-extensions==4.16.0
+ + websockets==17.0.1
+ + yarl==1.24.5
+Installed 2 executables: amplifier-browser-bridge, amplifier-browser-bridge-mcp
+
+$ amplifier-browser-bridge init
+Generated new hub token (stored in /root/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /root/.local/share/amplifier-browser-bridge/extension
 
 Remaining steps (manual -- Edge has no CLI for these):
-  1. Start the hub: ...
-  2. Load the extension: ...
-  3. Configure it: ...
-  4. Confirm it worked: ...
 
-$ ls /tmp/amplifier-browser-bridge-cleanroom/home/.local/share/amplifier-browser-bridge/extension/
-args_bool.mjs  background.js  combine_frames.mjs  config_validate.mjs  download_claim.mjs
-fetch_utils.mjs  frame_refs.mjs  injected.js  manifest.json  options.html  options.js
-ref_registry.mjs
+  1. Start the hub:
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=/root/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 127.0.0.1 --port 8900
+       (could not detect a Tailscale IP -- `tailscale ip -4` is unavailable or failed -- defaulting to 127.0.0.1, which is NOT reachable from another device; for cross-device use, re-run with --hub-host <this machine's tailnet IP>)
 
-$ AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=.../tokens.json amplifier-browser-bridge hub --host 127.0.0.1 --port 8901
-amplifier-browser-bridge hub listening on ws://127.0.0.1:8901/device (extensions) and
-ws://127.0.0.1:8901/agent (agents); audit log -> ./amplifier-browser-bridge-audit.jsonl
+  2. Load the extension:
+       edge://extensions -> enable Developer mode -> Load unpacked ->
+       select: /root/.local/share/amplifier-browser-bridge/extension
 
-$ AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://127.0.0.1:8901/agent AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8901/agent
-[ok]   token_store: auth enabled; token file: .../tokens.json
-[ok]   token_file_siblings: no other token-like files found alongside .../tokens.json
-[ok]   hub_reachable: hub reachable at ws://127.0.0.1:8901/agent
-[ok]   token_match: token accepted by hub
-[FAIL] device_connected: no browser device has ever connected to this hub. ...
+  3. Configure it:
+       Click the extension's toolbar icon (its only UI) to open the options page.
+       Hub URL: ws://127.0.0.1:8900/device
+       Token:   9a971fad524311b42dc81956c8d162ae
+       Click Save.
+
+  4. Confirm it worked:
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN=9a971fad524311b42dc81956c8d162ae amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8900/agent
+
+$ ls /root/.local/share/amplifier-browser-bridge/extension/
+args_bool.mjs        config_validate.mjs   frame_refs.mjs   options.html
+background.js        download_claim.mjs    injected.js      options.js
+bundled_config.mjs   effects_collector.mjs manifest.json    ref_registry.mjs
+combine_frames.mjs   fetch_utils.mjs
 ```
+
+Steps 1 and 4 of `init`'s printed instructions were then run **exactly as printed** -- no host,
+port, or URL edited:
+
+```console
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=/root/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 127.0.0.1 --port 8900
+amplifier-browser-bridge hub listening on ws://127.0.0.1:8900/device (extensions) and ws://127.0.0.1:8900/agent (agents); audit log -> ./amplifier-browser-bridge-audit.jsonl
+
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN=9a971fad524311b42dc81956c8d162ae amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8900/agent
+[ok]   token_store: auth enabled; token file: /root/.config/amplifier-browser-bridge/tokens.json
+[ok]   token_file_siblings: no other token-like files found alongside /root/.config/amplifier-browser-bridge/tokens.json
+[ok]   network_exposure: this doctor invocation targets a loopback host ('127.0.0.1'). [...]
+[ok]   hub_reachable: hub reachable at ws://127.0.0.1:8900/agent
+[ok]   token_match: token accepted by hub
+[FAIL] device_connected: no browser device has ever connected to this hub. Load the extension unpacked (edge://extensions -> Developer mode -> Load unpacked), click its toolbar icon, and set the Hub URL/token on the options page.
+Error: one or more checks failed -- see above.
+```
+
+That trailing `[FAIL]` is the correct and expected end state for this transcript: no browser was
+ever attached, because the container has no Edge in it. The token shown was generated inside the
+throwaway container and died with it.
+
+**The `init` -> `doctor` host agreement is load-bearing and was specifically checked.** An
+earlier release printed a hub command binding a tailnet address while printing a `doctor`
+command aimed at loopback, so following the printed steps verbatim always failed at
+`hub_reachable`. Above, with no Tailscale present, `init` fell back to `127.0.0.1`, said so
+explicitly, and printed a `doctor` command targeting that same `127.0.0.1` -- the two agree.
 
 Before this fix, the `amplifier-browser-bridge init` step above raised `ExtensionSourceNotFoundError` on a
 non-editable install -- the wheel didn't contain `extension/` at all (see
@@ -235,8 +312,11 @@ non-editable install -- the wheel didn't contain `extension/` at all (see
 `tests/test_packaging.py`, which builds a real wheel and asserts every file `amplifier-browser-bridge init` needs
 is actually inside it).
 
-The extension was loaded via Playwright's headless Chromium (`--load-extension=./extension
---user-data-dir=./profile --remote-debugging-port=<port>`). Verified via CDP's `/json/list`:
+**Separately, and earlier (2026-07-26), the browser half was verified in its own container** --
+the clean-room run above has no browser in it at all, so it proves the install and CLI chain,
+not the extension. In that earlier run the extension was loaded via Playwright's headless
+Chromium (`--load-extension=./extension --user-data-dir=./profile
+--remote-debugging-port=<port>`). Verified via CDP's `/json/list`:
 
 - The service worker registered (`chrome-extension://<id>/background.js`).
 - **The options page opened automatically** on first install (`onInstalled` ->
@@ -335,7 +415,35 @@ relying on a gate that a human will never actually see.
 
 ## Platform support
 
-| Capability | Edge desktop (Windows / macOS / Linux) | Edge Android |
+**Edge desktop is the supported platform. Edge Android is EXPERIMENTAL.** Read the box below
+before reading the table -- the table describes what the *platform* can do, not how easy it is
+to get this extension onto it.
+
+> ### Android support is experimental
+>
+> - **You cannot install this on Edge Android stable.** Edge for Android gained extension
+>   support in March 2025 (v134), but only for a **small, Microsoft-curated set** of extensions
+>   -- roughly two dozen, chosen by Microsoft. **This extension is not on that list**, and there
+>   is no application process documented for getting onto it.
+> - **Sideloading requires Edge Canary or Beta on Android**, via a hidden developer-options
+>   flow: Settings -> About Microsoft Edge -> tap the build number 5 times -> Developer Options
+>   -> "Extension install by crx". Microsoft does not document this flow anywhere public; it is
+>   known from community reporting and from this project's own testing. Whether it is genuinely
+>   *exclusive* to Canary/Beta is inferred, not confirmed by Microsoft.
+> - **The install is awkward on purpose-of-the-platform grounds, not ours.** The artifact must
+>   be served as `.bin` and renamed to `.crx` on the phone, because Chromium intercepts `.crx`
+>   downloads and Edge Android silently discards the file. A battery-optimization exemption is
+>   an onboarding *requirement*, not a tip.
+> - **This extension's own code has never been confirmed running on a real Android device.** The
+>   Android platform behaviors below were measured on real hardware with a *separate throwaway
+>   probe extension*, not with this project's code. See
+>   [docs/ANDROID.md](docs/ANDROID.md)'s "What remains unproven" for the exact line between what
+>   was proven and what was inferred.
+>
+> Treat every "Yes" in the Edge Android column as "the platform supports this", not as "this
+> extension has been observed doing this on your phone."
+
+| Capability | Edge desktop (Windows / macOS / Linux) | Edge Android (experimental) |
 |---|---|---|
 | Read/write DOM, element click/type dispatch | Yes | Yes |
 | Screenshot the active tab | Yes | Yes |
@@ -378,10 +486,45 @@ amplifier-browser-bridge-mcp   # runs over stdio, the default every MCP client s
 ## Testing
 
 ```bash
-uv pip install -e ".[dev]"          # or: uv pip install -e . pytest
-pytest tests/                        # root package
-pytest modules/tool-browser-bridge/tests/   # Amplifier tool module
+# Run from the repo root. `uv pip install` REQUIRES an active virtualenv -- with none
+# active it refuses with "No virtual environment found" and exits non-zero, and the
+# `pytest` lines then die with "command not found". These two lines are not optional.
+uv venv
+source .venv/bin/activate
+
+# Root package -- 412 tests.
+uv pip install -e . pytest pytest-asyncio "mcp<2"
+pytest tests/
+
+# Amplifier tool module -- 14 tests. amplifier-core is a PEER dependency the
+# module deliberately does not declare (see its pyproject.toml), so install it here.
+uv pip install -e ./modules/tool-browser-bridge amplifier-core
+pytest modules/tool-browser-bridge/tests/
 ```
+
+Verified 2026-08-08 by extracting this exact block from `README.md` and running it with
+`bash`, from a fresh anonymous clone, in a container with no venv active.
+
+Each part of that first command is load-bearing; dropping any one of them produces a
+failure that looks like a broken repo rather than a missing package:
+
+| Omit | What actually happens |
+|---|---|
+| `pytest-asyncio` | **32 failed, 380 passed** -- every `async def` test errors with "async def functions are not natively supported" |
+| `mcp<2` | `pytest tests/` aborts during collection: `tests/test_mcp.py` -> `mcp_server.py` -> `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` |
+| `amplifier-core` | `modules/tool-browser-bridge/tests/` aborts during collection: `ModuleNotFoundError: No module named 'amplifier_core'` |
+
+**Two traps worth naming explicitly:**
+
+- **There is no `[dev]` extra.** `pyproject.toml` declares exactly one optional
+  dependency group, `mcp`. `uv pip install -e ".[dev]"` does not fail -- it prints
+  `warning: ... does not have an extra named 'dev'` and **exits 0 having installed
+  nothing**, so the next command dies with 32 collection errors.
+- **`.[mcp]` does not currently work either.** The declared floor is `mcp>=1.6`, which
+  today resolves to `mcp` 2.0.0 -- a release that removed `mcp.server.fastmcp`, the
+  exact symbol `src/amplifier_browser_bridge/mcp_server.py:35` imports. Until that
+  floor is capped in `pyproject.toml`, pass `"mcp<2"` explicitly (1.29.0 resolves and
+  passes). This affects `amplifier-browser-bridge-mcp` at runtime too, not just tests.
 
 ## Contributing
 

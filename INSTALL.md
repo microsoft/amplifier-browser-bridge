@@ -25,14 +25,16 @@ Edge browser -- on this machine, or on a completely different device, over
 your own [Tailscale](https://tailscale.com) network. It is not a sandboxed or
 disposable browser; it is the browser you actually use, with your actual
 sessions. Before installing, read
-[SECURITY.md](https://github.com/microsoft/amplifier-browser-bridge/blob/main/SECURITY.md)
+[SECURITY.md](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/SECURITY.md)
 in the source repository -- it explains, plainly, what protects you and what
 does not.
 
 ## What you need before you start
 
 - **Microsoft Edge**, desktop (Windows, macOS, or Linux). This extension does
-  not support other browsers.
+  not support other browsers. **Edge on Android is experimental and is not
+  installable this way** -- see "Android" at the end of this document before
+  you try.
 - **A place to run the hub.** The hub is a Python program (`amplifier-browser-bridge
   hub`). This can be the same machine running Edge, or a different machine on
   your tailnet -- both work, but if hub and browser are on different devices
@@ -40,18 +42,32 @@ does not.
 - **[Tailscale](https://tailscale.com)**, installed and signed in, if you want
   the hub and the browser on different devices. If hub and browser are the
   *same* machine, Tailscale is optional -- `127.0.0.1` (loopback) is enough.
-- **A way to run the hub program.** See "Installing and starting the hub"
-  below -- it is a separate download from this zip.
+- **Python 3.12 or newer, and [`uv`](https://docs.astral.sh/uv/getting-started/installation/)**,
+  on whichever machine will run the hub. `uv` is how you install the hub in
+  Step 1.
+- **`git`**, to clone the hub's source. The hub is **not** on PyPI yet, so
+  there is no `pip install` shortcut -- see Step 1.
 
 ## Step 1 -- Install and start the hub
 
-The hub is not inside this zip -- it is a separate Python package. On the
-machine that will run it:
+The hub is not inside this zip -- it is a separate Python package, and it is
+**not published to PyPI yet**, so you install it from source. On the machine
+that will run it:
 
 ```bash
-uv tool install amplifier-browser-bridge   # or: pip install amplifier-browser-bridge
+git clone https://github.com/bkrabach/amplifier-browser-bridge.git
+cd amplifier-browser-bridge
+uv tool install .
 amplifier-browser-bridge init
 ```
+
+The repo is public -- the clone needs no GitHub account, token, or SSH key.
+
+> **Do not use `uv tool install amplifier-browser-bridge` or
+> `pip install amplifier-browser-bridge`.** Neither works today; the name is
+> not on PyPI, and both fail with a package-not-found error. When a release is
+> published, that one-liner will replace the clone and both commands above
+> collapse into it.
 
 `init` generates a token, prints the exact remaining commands (including
 which host/port to bind), and tells you whether it auto-detected a Tailscale
@@ -114,11 +130,20 @@ AMPLIFIER_BROWSER_BRIDGE_TOKEN=<the token from Step 1> \
   amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8900/agent
 ```
 
-`doctor` checks the token file, hub reachability, token match, and whether a
-browser has ever connected -- and stops at the first broken link with a
-specific, actionable message. A healthy setup ends with the device showing
-as connected. If it doesn't, `doctor`'s own output tells you which of the
-four links is broken.
+`doctor` runs six checks in order -- the token file (`token_store`), other
+token-like files sitting beside it (`token_file_siblings`), this machine's
+network exposure and Tailscale ACL posture (`network_exposure`), hub
+reachability (`hub_reachable`), token match (`token_match`), and whether a
+browser has ever connected (`device_connected`). It stops at the first broken
+link and marks everything downstream `skipped`, so you get one thing to fix
+rather than a wall of red. A healthy setup ends with `[ok] device_connected`.
+
+**If you run `doctor` before finishing Steps 2 and 3, the last line will read
+`[FAIL] device_connected: no browser device has ever connected to this hub`
+and the command will exit non-zero. That is expected, not a malfunction** --
+it is `doctor` telling you the browser half isn't done yet, and naming the
+step. Everything above that line showing `[ok]` means the hub half is
+correct.
 
 Once `doctor` confirms a connection, an agent can issue commands, e.g.:
 
@@ -132,7 +157,7 @@ amplifier-browser-bridge tabs <device_id>
 This is not a narrow, single-purpose extension -- it is a general remote-control
 surface for your browser, and its permissions reflect that honestly rather than
 minimizing it. See
-[`docs/permission-justifications.md`](https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/permission-justifications.md)
+[`docs/permission-justifications.md`](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/docs/permission-justifications.md)
 in the source repository for the full, long-form reasoning behind each one
 (`<all_urls>`, `chrome.debugger`, and the persistent connection to the hub in
 particular). In short:
@@ -170,6 +195,38 @@ path, and survive an update untouched.
 3. Stop the hub process (Ctrl-C, or however you started it) if you no longer
    need it running.
 
+## Android (experimental -- these instructions do not apply)
+
+**Everything above describes Edge on the desktop. Android support is
+experimental, and the steps above will not work there.** If you came here
+hoping to put this on a phone, read this section before spending time on it:
+
+- **Edge Android stable cannot install this extension.** Edge for Android
+  gained extension support in March 2025, but only for a **small,
+  Microsoft-curated set** of extensions -- roughly two dozen, chosen by
+  Microsoft. **This extension is not on that list**, and no public process for
+  getting onto it is documented.
+- **Sideloading requires Edge Canary or Beta on Android**, through a hidden
+  developer-options flow: Settings -> About Microsoft Edge -> tap the build
+  number **5 times** -> Developer Options -> **"Extension install by crx"**.
+  Microsoft does not document this flow publicly; it is known from community
+  reporting and this project's own testing. Whether it is genuinely
+  *exclusive* to Canary/Beta is inferred, not confirmed by Microsoft.
+- **The flow is not "unzip and load unpacked".** It needs a packed `.crx`
+  built by `scripts/package-android.sh`, served as a `.bin` file and renamed
+  to `.crx` on the phone -- because Chromium intercepts `.crx` downloads and
+  Edge Android silently discards the file. "Extension install by crx" also
+  requires a **local file path**, not a URL.
+- **A battery-optimization exemption is a requirement, not a tip.** Without
+  it, the phone goes unreachable whenever the screen is off.
+- **This extension's own code has never been confirmed running on a real
+  Android device.** The platform behaviors were measured on real hardware with
+  a separate throwaway probe extension, not with this project's code.
+
+The full runbook, including the honest list of what remains unproven, is
+[`docs/ANDROID.md`](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/docs/ANDROID.md)
+in the source repository.
+
 ## Trouble?
 
 | Symptom | Likely cause |
@@ -182,4 +239,4 @@ path, and survive an update untouched.
 | Extension connects, then goes dark for a long time on a phone/mobile device | Battery-optimization settings are suspending the browser in the background -- see `docs/ANDROID.md` in the source repository for the exact onboarding steps this project's own testing found necessary. |
 
 For anything not covered here, file an issue at
-<https://github.com/microsoft/amplifier-browser-bridge/issues>.
+<https://github.com/bkrabach/amplifier-browser-bridge/issues>.
