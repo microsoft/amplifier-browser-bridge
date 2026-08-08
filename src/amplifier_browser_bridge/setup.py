@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .auth import DEFAULT_TOKEN_FILE, load_token_store
+from .extension_integrity import verify_extension_integrity
 
 DEFAULT_STAGE_DIR = Path("~/.local/share/amplifier-browser-bridge/extension")
 
@@ -132,6 +133,14 @@ def stage_extension(dest: str | Path | None = None, source: str | Path | None = 
         if not src_file.is_file():
             raise ExtensionSourceNotFoundError(f"expected extension file missing from source: {src_file}")
         shutil.copy2(src_file, dest_path / name)
+
+    # Fail loud rather than silently hand back a directory whose background.js (or
+    # any other shipped file) imports something `_EXTENSION_FILES` forgot to include --
+    # exactly the 87ce68d bug (effects_collector.mjs shipped as an import but omitted
+    # from the staging whitelist, silently killing the entire service worker on next
+    # load). Checked against dest_path itself (the actual staged output), never against
+    # source_path (which always has every file and so could never catch an omission).
+    verify_extension_integrity(dest_path)
 
     return dest_path
 

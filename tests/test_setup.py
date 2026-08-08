@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+import amplifier_browser_bridge.setup as setup_mod
+from amplifier_browser_bridge.extension_integrity import ExtensionIntegrityError
 from amplifier_browser_bridge.setup import (
     ExtensionSourceNotFoundError,
     ensure_token_file,
@@ -138,3 +140,33 @@ def test_stage_extension_missing_source_file_fails_loud(tmp_path: Path) -> None:
 
     with pytest.raises(ExtensionSourceNotFoundError):
         stage_extension(dest=tmp_path / "dest", source=incomplete_source)
+
+
+def test_stage_extension_refuses_when_a_whitelisted_file_imports_an_unwhitelisted_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression test for the actual shipped bug (commit 87ce68d): background.js
+    (real source, unmodified) imports `./effects_collector.mjs` at module top level.
+    Simulate the exact historical mistake by removing ONLY that name from
+    `_EXTENSION_FILES` -- everything else about the real source tree is untouched --
+    and prove `stage_extension()` now refuses instead of silently handing back a
+    staged directory that would kill the entire MV3 service worker on next load.
+
+    This reproduces the bug at the level it actually shipped: a whitelist omission,
+    not a hand-built broken fixture.
+    """
+    assert "effects_collector.mjs" in setup_mod._EXTENSION_FILES, (
+        "test assumption stale: effects_collector.mjs is no longer part of the real "
+        "staging whitelist -- update this test to reflect whatever file background.js "
+        "imports today."
+    )
+    broken_whitelist = tuple(f for f in setup_mod._EXTENSION_FILES if f != "effects_collector.mjs")
+    monkeypatch.setattr(setup_mod, "_EXTENSION_FILES", broken_whitelist)
+
+    with pytest.raises(ExtensionIntegrityError, match="effects_collector.mjs") as exc_info:
+        stage_extension(dest=tmp_path / "staged")
+
+    assert exc_info.value.args
+    # Fail loud, not "warn and continue": this must be a raised exception (non-zero
+    # exit at the CLI layer via cli.py's ClickException translation), never a printed
+    # warning with a zero return.

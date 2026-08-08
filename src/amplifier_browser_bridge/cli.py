@@ -24,6 +24,7 @@ from .audit import AuditLog
 from .auth import extract_token_value, find_sibling_token_files, load_token_store, mask_token
 from .client import HubClient, HubError
 from .doctor import run_doctor
+from .extension_integrity import ExtensionIntegrityError
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
 from .netinfo import detect_tailscale_ip, is_wildcard_bind, wildcard_bind_warning
 from .policy import Denylist, host_of
@@ -1121,7 +1122,7 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
 
     try:
         staged_dir = stage_extension(dest)
-    except ExtensionSourceNotFoundError as e:
+    except (ExtensionSourceNotFoundError, ExtensionIntegrityError) as e:
         raise click.ClickException(str(e)) from e
 
     action = "Generated new" if token_result.created_new else "Reusing existing"
