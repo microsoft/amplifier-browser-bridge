@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from .auth import (
     TokenStore,
@@ -25,8 +26,28 @@ from .auth import (
     resolve_token_file,
 )
 from .client import HubClient, HubError
+from .netinfo import detect_tailscale_ip, is_loopback, is_wildcard_bind
 
 CheckStatus = Literal["ok", "fail", "skipped"]
+
+# A2 fix (security review finding): `doctor` never reported anything about
+# network exposure or Tailscale ACL posture, even though SECURITY.md's
+# original threat model rested entirely on "the tailnet is the boundary."
+# Tailscale's own default policy is ALLOW-ALL WITHIN THE TAILNET unless an
+# operator has hand-written a restrictive ACL -- for most users, that means
+# the "tailnet boundary" is a no-op and the per-device token is the only
+# real gate. See docs/tailscale-acl-example.json for a starting-point
+# restrictive policy, and SECURITY.md's rewritten threat-model section.
+_ACL_DISCLOSURE = (
+    "Tailscale's DEFAULT policy allows every device on your tailnet to reach every other "
+    "device on every port -- this is Tailscale's own default, not something this project "
+    "configures. Unless you have written a restrictive ACL in your tailnet's admin console "
+    "(https://login.tailscale.com/admin/acls), any device on your tailnet -- not just the "
+    "ones you intend to use with this hub -- can reach it. A starting-point restrictive ACL "
+    "is shipped at docs/tailscale-acl-example.hujson (scopes reachability of the hub's port to "
+    "a tag you assign to your own devices). Until you apply something like it, the per-device "
+    "token is the real gate, not the tailnet."
+)
 
 
 @dataclass
@@ -79,6 +100,59 @@ def _check_token_file_siblings(active_path: Path, store: TokenStore) -> DoctorCh
     )
 
 
+def _check_network_exposure(hub_url: str, auth_enabled: bool) -> DoctorCheck:
+    """A2 fix (security review finding): report what the hub is (or could be)
+    exposed to, and the Tailscale ACL disclosure -- neither existed before.
+
+    This can only observe the host component of the URL THIS doctor
+    invocation is pointed at, not necessarily every interface the actual
+    running hub process bound (a hub started with `--host 0.0.0.0` is still
+    reachable at `ws://127.0.0.1:.../agent` locally, so a doctor run against
+    127.0.0.1 cannot, by itself, prove the hub isn't ALSO wildcard-bound).
+    Says so explicitly rather than implying a guarantee this check cannot
+    make.
+    """
+    host = urlsplit(hub_url).hostname or ""
+    detected_tailscale_ip = detect_tailscale_ip()
+    lines: list[str] = []
+
+    if is_wildcard_bind(host):
+        lines.append(
+            f"this doctor invocation targets a WILDCARD host ({host!r}) -- if the running hub "
+            "was actually started with --host matching this, it is reachable from EVERY network "
+            "interface this machine has, not just the tailnet."
+        )
+    elif is_loopback(host):
+        lines.append(
+            f"this doctor invocation targets a loopback host ({host!r}). Note: this check can "
+            "only see what host YOU pointed doctor at -- it cannot prove the running hub process "
+            "isn't ALSO bound to a wider address (e.g. started with --host 0.0.0.0). Confirm "
+            "separately how the hub you're diagnosing was actually started."
+        )
+    else:
+        lines.append(
+            f"this doctor invocation targets host {host!r} -- not a wildcard bind, but confirm "
+            "this is the address you intend (your machine's own tailnet IP, not something wider)."
+        )
+
+    if detected_tailscale_ip:
+        lines.append(f"this machine's own Tailscale IP: {detected_tailscale_ip}.")
+    else:
+        lines.append(
+            "could not detect a Tailscale IP on this machine (`tailscale ip -4` unavailable or failed)."
+        )
+
+    if not auth_enabled:
+        lines.append(
+            "CRITICAL COMBINATION: auth is DISABLED (see token_store above). If this hub is "
+            "reachable from anywhere beyond this machine, ANY device that can reach the port "
+            "controls every connected browser, with no token check at all."
+        )
+
+    lines.append(_ACL_DISCLOSURE)
+    return DoctorCheck("network_exposure", "ok", " ".join(lines))
+
+
 async def run_doctor(
     hub_url: str,
     token: str | None,
@@ -104,6 +178,7 @@ async def run_doctor(
             )
         )
     checks.append(_check_token_file_siblings(file_path, store))
+    checks.append(_check_network_exposure(hub_url, store.auth_enabled))
 
     client = HubClient(hub_url, token=token)
     try:

@@ -1,0 +1,50 @@
+// Starting-point restrictive Tailscale ACL for amplifier-browser-bridge (A2 fix, security
+// review finding).
+//
+// Tailscale's DEFAULT policy allows every device on your tailnet to reach every
+// other device on every port. That means, out of the box, the tailnet is NOT a
+// meaningful boundary around this hub -- any device you've ever authorized onto
+// your tailnet (a work laptop, a friend's shared machine, a device you later
+// stop trusting) can still reach the hub's port unless you write a policy like
+// this one. See docs/POLICY.md and SECURITY.md's threat-model section for the
+// full argument: without an ACL like this, the per-device token is the ONLY
+// real gate, not the tailnet.
+//
+// This is a STARTING POINT, not a drop-in final policy -- edit the tags and
+// hostnames below to match your own tailnet before applying it (Tailscale
+// admin console -> Access controls, https://login.tailscale.com/admin/acls).
+//
+// What this policy does:
+//   - Tags your own agent host and your own browser devices explicitly, rather
+//     than trusting tailnet membership alone.
+//   - Grants tag:amplifier-browser-devices -> tag:amplifier-browser-agent:8900 ONLY --
+//     nothing else on your tailnet can reach the hub's port at all.
+//   - Denies everything else by omission -- Tailscale ACLs are deny-by-default
+//     for anything not explicitly granted once you have ANY "acls" block (this
+//     is what closes the "allow all" default).
+{
+  "tagOwners": {
+    // Replace with your own Tailscale identity (the account that should be
+    // allowed to assign these tags to devices).
+    "tag:amplifier-browser-agent": ["autogroup:admin"],
+    "tag:amplifier-browser-devices": ["autogroup:admin"]
+  },
+
+  "acls": [
+    {
+      "action": "accept",
+      // Only devices tagged as YOUR OWN browser devices may reach the hub --
+      // and only on the hub's port (8900 by default; change if you run
+      // `amplifier-browser-bridge hub --port <other>`).
+      "src": ["tag:amplifier-browser-devices"],
+      "dst": ["tag:amplifier-browser-agent:8900"]
+    }
+  ],
+
+  // Optional but recommended: without this, devices tagged
+  // tag:amplifier-browser-agent / tag:amplifier-browser-devices still get SSH access to each
+  // other under Tailscale's own defaults for tagged devices in some configs.
+  // Leave this present-but-empty (or write your own SSH rules) rather than
+  // deleting the section, so a future default doesn't silently reopen access.
+  "ssh": []
+}

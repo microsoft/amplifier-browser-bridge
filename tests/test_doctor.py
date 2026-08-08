@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from aiohttp.test_utils import TestServer
@@ -194,6 +195,62 @@ def test_doctor_token_file_path_honors_env_var_not_just_hardcoded_default(
 
     token_check = _by_name(checks, "token_store")
     assert str(custom_path) in token_check.message
+
+
+# --- A2 fix: network_exposure check (bind-address exposure + Tailscale ACL disclosure) ---
+
+
+def test_doctor_network_exposure_warns_on_wildcard_host(tmp_path: Path, token_file: Path) -> None:
+    with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value="100.124.126.19"):
+        checks = asyncio.run(run_doctor("ws://0.0.0.0:8900/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "network_exposure")
+    assert check.ok  # informational, never fails the run on its own
+    assert "WILDCARD" in check.message
+    assert "0.0.0.0" in check.message
+
+
+def test_doctor_network_exposure_notes_loopback_cannot_prove_wider_bind_absent(
+    tmp_path: Path, token_file: Path
+) -> None:
+    with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value=None):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:8900/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "network_exposure")
+    assert "loopback" in check.message
+    assert "cannot prove" in check.message
+
+
+def test_doctor_network_exposure_includes_tailscale_acl_disclosure(tmp_path: Path, token_file: Path) -> None:
+    with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value="100.124.126.19"):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:8900/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "network_exposure")
+    assert "allows every device on your tailnet" in check.message
+    assert "docs/tailscale-acl-example.hujson" in check.message
+    assert "100.124.126.19" in check.message  # detected IP surfaced to the user
+
+
+def test_doctor_network_exposure_flags_critical_combo_when_auth_disabled(tmp_path: Path) -> None:
+    """Auth disabled + a non-loopback target is the specific dangerous
+    combination this check exists to name loudly."""
+    missing_token_path = tmp_path / "no-tokens-here.json"
+    with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value=None):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:1/agent", None, missing_token_path))
+
+    check = _by_name(checks, "network_exposure")
+    assert "CRITICAL COMBINATION" in check.message
+    assert "auth is DISABLED" in check.message
+
+
+def test_doctor_network_exposure_silent_on_critical_combo_when_auth_enabled(
+    tmp_path: Path, token_file: Path
+) -> None:
+    with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value=None):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:1/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "network_exposure")
+    assert "CRITICAL COMBINATION" not in check.message
 
 
 def test_doctor_reports_auth_disabled_honestly(tmp_path: Path) -> None:
