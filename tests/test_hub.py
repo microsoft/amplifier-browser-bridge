@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import socket
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -19,7 +20,9 @@ from amplifier_browser_bridge.addressing import Target
 from amplifier_browser_bridge.audit import AuditLog
 from amplifier_browser_bridge.auth import TokenStore
 from amplifier_browser_bridge.hub import Hub, HubBindError, serve_hub
-from amplifier_browser_bridge.tiers import Tier
+from amplifier_browser_bridge.protocol import new_id
+from amplifier_browser_bridge.queue import QueuedCommand
+from amplifier_browser_bridge.tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
 
 class FakeDeviceSocket:
@@ -99,6 +102,66 @@ def test_offline_device_queues_and_returns_immediately(tmp_path: Any) -> None:
     assert result["tier"] == Tier.DORMANT.value
     assert result["queue_position"] == 1
     assert "command_id" in result
+
+
+# ---------------------------------------------------------------------------
+# Liveness bug fix: airplane mode kills a device's radio without a TCP FIN/RST,
+# so the hub's socket never closes and `record.connected` stays True forever.
+# A command dispatched into that state used to time out at 120s instead of
+# queuing (see tiers.py's module docstring for the full root-cause chain).
+# This reproduces the failure at the hub level: an open socket that has gone
+# silent past LIVE_SILENCE_TIMEOUT_SECONDS must route new commands to the
+# queue, never into `_dispatch_live`.
+# ---------------------------------------------------------------------------
+
+
+def test_open_but_silent_device_queues_instead_of_dispatching_into_a_dead_socket(tmp_path: Any) -> None:
+    """The real-world failure, reproduced without a network socket: `record.ws`
+    is still set (nothing ever closed it -- exactly what airplane mode does to
+    a real connection), but the device hasn't been heard from in longer than
+    LIVE_SILENCE_TIMEOUT_SECONDS. Before the fix, `record.tier` was
+    unconditionally LIVE here and `send_command` dispatched straight into
+    `_dispatch_live`, which would wait the full command timeout for a result
+    that can never arrive. After the fix, the command must queue immediately
+    -- `fake_ws.sent` stays empty, proving the wire was never touched."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record)
+    record.ws = fake_ws  # socket never closed -- connected stays True, as in the field
+    record.last_seen = datetime.now(UTC) - timedelta(seconds=LIVE_SILENCE_TIMEOUT_SECONDS + 1)
+
+    # The tiering fix itself: still "connected", but no longer trusted as LIVE.
+    assert record.connected is True
+    assert record.tier is Tier.INTERMITTENT
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "tabs", {})
+
+    result = asyncio.run(run())
+    assert result["status"] == "queued"
+    assert result["tier"] == Tier.INTERMITTENT.value
+    assert result["queue_position"] == 1
+    assert fake_ws.sent == []  # never dispatched -- the wire was never touched
+    assert len(record.queue) == 1
+
+
+def test_open_socket_recently_heard_from_still_dispatches_live(tmp_path: Any) -> None:
+    """Sanity complement: an open socket that HAS been heard from recently must
+    still dispatch immediately -- the fix must not make every connected device
+    queue, only ones that have actually gone silent."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record, canned_result={"ok": True, "result": {"tabs": []}})
+    record.ws = fake_ws
+    record.last_seen = datetime.now(UTC) - timedelta(seconds=LIVE_SILENCE_TIMEOUT_SECONDS - 1)
+    assert record.tier is Tier.LIVE
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1", tab_id=1), "tabs", {})
+
+    result = asyncio.run(run())
+    assert result == {"ok": True, "result": {"tabs": []}}
+    assert len(fake_ws.sent) == 1
 
 
 def test_two_tabs_on_one_device_do_not_cross_contaminate(tmp_path: Any) -> None:
@@ -539,6 +602,50 @@ def test_default_timeout_used_when_no_override_given(tmp_path: Any) -> None:
     result = asyncio.run(run())
     assert result["ok"] is False
     assert "timeout waiting 0.05s" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Timeout message misattribution fix: the message used to unconditionally blame
+# "a heavy SPA hydrating," even when the real cause (observed in the field) was
+# a device that had lost connectivity. It now diagnoses from the record's own
+# silence at the moment of timeout. `_send_and_await` is called directly (its
+# own docstring: "tests may call this directly to bypass escalation") so the
+# record's silence can be set precisely, independent of the tier-gate covered
+# by the queuing tests above.
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_message_blames_connectivity_loss_when_device_has_gone_silent(tmp_path: Any) -> None:
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=0.05)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    # Well past LIVE_SILENCE_TIMEOUT_SECONDS by the time this command's own
+    # (tiny) timeout expires -- simulates a device that went dark long before
+    # this specific command was ever sent.
+    record.last_seen = datetime.now(UTC) - timedelta(seconds=LIVE_SILENCE_TIMEOUT_SECONDS + 60.0)
+    cmd = QueuedCommand(id=new_id(), target=Target(device_id="d1", tab_id=1), command="read", args={})
+
+    result = asyncio.run(hub._send_and_await(record, cmd))
+    assert result["ok"] is False
+    assert "not been heard from" in result["error"]
+    assert "lost connection" in result["error"]
+    assert "heavy SPA" not in result["error"]
+
+
+def test_timeout_message_still_blames_a_slow_page_when_device_is_actively_heartbeating(tmp_path: Any) -> None:
+    """Complement: a device heard from moments ago, whose command is merely
+    slow, must keep the original actionable "heavy SPA" guidance -- it must not
+    be replaced by a connectivity-loss message that would misdirect debugging."""
+    hub = Hub(token_store=TokenStore(), audit_log=AuditLog(tmp_path / "audit.jsonl"), command_timeout=0.05)
+    record = hub.registry.get_or_create("d1")
+    record.ws = _NeverRespondingSocket()
+    record.touch()  # heard from moments ago
+    cmd = QueuedCommand(id=new_id(), target=Target(device_id="d1", tab_id=1), command="read", args={})
+
+    result = asyncio.run(hub._send_and_await(record, cmd))
+    assert result["ok"] is False
+    assert "heavy SPA" in result["error"]
+    assert "not been heard from" not in result["error"]
 
 
 def test_queued_command_preserves_timeout_override_until_drained(tmp_path: Any) -> None:

@@ -56,11 +56,18 @@ class DeviceRecord:
         return self.ws is not None
 
     @property
+    def seconds_since_last_seen(self) -> float | None:
+        """Elapsed time since the last hello, heartbeat, result, or event from
+        this device (`None` if it has never connected). Exposed separately from
+        `tier` so callers that need the raw elapsed value -- e.g. hub.py's
+        timeout-diagnosis message -- don't have to recompute it by hand."""
+        if self.last_seen is None:
+            return None
+        return (datetime.now(UTC) - self.last_seen).total_seconds()
+
+    @property
     def tier(self) -> Tier:
-        elapsed: float | None = None
-        if self.last_seen is not None:
-            elapsed = (datetime.now(UTC) - self.last_seen).total_seconds()
-        return compute_tier(self.connected, elapsed)
+        return compute_tier(self.connected, self.seconds_since_last_seen)
 
     def bind(self, ws: DeviceConnection, hello: dict[str, Any]) -> None:
         """Attach a live websocket connection, populated from a `hello` envelope."""
