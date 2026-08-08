@@ -360,8 +360,14 @@ that target (`PolicyEngine.evaluate` checks denylist before gates) -- there is n
 *new* command can be dispatched and every *queued* one is rejected; it does not mean an in-flight
 command is interrupted mid-execution in the browser.
 
-This phase implements the lib-level API only (`Hub.engage_kill_switch` /
-`Hub.disengage_kill_switch`). Surfacing it via the CLI or an MCP tool is later work.
+**A4 fix (security review finding):** this section previously described the kill switch as an
+available control while stating, honestly, that only the lib-level API existed -- but README's
+consent table listed it alongside the denylist and confirmation gates without that caveat, which
+is exactly the kind of documented-but-unenforced gap this project has committed to closing on
+sight. It is now reachable over the wire (`kill_switch_engage`/`kill_switch_disengage`/
+`kill_switch_status`, `docs/PROTOCOL.md`) and via the CLI (`amplifier-browser-bridge kill-switch
+engage|disengage|status`) -- same token-checked `/agent` route as every other command, not a
+separate privileged surface.
 
 ---
 

@@ -403,6 +403,22 @@ Pass the returned `session_id` as an optional `session_id` field on a `command` 
 (below) to enforce this session's write scope against that command. Omitting `session_id`
 entirely keeps the existing, fully-permissive default every pre-`scope.py` caller already gets.
 
+**A5 fix (security review finding): this state is now visible, not silent.** Omitting
+`session_id` used to leave a caller with no way to tell, from the response alone, that its
+command ran with no page-immune write restriction at all. The deliberate choice remains
+unchanged -- the maintainer's own stance is broad access by default (`docs/POLICY.md` section
+1), so the default itself was not narrowed -- but every `STATE_CHANGING_COMMANDS` result reached
+without a `session_id` now carries a `scope_warning` string field (`hub.py`'s
+`SCOPE_UNSCOPED_WARNING`), the same way `classification` is attached to every such result
+whether or not it gated:
+
+```json
+{"v": 1, "id": "...", "type": "result", "ok": true, "result": {"...": "..."},
+ "scope_warning": "no session_id supplied -- this command ran under the pre-existing, fully-permissive implicit write scope ..."}
+```
+
+A caller that always establishes a session and passes its `session_id` never sees this field.
+
 ### `narrow_scope` (agent -> hub) / `result` (hub -> agent)
 
 Narrows an **existing** session's scope -- never widens:
@@ -1162,6 +1178,29 @@ implements this.
 returned), never a hidden block. When a device transitions back to `live` (a fresh `hello`),
 the hub drains its queue in strict FIFO order (`queue.py`), dispatching each command exactly as
 if it had just been requested, and results become retrievable via `poll`.
+
+### `kill_switch_engage` / `kill_switch_disengage` / `kill_switch_status` (agent -> hub) / `result` (hub -> agent)
+
+A4 fix (security review finding): `docs/POLICY.md` section 5 and README's consent table always
+described a hub-level kill switch as an available control; until this pass it was reachable only
+by an embedding application calling `Hub.engage_kill_switch()`/`disengage_kill_switch()` directly
+in-process -- no wire message, and no CLI command, reached it.
+
+```json
+{"v": 1, "id": "...", "type": "kill_switch_engage", "token": "..."}
+```
+```json
+{"v": 1, "id": "...", "type": "result", "ok": true, "kill_switch_active": true, "rejected_queued_commands": 3}
+```
+
+`kill_switch_engage` halts all future dispatch immediately and rejects (does not silently drop)
+every command currently sitting in a per-device queue -- see `Hub.engage_kill_switch`'s
+docstring for the honest limit: it does NOT recall a command already in flight to a device.
+`kill_switch_disengage` restores normal dispatch (`{"ok": true, "kill_switch_active": false}`).
+`kill_switch_status` reports the current state without changing it
+(`{"ok": true, "kill_switch_active": bool}`). All three are ordinary token-checked agent-route
+requests -- same path as `command`/`confirm`/`establish_session`. CLI: `amplifier-browser-bridge kill-switch
+engage|disengage|status`.
 
 ## Authentication
 

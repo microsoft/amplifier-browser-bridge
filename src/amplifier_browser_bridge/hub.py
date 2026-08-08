@@ -112,6 +112,24 @@ _URL_BEARING_RESULT_COMMANDS = frozenset({"navigate", "snapshot", "read"})
 # and is not yet wired to this; see this PR's report for that open item.
 _PAGE_CONTENT_RESULT_COMMANDS = frozenset({"read", "snapshot", "tabs"})
 
+# A5 fix (security review finding): session scope (scope.py) is the ONLY
+# page-immune protection this design has -- design doc section 4's lemma --
+# and it is opt-in: a caller that omits `session_id` gets the pre-existing,
+# fully-permissive default (design doc section 8, "Migration") with NO
+# indication in the response that it ran unscoped. Rather than narrow that
+# default (the maintainer's own stated stance is broad access by default --
+# see docs/POLICY.md section 1), this makes the state VISIBLE: every
+# STATE_CHANGING_COMMANDS result reached without a session_id carries this
+# text in a `scope_warning` field, the same way `classification` is attached
+# to every such result whether or not it gated. See docs/PROTOCOL.md's
+# "Sessions" section, which states this choice plainly.
+SCOPE_UNSCOPED_WARNING = (
+    "no session_id supplied -- this command ran under the pre-existing, fully-permissive "
+    "implicit write scope (no page-immune write restriction was enforced). Pass a session_id "
+    "from session-establish/establish_session to enforce a narrower write scope -- see "
+    "docs/PROTOCOL.md's 'Sessions' section."
+)
+
 
 class HubBindError(RuntimeError):
     """Raised by `serve_hub` when the hub cannot bind its listening socket -- e.g.
@@ -614,6 +632,15 @@ class Hub:
                 elif rtype == "narrow_scope":
                     result = self._handle_narrow_scope(req)
                     await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
+                elif rtype == "kill_switch_engage":
+                    result = self._handle_kill_switch_engage(req)
+                    await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
+                elif rtype == "kill_switch_disengage":
+                    result = self._handle_kill_switch_disengage(req)
+                    await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
+                elif rtype == "kill_switch_status":
+                    result = self._handle_kill_switch_status()
+                    await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
                 else:
                     await ws.send_json(
                         {
@@ -745,6 +772,33 @@ class Hub:
         except ScopeError as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "session_id": scope.session_id, "scope": scope.to_wire()}
+
+    # ------------------------------------------------------------------
+    # Kill switch (A4 fix, security review finding): docs/POLICY.md section
+    # 5 always described this as a real, available control -- README's
+    # consent table listed it right alongside the denylist and confirmation
+    # gates. It was true only at the library level (`Hub.engage_kill_switch`/
+    # `disengage_kill_switch`, called directly by a test or an embedding
+    # app) -- no operator running the shipped `amplifier-browser-bridge` CLI, and no agent
+    # over the wire protocol, had any way to reach it. These three wire
+    # messages (and the matching `amplifier-browser-bridge kill-switch` CLI subcommand) are
+    # what make the documented control actually reachable, from the same
+    # `/agent` route and the same token-checked path every other agent
+    # request already goes through.
+    # ------------------------------------------------------------------
+
+    def _handle_kill_switch_engage(self, req: dict[str, Any]) -> dict[str, Any]:
+        del req  # no fields consumed today; kept for symmetry/future audit context
+        rejected = self.engage_kill_switch()
+        return {"ok": True, "kill_switch_active": True, "rejected_queued_commands": rejected}
+
+    def _handle_kill_switch_disengage(self, req: dict[str, Any]) -> dict[str, Any]:
+        del req  # no fields consumed today; kept for symmetry/future audit context
+        self.disengage_kill_switch()
+        return {"ok": True, "kill_switch_active": False}
+
+    def _handle_kill_switch_status(self) -> dict[str, Any]:
+        return {"ok": True, "kill_switch_active": self.policy.kill_switch_active}
 
     def _maybe_seal_session(self, session_id: str | None) -> None:
         """Seal a session the first time any of its commands yields page
@@ -914,11 +968,17 @@ class Hub:
         # once here from the already-evaluated `decision`, not round-tripped
         # through the device.
         classification_wire = decision.classification.to_wire() if decision.classification else None
+        # A5 fix -- see SCOPE_UNSCOPED_WARNING's module-level comment.
+        scope_warning = (
+            SCOPE_UNSCOPED_WARNING if scope is None and command in STATE_CHANGING_COMMANDS else None
+        )
 
         if record.tier is Tier.LIVE:
             result = await self._dispatch_live(record, cmd)
             if classification_wire is not None:
                 result = {**result, "classification": classification_wire}
+            if scope_warning is not None:
+                result = {**result, "scope_warning": scope_warning}
             return result
 
         position = record.queue.enqueue(cmd)
@@ -939,6 +999,8 @@ class Hub:
         }
         if classification_wire is not None:
             queued_response["classification"] = classification_wire
+        if scope_warning is not None:
+            queued_response["scope_warning"] = scope_warning
         return queued_response
 
     @staticmethod

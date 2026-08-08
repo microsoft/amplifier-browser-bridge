@@ -149,6 +149,24 @@ class HubClient:
         )
         return resp
 
+    async def kill_switch_engage(self) -> dict[str, Any]:
+        """Halt all future dispatch immediately (`Hub.engage_kill_switch`,
+        docs/POLICY.md section 5) and reject every command currently queued
+        for any device. A4 fix (security review finding): this is the CLI/
+        lib-facing wire path that makes the documented kill switch actually
+        reachable by an operator -- it was previously library-API-only
+        (`Hub.engage_kill_switch()` called directly, never over the wire)."""
+        return await self._request({"v": PROTOCOL_VERSION, "id": new_id(), "type": "kill_switch_engage"})
+
+    async def kill_switch_disengage(self) -> dict[str, Any]:
+        """Restore normal dispatch after `kill_switch_engage`."""
+        return await self._request({"v": PROTOCOL_VERSION, "id": new_id(), "type": "kill_switch_disengage"})
+
+    async def kill_switch_status(self) -> dict[str, Any]:
+        """Current kill-switch state (`{"ok": True, "kill_switch_active": bool}`),
+        without changing it."""
+        return await self._request({"v": PROTOCOL_VERSION, "id": new_id(), "type": "kill_switch_status"})
+
     async def establish_session(
         self,
         *,
