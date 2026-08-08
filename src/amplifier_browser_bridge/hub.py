@@ -308,10 +308,26 @@ class Hub:
 
         if device_id:
             record = self.registry.get(device_id)
-            if record is not None:
+            # Race fix: only unbind if THIS connection is still the one the
+            # record holds. Without this guard, a stale connection's belated
+            # close -- e.g. an old TCP socket finally giving up seconds after
+            # a reconnect already replaced it -- would wipe out the live
+            # connection a newer `hello` had already bound. This was rare
+            # when closes only happened as the OS reported them; a
+            # forthcoming active keepalive sweep will proactively close
+            # silent connections, which will exercise this exit path far
+            # more often, so the race must be closed first.
+            if record is not None and record.ws is ws:
                 record.unbind()
-            self.audit.record("device_disconnected", device_id=device_id)
-            logger.info("device disconnected: %s", device_id)
+                self.audit.record("device_disconnected", device_id=device_id)
+                logger.info("device disconnected: %s", device_id)
+            elif record is not None:
+                self.audit.record("stale_connection_ignored", device_id=device_id)
+                logger.info(
+                    "stale connection for device %s closed after a newer connection already "
+                    "replaced it -- ignoring (not unbinding the live connection)",
+                    device_id,
+                )
 
         return ws
 
