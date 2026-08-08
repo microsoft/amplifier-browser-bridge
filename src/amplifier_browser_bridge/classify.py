@@ -346,11 +346,111 @@ def _compiled(patterns: tuple[str, ...]) -> tuple[re.Pattern[str], ...]:
     return tuple(re.compile(p, re.IGNORECASE) for p in patterns)
 
 
+# B2 fix (security review finding, classifier extraction gap): a label like
+# "Аdmin" (Cyrillic А, U+0410) is byte-different from "Admin" but visually
+# indistinguishable, and every match in this module is a plain codepoint
+# comparison -- so a page can defeat every family/phrase match just by
+# substituting look-alike characters from another script into an otherwise
+# ordinary-looking label. This is exactly the technique IDN-homograph phishing
+# uses against domain names; the same substitution works against label text.
+#
+# The full, normative answer is Unicode's own confusables mapping
+# (https://www.unicode.org/reports/tr39/, `confusables.txt`) via a "skeleton"
+# transform. That table has thousands of entries covering combining marks,
+# ligatures, and many scripts. Depending on it as a runtime dependency (a
+# bundled data file, or a PyPI package like `confusable-homoglyphs`) is more
+# than this specific, narrow gap warrants -- IMPLEMENTATION_PHILOSOPHY.md's
+# library-vs-custom-code judgment: reach for a library when the COMPLEXITY IT
+# HANDLES is worth the dependency, not merely because a standard exists.
+#
+# LOAD-BEARING SUBSET IMPLEMENTED HERE: single-character substitution of the
+# specific Cyrillic and Greek letters that are visually identical (or
+# near-identical) to a Latin letter used somewhere in this module's own
+# family/phrase vocabulary (a/e/o/p/c/y/x/i/j/s/k/h/t/b + their uppercase
+# forms) -- exactly the technique a "let's rename the Elevate button to look
+# the same but score differently" adversary would reach for first. Applied
+# BEFORE matching, to a NORMALIZED COPY of the text used only for scoring --
+# `Signal.value`/audit records still carry the ORIGINAL text, so a human
+# reviewing the audit log sees the real (possibly homoglyph-laden) label, not
+# a silently-rewritten one.
+#
+# NOT IMPLEMENTED (say so plainly, not implied-complete): full Unicode
+# confusables skeleton transform, multi-character ligatures/sequences,
+# combining-mark stripping, scripts beyond Cyrillic/Greek (e.g. Cherokee,
+# Armenian letters that are also confusable), and whole-word transliteration.
+# A sufficiently exotic homoglyph from outside this table still evades
+# scoring -- this raises the bar against the specific, cheap, already-observed
+# technique, it does not close every possible one. See classify.py's module
+# docstring: this whole module is advisory, never a security boundary.
+_CONFUSABLES_MAP: dict[str, str] = {
+    # Cyrillic -> visually-identical Latin lookalike (lowercase)
+    "а": "a",  # U+0430 CYRILLIC SMALL LETTER A
+    "е": "e",  # U+0435 CYRILLIC SMALL LETTER IE
+    "о": "o",  # U+043E CYRILLIC SMALL LETTER O
+    "р": "p",  # U+0440 CYRILLIC SMALL LETTER ER
+    "с": "c",  # U+0441 CYRILLIC SMALL LETTER ES
+    "у": "y",  # U+0443 CYRILLIC SMALL LETTER U
+    "х": "x",  # U+0445 CYRILLIC SMALL LETTER HA
+    "і": "i",  # U+0456 CYRILLIC SMALL LETTER BYELORUSSIAN-UKRAINIAN I
+    "ј": "j",  # U+0458 CYRILLIC SMALL LETTER JE
+    "ѕ": "s",  # U+0455 CYRILLIC SMALL LETTER DZE
+    "к": "k",  # U+043A CYRILLIC SMALL LETTER KA (not identical, but common OCR/homoglyph pairing)
+    "н": "h",  # U+043D CYRILLIC SMALL LETTER EN
+    "т": "t",  # U+0442 CYRILLIC SMALL LETTER TE
+    "в": "b",  # U+0432 CYRILLIC SMALL LETTER VE (loose but commonly used)
+    # Cyrillic -> Latin lookalike (uppercase)
+    "А": "A",  # U+0410
+    "Е": "E",  # U+0415
+    "О": "O",  # U+041E
+    "Р": "P",  # U+0420
+    "С": "C",  # U+0421
+    "Х": "X",  # U+0425
+    "К": "K",  # U+041A
+    "Н": "H",  # U+041D
+    "Т": "T",  # U+0422
+    "В": "B",  # U+0412
+    "М": "M",  # U+041C
+    # Greek -> Latin lookalike
+    "α": "a",  # U+03B1 GREEK SMALL LETTER ALPHA
+    "ο": "o",  # U+03BF GREEK SMALL LETTER OMICRON
+    "ρ": "p",  # U+03C1 GREEK SMALL LETTER RHO
+    "υ": "y",  # U+03C5 GREEK SMALL LETTER UPSILON
+    "Α": "A",  # U+0391 GREEK CAPITAL LETTER ALPHA
+    "Β": "B",  # U+0392 GREEK CAPITAL LETTER BETA
+    "Ε": "E",  # U+0395 GREEK CAPITAL LETTER EPSILON
+    "Ζ": "Z",  # U+0396 GREEK CAPITAL LETTER ZETA
+    "Η": "H",  # U+0397 GREEK CAPITAL LETTER ETA
+    "Ι": "I",  # U+0399 GREEK CAPITAL LETTER IOTA
+    "Κ": "K",  # U+039A GREEK CAPITAL LETTER KAPPA
+    "Μ": "M",  # U+039C GREEK CAPITAL LETTER MU
+    "Ν": "N",  # U+039D GREEK CAPITAL LETTER NU
+    "Ο": "O",  # U+039F GREEK CAPITAL LETTER OMICRON
+    "Ρ": "P",  # U+03A1 GREEK CAPITAL LETTER RHO
+    "Τ": "T",  # U+03A4 GREEK CAPITAL LETTER TAU
+    "Υ": "Y",  # U+03A5 GREEK CAPITAL LETTER UPSILON
+    "Χ": "X",  # U+03A7 GREEK CAPITAL LETTER CHI
+}
+
+_CONFUSABLES_TABLE = str.maketrans(_CONFUSABLES_MAP)
+
+
+def _normalize_confusables(text: str | None) -> str | None:
+    """Map known look-alike Cyrillic/Greek characters to their Latin
+    equivalent, for MATCHING purposes only -- see `_CONFUSABLES_MAP`'s
+    comment for exactly what this does and does not cover. Callers should
+    keep using the ORIGINAL (un-normalized) text for anything user- or
+    audit-facing; only the comparison should see the normalized form."""
+    if text is None:
+        return None
+    return text.translate(_CONFUSABLES_TABLE)
+
+
 def _first_match(patterns: tuple[re.Pattern[str], ...], value: str | None) -> str | None:
     if not value:
         return None
+    normalized = value.translate(_CONFUSABLES_TABLE)
     for pattern in patterns:
-        if pattern.search(value):
+        if pattern.search(normalized):
             return pattern.pattern
     return None
 
@@ -360,16 +460,22 @@ def _count_family_terms(family_terms: tuple[str, ...], *texts: str | None) -> li
     family terms appearing anywhere across `texts` (`permission`/
     `permissions` count once, as one term -- see the module docstring's
     "Family lexicon" note). Returns the list of matched terms (for the
-    signal's `matched` field), not just a count."""
+    signal's `matched` field), not just a count.
+
+    Matches against a confusables-normalized copy of `texts` (see
+    `_normalize_confusables`) -- a label using look-alike Cyrillic/Greek
+    characters for an otherwise-ordinary word (e.g. "Аdmin" with a Cyrillic
+    А) is not silently invisible to this scan."""
     joined = " ".join(t for t in texts if t)
     if not joined:
         return []
+    normalized_joined = _normalize_confusables(joined) or ""
     matched: list[str] = []
     for term in family_terms:
         # "just-in-time" contains a literal hyphen; word-boundary matching
         # still works since \b anchors on the alnum/non-alnum transition.
         pattern = re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
-        if pattern.search(joined):
+        if pattern.search(normalized_joined):
             matched.append(term)
     return matched
 
