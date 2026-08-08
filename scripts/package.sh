@@ -177,6 +177,35 @@ done
 # this zip contains only what a sideloader's browser actually loads, plus the
 # one document (INSTALL.md) written for them.
 
+# --------------------------------------------------------------------------
+# Gate 4: extension integrity -- the actual staged set (not the source tree,
+# which always has every file and could never reproduce this) must be
+# internally consistent: every static import a shipped .js/.mjs file declares,
+# and every file manifest.json references, must exist in $STAGE. This is the
+# exact gate that would have caught 87ce68d (background.js imports
+# effects_collector.mjs; it was omitted from setup.py's _EXTENSION_FILES, so
+# earlier builds staged a background.js importing a file never staged
+# alongside it) -- see src/amplifier_browser_bridge/extension_integrity.py for
+# why this is a parse-based check rather than an actual-load check.
+# --------------------------------------------------------------------------
+echo "" >&2
+echo "Checking extension integrity (imports + manifest refs resolve within \$STAGE)..." >&2
+if ! python3 -c "
+import sys
+sys.path.insert(0, 'src')
+from pathlib import Path
+from amplifier_browser_bridge.extension_integrity import ExtensionIntegrityError, verify_extension_integrity
+try:
+    verify_extension_integrity(Path('$STAGE'))
+except ExtensionIntegrityError as e:
+    print(f'BUILD REFUSED -- {e}', file=sys.stderr)
+    sys.exit(1)
+"; then
+    rm -rf "$STAGE"
+    exit 1
+fi
+echo "  OK -- every import and manifest reference resolves within the staged set." >&2
+
 # Normalize every staged file's mtime to a fixed reference timestamp before
 # zipping. `zip -X` alone (as used by the sibling projects' package.sh
 # scripts) strips UID/GID/extra-field metadata but NOT each entry's DOS
