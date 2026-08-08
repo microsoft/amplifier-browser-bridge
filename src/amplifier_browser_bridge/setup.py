@@ -47,6 +47,11 @@ _EXTENSION_FILES = (
     "args_bool.mjs",
     "fetch_utils.mjs",
     "download_claim.mjs",
+    # Zero-config Android install: background.js statically imports this at module
+    # top level for the bundled first-run config adoption decision (see that
+    # module's docstring and scripts/package-android.sh). Same 87ce68d failure mode
+    # as effects_collector.mjs below applies if this is ever omitted here.
+    "bundled_config.mjs",
     # Added by the confirmation-gate feature (commit 87ce68d): background.js imports
     # this at module top level. Omitting it here was a real, shipped bug -- any
     # staged install missing it fails to import background.js entirely on the NEXT

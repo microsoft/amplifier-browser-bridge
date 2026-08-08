@@ -21,6 +21,7 @@ import {
   validateWaitDownloadArgs,
 } from "./download_claim.mjs";
 import { EffectsCollector, EFFECTS_WINDOW_MS, emptyEffectsReport } from "./effects_collector.mjs";
+import { resolveBundledConfigAdoption, CONFIG_SOURCE_BUNDLED, BUNDLED_CONFIG_RESOURCE } from "./bundled_config.mjs";
 
 const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 15000; // measured to hold a desktop MV3 worker alive
@@ -34,6 +35,9 @@ let deviceId = null;
 let profileId = null;
 let capabilities = null;
 let reconnecting = false; // single-flight guard -- see scheduleReconnect()
+let connectInFlight = false; // single-flight guard for connect() itself -- see its own comment
+// below for why this exists (adoptBundledConfigIfNeeded() can trigger a *nested* connect() call
+// via storage.onChanged the moment it writes a first-run adoption).
 let reconnectAttempt = 0;
 let heartbeatTimer = null;
 let heartbeatSeq = 0;
@@ -89,6 +93,98 @@ async function loadConfig() {
   hubUrl = validation.valid ? validation.normalized : null;
   hubToken = typeof stored.amplifier_browser_bridge_hub_token === "string" ? stored.amplifier_browser_bridge_hub_token : "";
   return { configured, hubUrl, hubToken, error: validation.error, legacyConfigDetected };
+}
+
+// ---------------------------------------------------------------------------
+// Bundled first-run config (Android zero-config install)
+//
+// The reachability problem this closes: chrome.runtime.openOptionsPage() (wired to
+// both the toolbar click and onInstalled below) does nothing usable on Edge Android,
+// and there is no way to type a 32-character extension ID by hand to reach
+// chrome-extension://<id>/options.html directly. Without SOME other channel, a fresh
+// Android sideload has NO reachable path to enter a hub URL/token at all. See
+// bundled_config.mjs's own docstring for the full rationale and scripts/
+// package-android.sh for how bundled_config.json gets baked into the packed CRX
+// (written only into that script's temporary staging directory -- never into this
+// tracked extension/ source tree) at pack time.
+//
+// Fetching a same-extension resource via chrome.runtime.getURL() + fetch() from the
+// service worker's own execution context does NOT require declaring
+// web_accessible_resources -- that manifest key only gates a WEB PAGE (a different
+// origin) trying to load an extension resource; this file already IS the extension.
+// ---------------------------------------------------------------------------
+
+async function fetchBundledConfig() {
+  let response;
+  try {
+    response = await fetch(chrome.runtime.getURL(BUNDLED_CONFIG_RESOURCE));
+  } catch {
+    return null; // most commonly: the desktop build, which never generates this file at all.
+  }
+  if (!response || !response.ok) {
+    return null; // 404 on any build that didn't bake one in -- expected, not an error.
+  }
+  try {
+    return await response.json();
+  } catch (err) {
+    // A file that exists but doesn't parse IS a build defect (unlike a plain 404) -- loud,
+    // not silent, so a broken packaging run is noticed rather than quietly producing an
+    // Android build that's no better off than before this feature existed.
+    console.warn("amplifier-browser-bridge: bundled_config.json exists but is not valid JSON -- ignoring it.", err);
+    return null;
+  }
+}
+
+async function adoptBundledConfigIfNeeded() {
+  const bundled = await fetchBundledConfig();
+  if (!bundled) return; // nothing shipped (or it failed to load) -- resolveBundledConfigAdoption
+  // would return null anyway, but skip the storage read entirely when there's nothing to adopt.
+
+  const stored = await chrome.storage.local.get([
+    "amplifier_browser_bridge_hub_url",
+    "amplifier_browser_bridge_hub_token",
+    "abb_hub_url",
+    "abb_hub_token",
+    "amplifier_browser_bridge_setup_completed",
+  ]);
+  const decision = resolveBundledConfigAdoption(
+    {
+      hubUrl: stored.amplifier_browser_bridge_hub_url,
+      hubToken: stored.amplifier_browser_bridge_hub_token,
+      legacyHubUrl: stored.abb_hub_url,
+      legacyHubToken: stored.abb_hub_token,
+      setupCompleted: !!stored.amplifier_browser_bridge_setup_completed,
+    },
+    bundled
+  );
+  if (!decision) {
+    // Distinguish a real build defect (bundle present but structurally invalid) from every
+    // other "do nothing" reason, which are all normal/expected and not worth logging.
+    if (!validateHubUrl(bundled.hubUrl).valid) {
+      console.warn(
+        "amplifier-browser-bridge: bundled_config.json was shipped but its hubUrl is invalid " +
+          `(${JSON.stringify(bundled.hubUrl)}) -- ignoring it. This indicates a packaging defect; ` +
+          "re-run scripts/package-android.sh."
+      );
+    }
+    return;
+  }
+
+  await chrome.storage.local.set({
+    amplifier_browser_bridge_hub_url: decision.hubUrl,
+    amplifier_browser_bridge_hub_token: decision.hubToken,
+    amplifier_browser_bridge_config_source: CONFIG_SOURCE_BUNDLED,
+    amplifier_browser_bridge_config_bundled_at: decision.generatedAt,
+    // Marks this install as having completed setup so a future rebuild (carrying a
+    // different, e.g. rotated, token) never re-adopts over it -- see
+    // bundled_config.mjs's "one invariant" section.
+    amplifier_browser_bridge_setup_completed: true,
+  });
+  console.info(
+    `amplifier-browser-bridge: adopted a bundled first-run configuration (hub ${decision.hubUrl}) -- ` +
+      "this was baked into the installed artifact at pack time, not typed by a human. Change it " +
+      "any time on the options page; once you Save, this bundled default is never re-applied."
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -402,10 +498,30 @@ function scheduleReconnect() {
 }
 
 async function connect() {
+  if (connectInFlight) {
+    // adoptBundledConfigIfNeeded() below can write a first-run adoption to
+    // chrome.storage.local, which fires storage.onChanged, whose listener (bottom of this
+    // file) calls connect() again -- a nested, concurrent call arriving before `ws` has been
+    // assigned by THIS invocation. Without this guard, both calls could race past the
+    // `ws && ...` check below (both seeing `ws === null`) and each open its own WebSocket.
+    // This makes that nested call a harmless no-op; the in-flight call below still proceeds
+    // using the very config the nested call would have re-read anyway.
+    return;
+  }
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return; // already connected/connecting -- connect() itself is also single-flight
   }
 
+  connectInFlight = true;
+  try {
+    await connectLocked();
+  } finally {
+    connectInFlight = false;
+  }
+}
+
+async function connectLocked() {
+  await adoptBundledConfigIfNeeded();
   await loadConfig();
   if (!configured) {
     // Fail loud and legibly, never a silent connect loop against an undefined/invalid
@@ -1867,8 +1983,18 @@ if (typeof chrome.debugger !== "undefined" && chrome.debugger.onDetach) {
 // idempotent/single-flight, so overlapping triggers here are harmless.
 // ---------------------------------------------------------------------------
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async () => {
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+  // Adopt a build-time-baked hub URL/token (Android zero-config installs -- see
+  // "Bundled first-run config" section above) BEFORE opening the options page or
+  // attempting to connect, so if the options page DOES render (reliable on Desktop;
+  // unreliable on Edge Android, which is the whole reason this feature exists), it
+  // shows the real adopted values on its very first paint instead of a blank one.
+  // Idempotent and guarded by amplifier_browser_bridge_setup_completed -- connect()
+  // below also calls this on every invocation (a worker restart without a fresh
+  // onInstalled event still needs the same one-time adoption to happen eventually),
+  // so this call is a deliberate, harmless duplicate of what would happen anyway.
+  await adoptBundledConfigIfNeeded();
   // First-run UX: open the options page immediately so a fresh install's very first
   // screen is "set the hub URL/token", not a silently-failing connection attempt.
   // Harmless on a re-install/update of an already-configured install -- an extra tab

@@ -19,6 +19,7 @@
 // a terminal state.
 
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
+import { describeConfigProvenance, CONFIG_SOURCE_MANUAL } from "./bundled_config.mjs";
 
 const urlInput = document.getElementById("hub-url");
 const tokenInput = document.getElementById("hub-token");
@@ -26,11 +27,31 @@ const toggleTokenLink = document.getElementById("toggle-token");
 const errorEl = document.getElementById("error");
 const statusEl = document.getElementById("status");
 const saveButton = document.getElementById("save");
+const provenanceEl = document.getElementById("provenance");
+
+// Renders the "where did these values come from" line -- see bundled_config.mjs's
+// describeConfigProvenance for why this exists: a field silently pre-filled with a baked
+// hub URL/token, with no indication it wasn't typed by a human, is exactly how someone
+// ends up debugging a stale token for an hour with no idea where it came from.
+function renderProvenance({ configSource, configBundledAt }) {
+  if (!provenanceEl) return; // defensive -- absent only if options.html and this file drift apart
+  const text = describeConfigProvenance({ configSource, configBundledAt });
+  provenanceEl.textContent = text || "";
+}
 
 async function loadCurrentValues() {
-  const stored = await chrome.storage.local.get(["amplifier_browser_bridge_hub_url", "amplifier_browser_bridge_hub_token"]);
+  const stored = await chrome.storage.local.get([
+    "amplifier_browser_bridge_hub_url",
+    "amplifier_browser_bridge_hub_token",
+    "amplifier_browser_bridge_config_source",
+    "amplifier_browser_bridge_config_bundled_at",
+  ]);
   urlInput.value = stored.amplifier_browser_bridge_hub_url || "";
   tokenInput.value = stored.amplifier_browser_bridge_hub_token || "";
+  renderProvenance({
+    configSource: stored.amplifier_browser_bridge_config_source,
+    configBundledAt: stored.amplifier_browser_bridge_config_bundled_at,
+  });
 }
 
 // Sends the status query exactly once. NEVER throws and NEVER returns a bare value the
@@ -154,7 +175,16 @@ saveButton.addEventListener("click", async () => {
   await chrome.storage.local.set({
     amplifier_browser_bridge_hub_url: urlValidation.normalized,
     amplifier_browser_bridge_hub_token: tokenInput.value,
+    // A deliberate Save is the user affirmatively taking ownership of these values --
+    // whether they were blank, hand-typed from scratch, or started out pre-filled from a
+    // bundled first-run default (see bundled_config.mjs). From this point on the config
+    // is "manual": setup_completed blocks any future bundled-config adoption from ever
+    // overwriting it again, even across a rebuild carrying a different baked token.
+    amplifier_browser_bridge_config_source: CONFIG_SOURCE_MANUAL,
+    amplifier_browser_bridge_config_bundled_at: null,
+    amplifier_browser_bridge_setup_completed: true,
   });
+  renderProvenance({ configSource: CONFIG_SOURCE_MANUAL, configBundledAt: null });
 
   statusEl.className = "unknown";
   statusEl.textContent = "Saved. Connecting...";
