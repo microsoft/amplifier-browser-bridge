@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Amplifier Browser Bridge</title>
+<link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <h1>Amplifier Browser Bridge</h1>
+
+  <div id="status" class="unknown">Checking status...</div>
+
+  <!-- Shown only once a REAL status response supplies these. Both values come from
+       background.js's amplifier_browser_bridge_get_status response; neither is
+       computed, cached or guessed here. See popup.js for what is deliberately
+       absent from this list and why. -->
+  <dl id="details" hidden>
+    <dt>Hub</dt>
+    <dd id="hub-url"></dd>
+    <dt>Device</dt>
+    <dd id="device-id"></dd>
+  </dl>
+
+  <button id="open-options" type="button">Settings</button>
+
+  <p class="hint">
+    This panel is read-only. To change the Hub URL or token, open Settings. For a full
+    check of hub reachability, token match and device connection, run
+    <code>amplifier-browser-bridge doctor</code> from the CLI.
+  </p>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

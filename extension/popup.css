@@ -1,0 +1,82 @@
+/* popup.css -- styling for the toolbar popup (popup.html).
+ *
+ * Deliberately shares options.html's visual vocabulary (same font stack, same
+ * ok/warn/unknown status colours) so the two surfaces read as one extension.
+ * Kept in a separate file rather than inlined -- unlike options.html, which
+ * inlines its <style> -- because a popup gets a stylesheet request for free and
+ * this keeps popup.html's markup readable.
+ *
+ * The width is fixed rather than fluid: a popup has no viewport to be
+ * responsive to, and browsers size it from the document. 320px is wide enough
+ * for a wrapped UUID device id without becoming a second options page.
+ */
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  width: 320px;
+  margin: 0;
+  padding: 0.9rem;
+  color: #1a1a1a;
+  font-size: 0.9rem;
+}
+
+h1 {
+  font-size: 1rem;
+  margin: 0 0 0.75rem;
+}
+
+#status {
+  padding: 0.6rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
+/* Same three-state vocabulary as options.html: ok = confirmed good, warn = a
+ * real problem the user can act on, unknown = we have not heard back yet.
+ * There is no fourth "probably fine" state, by design. */
+#status.ok { background: #e6f4ea; color: #1e4620; }
+#status.warn { background: #fdecea; color: #611a15; }
+#status.unknown { background: #f1f1f1; color: #333; }
+
+dl {
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+}
+
+dt {
+  font-weight: 600;
+  color: #555;
+}
+
+dd {
+  margin: 0.1rem 0 0.5rem;
+  font-family: monospace;
+  /* Device ids are UUIDs and hub URLs are long: wrap rather than overflow, and
+   * stay selectable so either can be copied out for a bug report. */
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+dl[hidden] { display: none; }
+
+button {
+  margin-top: 0.9rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.hint {
+  font-size: 0.75rem;
+  color: #555;
+  line-height: 1.4;
+  margin: 0.9rem 0 0;
+}
+
+code {
+  font-size: 0.75rem;
+  background: #f1f1f1;
+  padding: 0 0.2em;
+  border-radius: 2px;
+}
