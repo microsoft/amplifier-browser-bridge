@@ -28,7 +28,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from amplifier_browser_bridge import HubClient, HubError, Target
-from amplifier_browser_bridge.legacy_env import warn_legacy_env_vars
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 from amplifier_core import ToolResult
@@ -778,11 +777,6 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> dict[
     """Mount every browser-bridge tool into the coordinator (the mount() Iron Law:
     each tool is registered via `coordinator.mount("tools", tool, name=tool.name)`).
     """
-    # See legacy_env.py's module docstring and MIGRATION.md -- fails loud (a
-    # logged warning, before any tool is registered) if a pre-rename ABB_*
-    # variable is still set in the Amplifier host process's environment,
-    # rather than silently falling through to a default.
-    warn_legacy_env_vars()
     tools = _build_tools()
     for tool in tools:
         await coordinator.mount("tools", tool, name=tool.name)

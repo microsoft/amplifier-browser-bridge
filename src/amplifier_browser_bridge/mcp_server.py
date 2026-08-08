@@ -36,7 +36,6 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from .addressing import Target
 from .client import HubClient, HubError
-from .legacy_env import warn_legacy_env_vars
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
@@ -948,10 +947,6 @@ def main() -> None:
     transport every MCP client (Claude Desktop, Amplifier, `mcp` CLI, ...) speaks
     without extra configuration. Set AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT=sse or streamable-http to
     use a different transport."""
-    # See legacy_env.py's module docstring and MIGRATION.md -- fails loud (to
-    # stderr, before the transport starts) if a pre-rename ABB_* variable is
-    # still set, rather than silently falling through to a default.
-    warn_legacy_env_vars()
     transport = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT", "stdio")
     mcp.run(transport=transport)  # type: ignore[arg-type]
 

@@ -25,7 +25,6 @@ from .auth import extract_token_value, find_sibling_token_files, load_token_stor
 from .client import HubClient, HubError
 from .doctor import run_doctor
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
-from .legacy_env import warn_legacy_env_vars
 from .netinfo import detect_tailscale_ip, is_wildcard_bind, wildcard_bind_warning
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
@@ -115,11 +114,6 @@ def main() -> None:
     Configure the hub via AMPLIFIER_BROWSER_BRIDGE_HUB_URL (default ws://127.0.0.1:8900/agent) and
     AMPLIFIER_BROWSER_BRIDGE_TOKEN (if the hub has auth enabled).
     """
-    # Checked before any subcommand logic runs, so a leftover ABB_* variable
-    # (from before this project dropped the acronym) produces this legible
-    # message instead of a confusing downstream default/error several layers
-    # in -- see legacy_env.py's module docstring and MIGRATION.md.
-    warn_legacy_env_vars()
 
 
 @main.command()

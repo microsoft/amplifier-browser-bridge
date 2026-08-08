@@ -63,20 +63,26 @@ and the on-disk config directory `~/.config/amplifier-browser-bridge/`.
 
 ## How this fails loud (so you know what happened)
 
-This is not a silent break -- every entry point tells you exactly what to do:
-
-- **CLI / MCP server / Amplifier tool module**: on startup, if any old `ABB_*`
-  variable is set in the environment, a line like this prints to stderr (or the
-  Amplifier host's log, for the tool module) before anything else runs:
-
-  ```
-  amplifier-browser-bridge: $ABB_HUB_URL is set, but this project renamed it to
-  $AMPLIFIER_BROWSER_BRIDGE_HUB_URL (the old 'abb'/'ABB_' acronym was dropped --
-  see MIGRATION.md). $ABB_HUB_URL is no longer read; set
-  $AMPLIFIER_BROWSER_BRIDGE_HUB_URL instead.
-  ```
-
-  One line per stale variable found. See `src/amplifier_browser_bridge/legacy_env.py`.
+- **CLI / MCP server / Amplifier tool module**: **no automatic detection.**
+  An earlier version of this project shipped `src/amplifier_browser_bridge/legacy_env.py`,
+  which printed a warning naming any stale `ABB_*` variable still set in the
+  environment. That module was deleted (E1, honest-disclosure pass) once it
+  was recognized for what it was: fail-loud machinery built to protect an
+  installed base of users who had run a published version under the old
+  acronym -- and at the time this rename shipped, and at every point since,
+  that installed base was zero (this project has never been published to
+  PyPI, the Chrome Web Store, or Edge Add-ons). Three call sites plus a
+  55-line module existed to guard against a scenario with no one in it. If
+  you have an old `ABB_*` variable set today, the new
+  `AMPLIFIER_BROWSER_BRIDGE_*` variable it should have been renamed to will
+  simply not be set -- you'll see whatever this project's ordinary "missing
+  configuration" failure looks like at that call site (e.g. `doctor`'s
+  `hub_reachable`/`token_match` checks), not a message naming the specific
+  old variable. The manual rename table above is still the correct fix; only
+  the automatic reminder is gone. If this project ever *does* build an
+  installed base under the old names (unlikely, given it never shipped under
+  them), reintroducing a warning like this for the real users affected would
+  be the correct move, not a mistake to avoid repeating.
 
 - **The extension**: if the old `abb_hub_url`/`abb_hub_token` keys hold a value but
   the new keys don't (i.e. this is an existing install, not a fresh one), the
