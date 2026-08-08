@@ -5,28 +5,47 @@ Phase 1. This doc covers the two Phase 2 surfaces -- both are thin adapters over
 the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
-Both surfaces expose the same twenty-two tools, named `browser_<command>` (mirroring
-Playwright MCP's vocabulary, design doc section 9):
+**Verified 2026-08-08 (grep-counted directly against the code, not assumed):**
+the native Amplifier tool module registers **25** tools; the MCP server also
+registers **25**. They are not byte-identical sets -- they differ by exactly
+one tool each: the native module has `browser_reload` (the MCP server does
+not), and the MCP server has `browser_confirm` (the native module does not).
+Every other name below is shared by both, named `browser_<command>`
+(mirroring Playwright MCP's vocabulary, design doc section 9). Earlier
+revisions of this doc claimed "twenty-two" tools and this repo's `bundle.md`
+claimed "sixteen" -- both were stale as of this correction; see
+`amplifier_module_tool_browser_bridge/__init__.py`'s `_build_tools()` and
+`mcp_server.py`'s `@mcp.tool()` decorators for the authoritative, current
+lists.
 
-| Tool | Command | Notes |
-|---|---|---|
-| `browser_devices` | `list_devices` | Entry point -- call first |
-| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status` |
-| `browser_snapshot` | `snapshot` | Accessibility-style tree with element `ref`s; optional `wake` (see Discarded tabs, docs/PROTOCOL.md) |
-| `browser_read` | `read` | Full visible text; optional `wake` |
-| `browser_click` | `click` | `ref` |
-| `browser_type` | `type` | `ref`, `text` |
-| `browser_key` | `key` | `key`, optional `ref` |
-| `browser_scroll` | `scroll` | `x`, `y` |
-| `browser_navigate` | `navigate` | `url` |
-| `browser_tab_open` | `tab_open` | device-only target; `url`, `active` (default background) |
-| `browser_tab_close` | `tab_close` | |
-| `browser_tab_activate` | `tab_activate` | the one command allowed to steal focus |
-| `browser_screenshot` | `screenshot` | active-tab-only in this injection-only phase |
-| `browser_wait_for` | `wait_for` | `selector`, `timeout_ms` |
-| `browser_wait_text` | `wait_text` | `text`, `timeout_ms` |
-| `browser_poll` | (agent-only `poll`) | check on / retrieve a previously queued command |
-| `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) |
+| Tool | Command | Notes | Surface |
+|---|---|---|---|
+| `browser_devices` | `list_devices` | Entry point -- call first | both |
+| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status` | both |
+| `browser_snapshot` | `snapshot` | Accessibility-style tree with element `ref`s; optional `wake`/`activate` (see Discarded tabs, docs/PROTOCOL.md) | both |
+| `browser_read` | `read` | Full visible text across all frames; optional `wake`/`activate` | both |
+| `browser_click` | `click` | `ref`, optional `session_id` | both |
+| `browser_type` | `type` | `ref`, `text`, optional `session_id` | both |
+| `browser_key` | `key` | `key`, optional `ref`, `session_id` | both |
+| `browser_scroll` | `scroll` | `x`, `y` | both |
+| `browser_navigate` | `navigate` | `url`, optional `session_id` | both |
+| `browser_tab_open` | `tab_open` | device-only target; `url`, `active` (default background) | both |
+| `browser_tab_close` | `tab_close` | | both |
+| `browser_tab_activate` | `tab_activate` | the one command allowed to steal focus | both |
+| `browser_screenshot` | `screenshot` | pixels only, no model call; `capture_hidden`, `frame_id`, `multi_page` | both |
+| `browser_vision_read` | (composed: `screenshot` + vision-model extraction) | TEXT extracted from pixels via a configured vision provider | both |
+| `browser_wait_for` | `wait_for` | `selector`, `timeout_ms` | both |
+| `browser_wait_text` | `wait_text` | `text`, `timeout_ms` | both |
+| `browser_fetch_bytes` | `fetch_bytes` | device-only target; fetch a URL from the extension's own (cookied) context | both |
+| `browser_grab_image` | `grab_image` | fetch a URL from the PAGE's own script context (defeats Referer/hotlink protection) | both |
+| `browser_downloads_list` | `downloads_list` | device-only target; baseline for `since_id` | both |
+| `browser_download` | `download` | device-only target; triggers `chrome.downloads.download` | both |
+| `browser_wait_download` | `wait_download` | device-only target; poll for a completed download | both |
+| `browser_poll` | (agent-only `poll`) | check on / retrieve a previously queued command | both |
+| `browser_establish_session` | (agent-only) | create a session with a declared write scope (confirmation-gate.md) | both |
+| `browser_narrow_scope` | (agent-only) | narrow an existing session's scope -- never widens | both |
+| `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) | **native module only** |
+| `browser_confirm` | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
 
 See `docs/PROTOCOL.md` for the exact command semantics and `docs/designs/browser-bridge.md`
 for the addressing model (`device_id` -> `window_id`/`tab_id` -> `ref`) and the
@@ -84,7 +103,10 @@ Claude Desktop-style `mcp_servers.json`:
 ### Verified end-to-end (proof)
 
 Run with a real hub (`amplifier-browser-bridge hub`) and a real MCP client (the `mcp` Python SDK's
-`ClientSession` + `stdio_client`, launching `amplifier-browser-bridge-mcp` as a subprocess):
+`ClientSession` + `stdio_client`, launching `amplifier-browser-bridge-mcp` as a subprocess). This
+transcript is historical (captured when the server exposed 16 tools) and is preserved verbatim as
+real evidence -- it is not a claim about today's tool count. See the table above for the current,
+verified-2026-08-08 count of 25.
 
 ```
 === TOOL LIST ===
@@ -128,15 +150,19 @@ not block, and it was not reported as an error.
 
 ## Amplifier tool module
 
-`modules/tool-browser-bridge/` wraps the same lib as sixteen Amplifier tools,
-following the `mount()` Iron Law (`creating-amplifier-modules` skill): each tool
-is registered via `await coordinator.mount("tools", tool, name=tool.name)`.
+`modules/tool-browser-bridge/` wraps the same lib as 25 Amplifier tools (see
+the table above), following the `mount()` Iron Law (`creating-amplifier-modules`
+skill): each tool is registered via `await coordinator.mount("tools", tool, name=tool.name)`.
 
 ### Adding the bundle
 
-See `bundle.md` at the repo root for the exact `tools:` YAML stanza (a published
-git source, or a local relative path for development against a checkout of this
-repo).
+See `bundle.md` at the repo root -- it is now a real, loadable Amplifier
+bundle (not just documentation) that composes foundation plus
+`behaviors/browser-bridge.yaml`, which wires this tool module in. See that
+file for the exact `includes:`/`tools:` YAML stanzas for each composition
+pattern (whole published bundle, behavior-only, or tool-module-only; a
+published git source, or a local relative path for development against a
+checkout of this repo).
 
 ### Local development note
 
@@ -153,7 +179,10 @@ this repo's own `.venv`) or updating the dependency to a git URL once one exists
 
 Ran `amplifier_core.validation.tool.ToolValidator` directly against the module
 directory (this is the same check Amplifier's module loader performs before
-mounting a tool module into a session):
+mounting a tool module into a session). This transcript is historical
+(captured when the module registered 16 tools) and preserved verbatim as real
+evidence -- not a claim about today's count; see the table above for the
+current, verified-2026-08-08 count of 25:
 
 ```
 INFO protocol_compliance - Tool 'browser_devices' implements Tool interface
