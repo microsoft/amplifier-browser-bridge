@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Privacy policy -- Amplifier Browser Bridge</title>
+    <meta
+      name="description"
+      content="Privacy policy for the Amplifier Browser Bridge extension. Reads page content and dispatches actions only in response to commands from a hub you run and control."
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="container topbar-inner">
+        <a class="brand" href="../" aria-label="Amplifier Browser Bridge -- back to home">
+          <span class="brand-name">Amplifier Browser Bridge</span>
+        </a>
+        <nav class="topnav">
+          <a href="../#install">Install</a>
+          <a href="../#security">Security</a>
+          <a href="https://github.com/microsoft/amplifier-browser-bridge">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="container">
+      <article class="prose">
+        <h1>Privacy policy</h1>
+        <p class="meta">Last updated: 2026-08-07</p>
+
+        <div class="callout-warning">
+          <strong>This extension is fundamentally different from a typical
+          browser extension's privacy story.</strong> It exists to let an AI
+          agent read and act on the pages you browse, at your own direction,
+          by design. There is no way to make that sound narrow without being
+          dishonest about it -- read this policy alongside
+          <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/SECURITY.md">SECURITY.md</a>
+          before installing.
+        </div>
+
+        <h2>What data this extension can access</h2>
+        <p>
+          When commanded to by the hub you configure (see below), this
+          extension can read the content of any page you are viewing --
+          text, form fields, page structure -- and can dispatch clicks,
+          keystrokes, and navigation as if you had performed them yourself.
+          It requests the <code>&lt;all_urls&gt;</code> host permission
+          specifically because this capability is not scoped to any
+          particular site; it is available on whatever page you have open
+          when an agent issues a command.
+        </p>
+
+        <h2>Where that data goes</h2>
+        <p>
+          This extension has exactly one network destination: the
+          <strong>hub</strong> -- a small program that you install and run,
+          at an address you configure on this extension's options page.
+          There is no telemetry, no analytics, and no first-party server
+          operated by the maintainers that this extension talks to. Whatever
+          the hub does with data it receives is a property of your own
+          deployment, not of this extension's code -- if you run the hub on
+          a machine or account you do not control, that operator can see
+          everything this extension reads and everything it is commanded to
+          do.
+        </p>
+
+        <h2>The hub, and who can command this extension</h2>
+        <p>
+          The hub can be reached by anything that holds its shared token and
+          can route a network connection to it -- typically your own
+          <a href="https://tailscale.com">Tailscale</a> network. See
+          <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/SECURITY.md">SECURITY.md</a>
+          for the full, current accounting of what protects that boundary
+          (the token is the load-bearing one in most deployments, not the
+          tailnet by itself).
+        </p>
+
+        <h2>Local storage (<code>chrome.storage.local</code>)</h2>
+        <p>
+          The extension stores, locally on your device only: the hub URL and
+          token you enter on its options page, and a randomly generated
+          device identifier. None of this leaves your device except as part
+          of the WebSocket connection you configured to your own hub.
+        </p>
+
+        <h2>What this extension does NOT do</h2>
+        <ul>
+          <li>It does not send data to any server operated by the project's maintainers.</li>
+          <li>It does not include any analytics, crash reporting, or usage-tracking library.</li>
+          <li>It does not read or transmit anything unless a command from your configured hub asks it to.</li>
+        </ul>
+
+        <h2>Permissions</h2>
+        <p>
+          See
+          <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/permission-justifications.md"
+            >docs/permission-justifications.md</a
+          >
+          in the source repository for the full, long-form reasoning behind
+          every permission this extension requests, including an honest
+          accounting of which ones could and could not be narrowed.
+        </p>
+
+        <h2>Contact</h2>
+        <p>
+          Issues and questions: please file an issue on the
+          <a href="https://github.com/microsoft/amplifier-browser-bridge/issues"
+            >project's GitHub repository</a
+          >. To report a security vulnerability, see
+          <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/SECURITY.md"
+            >SECURITY.md</a
+          >
+          -- do not use a public issue for that.
+        </p>
+
+        <a class="back link-arrow" href="../">&larr; Back to home</a>
+      </article>
+    </main>
+
+    <footer class="footer">
+      <div class="container footer-grid">
+        <div class="footer-col">
+          <h4>Project</h4>
+          <ul>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge">Repository</a></li>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge/issues">Issues</a></li>
+          </ul>
+        </div>
+        <div class="footer-col">
+          <h4>Legal</h4>
+          <ul>
+            <li><a href="./">Privacy policy</a></li>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/LICENSE">License (MIT)</a></li>
+          </ul>
+        </div>
+        <div class="footer-col footer-attribution">
+          <h4>Attribution</h4>
+          <p>MIT-licensed open source.</p>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>Amplifier Browser Bridge</span>
+        <span>&middot;</span>
+        <span>Open source</span>
+      </div>
+    </footer>
+  </body>
+</html>

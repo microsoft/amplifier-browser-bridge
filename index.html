@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Amplifier Browser Bridge</title>
+    <meta
+      name="description"
+      content="Amplifier Browser Bridge lets an AI agent observe and drive your real, logged-in Microsoft Edge browser -- on this device, or across your own tailnet. Broad by default; read the disclosures before installing."
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="style.css" />
+    <meta property="og:title" content="Amplifier Browser Bridge" />
+    <meta
+      property="og:description"
+      content="Lets an AI agent observe and drive your real Edge browser, on this device or across your tailnet."
+    />
+    <meta property="og:type" content="website" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="container topbar-inner">
+        <a class="brand" href="#top" aria-label="Amplifier Browser Bridge -- top of page">
+          <span class="brand-name">Amplifier Browser Bridge</span>
+        </a>
+        <nav class="topnav">
+          <a href="#install">Install</a>
+          <a href="#security">Security</a>
+          <a href="#permissions">Permissions</a>
+          <a href="privacy/">Privacy</a>
+          <a href="https://github.com/microsoft/amplifier-browser-bridge" aria-label="View source on GitHub"
+            >GitHub</a
+          >
+        </nav>
+      </div>
+    </header>
+
+    <main id="top">
+      <!-- HERO -->
+      <section class="hero">
+        <div class="container">
+          <h1>Your real browser. A second operator.</h1>
+          <p class="tagline">
+            Amplifier Browser Bridge lets an AI agent read and act inside your
+            actual, logged-in Microsoft Edge session -- on this device, or on
+            a completely different one, over your own
+            <a href="https://tailscale.com">Tailscale</a> network. It is not a
+            disposable automation browser; it is the browser you already use.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="#install">Install</a>
+            <a class="btn btn-secondary" href="https://github.com/microsoft/amplifier-browser-bridge"
+              >View on GitHub</a
+            >
+          </div>
+          <div class="status-banner">
+            <strong>Early-stage, not yet published to any extension store.</strong>
+            Phases 1-5 of a 6-phase build are complete (hub, extension,
+            addressing, agent surfaces, policy engine); CDP escalation
+            (trusted input, background-tab screenshots) is not yet built. This
+            is a sideload-only project today -- see
+            <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/INSTALL.md"
+              >INSTALL.md</a
+            >
+            for the real, harder-than-usual install path.
+          </div>
+        </div>
+      </section>
+
+      <!-- WHAT IT IS -->
+      <section class="section">
+        <div class="container">
+          <h2><span class="section-marker" aria-hidden="true"></span>What this is not</h2>
+          <p class="lede">
+            No vendor product does cross-device browser co-working today.
+            Claude in Chrome, Edge Copilot Mode, Gemini in Chrome, and
+            Playwright's own MCP extension mode all run their control plane
+            on the machine the human is sitting at. This project's whole
+            reason to exist is driving the browser on a device you are
+            <em>not</em> sitting at, from one you are.
+          </p>
+          <p class="lede">
+            The nearest prior art that already does cross-device control is
+            <a href="https://github.com/reliefeai/browser-relay"><code>browser-relay</code></a> (MIT) --
+            it authenticates a public Cloudflare Worker relay with a bearer
+            Device ID that its own documentation calls
+            "a capability -- anyone with it can control this browser." This
+            project's honest differentiator is not being first; it is
+            replacing that relay with your own tailnet: no third-party relay
+            in the path, no long-lived bearer token traveling the public
+            internet, and device-level network ACLs you control. See
+            <a
+              href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/designs/browser-bridge.md#9-positioning"
+              >the design doc's positioning section</a
+            >
+            for the full comparison.
+          </p>
+        </div>
+      </section>
+
+      <!-- INSTALL -->
+      <section id="install" class="section">
+        <div class="container">
+          <h2><span class="section-marker" aria-hidden="true"></span>Install</h2>
+          <p class="lede">
+            There is no store listing. Installing this today means three
+            pieces working together: a hub process, this extension, and a
+            shared token. Read
+            <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/INSTALL.md"
+              >INSTALL.md</a
+            >
+            in full before you start -- it is written for someone who has
+            never seen this system.
+          </p>
+          <div class="card-grid">
+            <article class="card">
+              <h3>1. Run the hub</h3>
+              <p><code>uv tool install amplifier-browser-bridge</code>, then <code>amplifier-browser-bridge init</code>.</p>
+            </article>
+            <article class="card">
+              <h3>2. Load the extension</h3>
+              <p>
+                Download the latest release zip, unzip it, and
+                <strong>Load unpacked</strong> at <code>edge://extensions/</code>.
+              </p>
+            </article>
+            <article class="card">
+              <h3>3. Configure and confirm</h3>
+              <p>
+                Paste the hub URL and token into the extension's options
+                page, then run <code>amplifier-browser-bridge doctor</code>.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECURITY -->
+      <section id="security" class="section">
+        <div class="container">
+          <h2><span class="section-marker" aria-hidden="true"></span>Security posture</h2>
+          <div class="callout-warning">
+            <strong>This software controls a real, authenticated browser session.</strong>
+            Read
+            <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/SECURITY.md"
+              >SECURITY.md</a
+            >
+            in full before installing or deploying it. The summary below is
+            not a substitute.
+          </div>
+          <ul>
+            <li>
+              <strong>The per-device shared token is the load-bearing
+              boundary</strong> for most deployments -- not your tailnet.
+              Tailscale's own default ACL policy lets every device on your
+              tailnet reach every other device on every port.
+            </li>
+            <li>
+              The hub binds <code>127.0.0.1</code> by default; a wildcard
+              bind is never silent -- it prints a named warning every time.
+            </li>
+            <li>
+              Consent is enforced structurally at one choke point in the hub,
+              not by asking the model to behave -- see
+              <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/POLICY.md"
+                >docs/POLICY.md</a
+              >
+              for exactly what the denylist and confirmation gates do and do
+              not catch.
+            </li>
+            <li>Every command, decision, and result is written to an audit log.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- PERMISSIONS -->
+      <section id="permissions" class="section">
+        <div class="container">
+          <h2><span class="section-marker" aria-hidden="true"></span>Permissions</h2>
+          <p class="lede">
+            This is a broad-access-by-default tool, not a narrow, single-site
+            extension -- its permissions say so honestly rather than
+            minimizing them. Full long-form reasoning, including which of
+            these could and could not be honestly narrowed, lives in
+            <a
+              href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/permission-justifications.md"
+              >docs/permission-justifications.md</a
+            >.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Permission</th>
+                <th>Why</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>&lt;all_urls&gt;</code></td>
+                <td>The agent can be asked to act on any site you browse to -- the maintainer's explicit design goal, not an oversight.</td>
+              </tr>
+              <tr>
+                <td><code>debugger</code></td>
+                <td>Optional escalation for trusted input events and background-tab screenshots. Not used unless a command asks for it.</td>
+              </tr>
+              <tr>
+                <td><code>scripting</code>, <code>tabs</code>, <code>webNavigation</code></td>
+                <td>Read pages, dispatch clicks/typing, know what tabs/URLs exist.</td>
+              </tr>
+              <tr>
+                <td><code>storage</code></td>
+                <td>Stores the hub URL/token you configure and this device's own identifier.</td>
+              </tr>
+              <tr>
+                <td><code>downloads</code>, <code>alarms</code>, <code>tabGroups</code></td>
+                <td>Support specific commands (download claiming, keepalive, tab-group-aware addressing).</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="container footer-grid">
+        <div class="footer-col">
+          <h4>Project</h4>
+          <ul>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge">Repository</a></li>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge/releases">Releases</a></li>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge/issues">Issues</a></li>
+          </ul>
+        </div>
+        <div class="footer-col">
+          <h4>Security &amp; policy</h4>
+          <ul>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/POLICY.md">Consent model</a></li>
+            <li><a href="privacy/">Privacy policy</a></li>
+          </ul>
+        </div>
+        <div class="footer-col footer-attribution">
+          <h4>Legal</h4>
+          <p>
+            MIT-licensed open source.
+            <a href="https://github.com/microsoft/amplifier-browser-bridge/blob/main/LICENSE">License</a>.
+            Not affiliated with, and does not modify, Microsoft Edge itself.
+          </p>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>Amplifier Browser Bridge</span>
+        <span>&middot;</span>
+        <span>Open source</span>
+      </div>
+    </footer>
+  </body>
+</html>
