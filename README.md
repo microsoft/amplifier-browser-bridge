@@ -47,10 +47,19 @@ What that means concretely:
 This software controls a user's real, authenticated browser session. Before evaluating or
 deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brief:
 
-- The hub has no public listener. It is reachable only from devices already inside the
-  operator's Tailscale tailnet; Tailscale ACLs are the outer authorization boundary.
+- **The per-device shared token is the load-bearing boundary for most deployments** -- not the
+  tailnet. Tailscale's own default ACL policy allows every device on your tailnet to reach every
+  other device on every port; unless you've written a restrictive ACL (starting point:
+  [docs/tailscale-acl-example.hujson](docs/tailscale-acl-example.hujson)), the tailnet is not a
+  meaningful boundary by itself. `amplifier-browser-bridge doctor` reports this and your bind-address exposure
+  on every run.
+- `amplifier-browser-bridge hub` binds `127.0.0.1` by default (safe, loopback-only); `amplifier-browser-bridge init`
+  auto-detects this machine's Tailscale IP as a cross-device-capable default and warns loudly if
+  a wildcard bind (`0.0.0.0`) is ever chosen instead.
 - A per-device shared token is a second, narrower boundary on top of tailnet identity, because
-  tailnet identity is per-*device*, not per-*application*.
+  tailnet identity is per-*device*, not per-*application*. Token comparison is constant-time.
+  One token controls every device connected to a hub unless you hand-provision per-device ones
+  (`auth.py`'s `TokenStore` supports this; `init` does not auto-provision them yet).
 - Consent is enforced structurally, at a single choke point in the hub (`PolicyEngine.evaluate`),
   never by prompting the model to behave -- a prompt-injected agent can *want* a different
   target, it cannot *address* one policy has not permitted.
@@ -86,7 +95,8 @@ Staged extension -> ~/.local/share/amplifier-browser-bridge/extension
 Remaining steps (manual -- Edge has no CLI for these):
 
   1. Start the hub:
-       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 0.0.0.0 --port 8900
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 100.x.y.z --port 8900
+       (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.x.y.z)
 
   2. Load the extension:
        edge://extensions -> enable Developer mode -> Load unpacked ->
@@ -94,13 +104,24 @@ Remaining steps (manual -- Edge has no CLI for these):
 
   3. Configure it:
        Click the extension's toolbar icon (its only UI) to open the options page.
-       Hub URL: ws://<this machine's tailnet IP>:8900/device
+       Hub URL: ws://100.x.y.z:8900/device
        Token:   <the generated token, printed above>
        Click Save.
 
   4. Confirm it worked:
        AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8900/agent
 ```
+
+**A1 fix (security review finding):** `amplifier-browser-bridge hub` used to default to `--host 0.0.0.0` --
+binding every network interface the machine has (home Wi-Fi, hotel Wi-Fi, a corporate LAN), not
+just the Tailscale tailnet this project's threat model assumes -- and `init` printed that default
+back as the recommended command. `hub` now defaults to `--host 127.0.0.1` (loopback only); `init`
+auto-detects this machine's own Tailscale IP (`tailscale ip -4`) as shown above so the printed
+command stays cross-device-capable without a silent wildcard bind. If Tailscale can't be
+detected, `init` falls back to `127.0.0.1` and says so explicitly -- cross-device use then
+requires passing `--hub-host <your tailnet IP>` yourself. Passing (or auto-falling to) a
+wildcard host anywhere prints a specific, named warning listing exactly what it exposes. See
+[SECURITY.md](SECURITY.md) for the full accounting.
 
 Follow those four steps -- step 2 (loading an unpacked extension) is a genuinely manual step;
 Edge has no CLI or API for it. Then issue a command:
@@ -282,7 +303,7 @@ read or click:
 |---|---|
 | Denylist | A small, hand-maintained set of sensitive host categories (financial, healthcare, identity providers, password managers) are made **invisible** to the agent -- they never appear in a `tabs` listing, not merely refused when directly addressed |
 | Confirmation gates | A fixed set of irreversible/world-visible actions (purchase, send, delete, OAuth grant, file upload, account creation, permission change) require an explicit `confirm` call before dispatch; everything else runs unprompted |
-| Kill switch | A hub-level stop-all that halts new dispatch and rejects every queued command immediately |
+| Kill switch | A hub-level stop-all that halts new dispatch and rejects every queued command immediately -- reachable via `amplifier-browser-bridge kill-switch engage\|disengage\|status` (A4 fix: previously library-API-only, `Hub.engage_kill_switch()`, with no CLI or wire-protocol path to it) |
 | Audit log | Every command, policy decision, and result is recorded, so broad default access has a compensating "the human can review everything after the fact" control |
 
 Read [docs/POLICY.md](docs/POLICY.md) in full before relying on this for anything beyond the
