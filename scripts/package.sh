@@ -177,6 +177,20 @@ done
 # this zip contains only what a sideloader's browser actually loads, plus the
 # one document (INSTALL.md) written for them.
 
+# Normalize every staged file's mtime to a fixed reference timestamp before
+# zipping. `zip -X` alone (as used by the sibling projects' package.sh
+# scripts) strips UID/GID/extra-field metadata but NOT each entry's DOS
+# date/time, which is taken from the file's actual mtime -- `cp` sets that to
+# "now" on every run, so two builds from IDENTICAL source produce DIFFERENT
+# zip bytes (and therefore different SHA256) if run more than ~2 seconds
+# apart. Verified against this script during development: two consecutive
+# runs produced different hashes; the sibling projects' own package.sh
+# scripts exhibit the identical issue when re-run seconds apart, despite
+# their header comments claiming reproducibility. Pinning every mtime here
+# (rather than assuming "rerun quickly enough") is what actually makes the
+# SHA256 below reproducible across arbitrarily separated runs.
+find "$STAGE" -type f -exec touch -t 202001010000 {} +
+
 (
     cd "$STAGE"
     # -X strips file metadata that varies run-to-run (uid/gid/timestamps).
