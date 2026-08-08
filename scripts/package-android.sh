@@ -22,8 +22,27 @@
 # different extension). The key is NEVER written into this repo -- default location
 # is under $HOME/.config, override with AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY. Never commit it.
 #
+# Zero-configuration install (bakes a hub URL + token into the build)
+# ---------------------------------------------------------------------
+# There is no reachable path to chrome-extension://<id>/options.html on Edge Android
+# by hand (see docs/ANDROID.md's "Zero-configuration builds" section and
+# extension/bundled_config.mjs's docstring for the full rationale). This script now
+# resolves a hub URL + token (via amplifier_browser_bridge.android_bake, read-only
+# w.r.t. the hub's own config -- see that module's docstring) and bakes them into
+# `bundled_config.json` inside $STAGE_EXT ONLY -- this file is NEVER written into the
+# tracked extension/ source tree, and is not committed. background.js adopts it as a
+# FIRST-RUN DEFAULT ONLY on install (extension/bundled_config.mjs).
+#
+# SECURITY: the built artifact now carries a live credential -- see SECURITY.md's
+# "The Android build now embeds a live hub credential in the artifact itself"
+# section. This script prints that disclosure at build time (never silently);
+# do not strip that output from CI logs or a build wrapper.
+#
 # Usage:
 #   scripts/package-android.sh
+#   scripts/package-android.sh --hub-host 100.124.126.19 --hub-port 8900
+#   scripts/package-android.sh --hub-url ws://100.124.126.19:8900/device
+#   scripts/package-android.sh --allow-no-token   # dev-only: bakes auth-disabled
 #   CHROME_BIN=/path/to/chrome scripts/package-android.sh
 #   AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY=/secure/path/key.pem scripts/package-android.sh
 set -euo pipefail
@@ -32,6 +51,32 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTENSION_SRC="$REPO_ROOT/extension"
 DIST_DIR="$REPO_ROOT/dist/android"
 KEY_PATH="${AMPLIFIER_BROWSER_BRIDGE_ANDROID_SIGNING_KEY:-$HOME/.config/amplifier-browser-bridge/android-signing-key.pem}"
+
+# --------------------------------------------------------------------------
+# Argument parsing -- the "overridable by flag or env" surface for the baked hub
+# URL/token. Distinct env var names from the hub-side AMPLIFIER_BROWSER_BRIDGE_HUB_URL
+# (cli.py's own default for the /agent route) deliberately: that variable means a
+# different route (/agent, not /device) and reusing it here would silently bake the
+# wrong path into the artifact if someone had it set for an unrelated CLI invocation.
+# --------------------------------------------------------------------------
+BAKE_HUB_URL="${AMPLIFIER_BROWSER_BRIDGE_BAKE_HUB_URL:-}"
+BAKE_HUB_HOST="${AMPLIFIER_BROWSER_BRIDGE_BAKE_HUB_HOST:-}"
+BAKE_HUB_PORT="${AMPLIFIER_BROWSER_BRIDGE_BAKE_HUB_PORT:-8900}"
+BAKE_ALLOW_NO_TOKEN="${AMPLIFIER_BROWSER_BRIDGE_BAKE_ALLOW_NO_TOKEN:-}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --hub-url) BAKE_HUB_URL="$2"; shift 2 ;;
+        --hub-host) BAKE_HUB_HOST="$2"; shift 2 ;;
+        --hub-port) BAKE_HUB_PORT="$2"; shift 2 ;;
+        --allow-no-token) BAKE_ALLOW_NO_TOKEN="1"; shift ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            echo "Usage: $0 [--hub-url ws://host:port/device] [--hub-host HOST] [--hub-port PORT] [--allow-no-token]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # --------------------------------------------------------------------------
 # Locate a Chromium/Chrome/Edge binary capable of --pack-extension. Playwright's
@@ -77,22 +122,84 @@ STAGE_EXT="$STAGE_DIR/extension"
 mkdir -p "$STAGE_EXT"
 cleanup() { rm -rf "$STAGE_DIR"; }
 trap cleanup EXIT
+# STAGE_DIR briefly holds bundled_config.json (a live credential in plaintext, see
+# below) before it's packed into the CRX -- restrict it to the owner as defense in
+# depth, on top of it being a private /tmp path and always cleaned up by the trap above.
+chmod 700 "$STAGE_DIR"
 
 cp "$EXTENSION_SRC/background.js" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/injected.js" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/options.html" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/options.js" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/config_validate.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/bundled_config.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/frame_refs.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/combine_frames.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/ref_registry.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/args_bool.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/fetch_utils.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/download_claim.mjs" "$STAGE_EXT/"
+cp "$EXTENSION_SRC/effects_collector.mjs" "$STAGE_EXT/"
 cp "$EXTENSION_SRC/manifest.android.json" "$STAGE_EXT/manifest.json"
 
 VERSION=$(python3 -c "import json; print(json.load(open('$STAGE_EXT/manifest.json'))['version'])")
 echo "Packaging version: $VERSION" >&2
+
+# --------------------------------------------------------------------------
+# Bake a hub URL + token into bundled_config.json (zero-configuration Android
+# install -- see this script's header comment and docs/ANDROID.md). Written ONLY
+# into $STAGE_EXT -- never into the tracked extension/ source tree.
+#
+# Uses amplifier_browser_bridge.android_bake (read-only w.r.t. the hub's own
+# token file) via the same `sys.path.insert(0, 'src')` convention scripts/package.sh
+# already uses for its own inline Python steps, rather than requiring this package
+# be installed into whatever Python environment runs this script.
+# --------------------------------------------------------------------------
+echo "" >&2
+echo "Baking hub URL + token into bundled_config.json..." >&2
+BAKE_ARGS=(--stage-dir "$STAGE_EXT" --hub-port "$BAKE_HUB_PORT")
+[ -n "$BAKE_HUB_URL" ] && BAKE_ARGS+=(--hub-url "$BAKE_HUB_URL")
+[ -n "$BAKE_HUB_HOST" ] && BAKE_ARGS+=(--hub-host "$BAKE_HUB_HOST")
+[ -n "$BAKE_ALLOW_NO_TOKEN" ] && BAKE_ARGS+=(--allow-no-token)
+if ! python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/src')
+from amplifier_browser_bridge.android_bake import cli_main
+sys.exit(cli_main(sys.argv[1:]))
+" "${BAKE_ARGS[@]}"; then
+    exit 1
+fi
+# The freshly-written bundled_config.json carries a live credential in plaintext
+# until it's packed into the CRX below -- restrict it to the owner (defense in
+# depth; write_bundled_config() already does this, this is belt-and-suspenders
+# against that function ever changing without this script noticing).
+chmod 600 "$STAGE_EXT/bundled_config.json"
+
+# --------------------------------------------------------------------------
+# Extension integrity gate -- previously present in scripts/package.sh (Gate 4) but
+# NOT wired into this script, which meant a staging omission here (like the real one
+# this pass found and fixed: effects_collector.mjs was never copied above, even
+# though background.js imports it at module top level -- exactly the 87ce68d
+# failure mode) shipped completely undetected. Verifies the CONSEQUENCE -- that
+# $STAGE_EXT is self-contained -- not the staging list against itself; see
+# extension_integrity.py's own docstring for why.
+# --------------------------------------------------------------------------
+echo "" >&2
+echo "Checking extension integrity (imports + manifest refs resolve within \$STAGE_EXT)..." >&2
+if ! python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/src')
+from pathlib import Path
+from amplifier_browser_bridge.extension_integrity import ExtensionIntegrityError, verify_extension_integrity
+try:
+    verify_extension_integrity(Path('$STAGE_EXT'))
+except ExtensionIntegrityError as e:
+    print(f'BUILD REFUSED -- {e}', file=sys.stderr)
+    sys.exit(1)
+"; then
+    exit 1
+fi
+echo "  OK -- every import and manifest reference resolves within the staged set." >&2
 
 # --------------------------------------------------------------------------
 # Pack. First run (no key yet) lets Chromium generate one, which we then move to
@@ -133,11 +240,22 @@ if [ ! -f "$KEY_PATH" ]; then
 fi
 
 mkdir -p "$DIST_DIR"
+chmod 700 "$DIST_DIR"
 OUT_CRX="$DIST_DIR/amplifier-browser-bridge-android-v${VERSION}.crx"
 cp "$GENERATED_CRX" "$OUT_CRX"
+# The built artifact now carries the same live credential bundled_config.json did --
+# restrict its permissions so it can't land somewhere world-readable by accident. This
+# does NOT survive the file being copied/uploaded elsewhere -- see SECURITY.md.
+chmod 600 "$OUT_CRX"
 
 echo "" >&2
 echo "Built: $OUT_CRX" >&2
+echo "" >&2
+echo "SECURITY: this artifact embeds a live hub credential (bundled_config.json, baked" >&2
+echo "above). Anyone who obtains this file can connect to the hub as this device." >&2
+echo "Treat it the same way you would treat the hub's own token file. See SECURITY.md's" >&2
+echo "'The Android build now embeds a live hub credential in the artifact itself'" >&2
+echo "section and docs/ANDROID.md's 'Zero-configuration builds' section." >&2
 echo "" >&2
 
 # --------------------------------------------------------------------------
