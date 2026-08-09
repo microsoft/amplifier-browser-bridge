@@ -31,6 +31,7 @@ from .auth import (
     resolve_token_file,
 )
 from .client import HubClient, HubError
+from .clipboard import copy_to_clipboard
 from .doctor import DoctorCheck, run_doctor
 from .extension_integrity import ExtensionIntegrityError
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
@@ -1105,21 +1106,29 @@ def pair(ttl: int) -> None:
     # sends anyone back to a terminal for anything. It works whether or not the
     # extension is installed yet. The bare code below remains for the one case the
     # link can't cover on its own: pasting directly into an ALREADY-OPEN Settings page.
-    if host and port_str.isdigit():
-        click.echo(
-            f"Pairing link (valid {ttl}s, single use, expires {time.strftime('%H:%M:%S', time.localtime(expires_at))}):"
-        )
+    #
+    # Auto-copies to the terminal's clipboard via OSC 52 (works over SSH -- see
+    # clipboard.py) before printing either form, so following the link or pasting
+    # the code never requires selecting terminal text by hand -- maintainer
+    # feedback: "if we HAVE to copy and paste ... can't we auto put it into the
+    # user's clipboard". The plain-text printout right below is the fallback for
+    # any terminal that doesn't support OSC 52.
+    have_link = bool(host and port_str.isdigit())
+    if have_link:
+        link = _setup_pair_url(host, int(port_str), code, expires_at=expires_at)
+        copied = copy_to_clipboard(link)
+        expires_str = time.strftime("%H:%M:%S", time.localtime(expires_at))
+        suffix = ", copied to clipboard" if copied else ""
+        click.echo(f"Open on the browser being paired (valid {ttl}s, expires {expires_str}{suffix}):")
         click.echo("")
-        click.echo(f"    {_setup_pair_url(host, int(port_str), code, expires_at=expires_at)}")
+        click.echo(f"    {link}")
         click.echo("")
-        click.echo("Open it ON THE BROWSER BEING PAIRED -- it downloads the extension if needed and")
-        click.echo('has this code ready to paste into Settings -> "Pair with a hub" -> Pair.')
-        click.echo("")
-    click.echo('Already have Settings open? Paste this code under "Pair with a hub" -> Pair:')
+    click.echo('Settings already open? Paste this code under "Enter a code by hand" -> Pair:')
     click.echo("")
+    if not have_link:
+        copy_to_clipboard(code)
     click.echo(f"    {code}")
     click.echo("")
-    click.echo("No hub URL or token to copy by hand -- pairing fetches both automatically.")
     if not result.get("persisted", True):
         click.echo("")
         click.echo(
@@ -1709,24 +1718,18 @@ def init(
         # printed instead of a live wait, since there's nothing here to watch
         # FOR in an unattended run.
         click.echo("")
-        click.echo("  2. Load the extension:")
-        click.echo("     On the browser being paired (open this URL THERE -- any device on your")
-        click.echo("     tailnet, not necessarily this machine):")
+        click.echo("  2. Load the extension -- open on the browser being paired:")
         click.echo(f"       {_setup_url(resolved_host, hub_port)}")
-        click.echo("     Same machine as this hub? Skip the download and use the staged copy directly:")
-        click.echo(
-            f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}"
-        )
+        click.echo(f"     (same machine? edge://extensions -> Load unpacked -> {staged_dir})")
         click.echo("")
-        click.echo("  3. Once it's loaded, get a pairing code whenever you're ready (minted fresh")
-        click.echo("     right when you ask, so it can't expire waiting on you):")
+        click.echo("  3. Get a pairing code when ready (fresh each time, so it can't expire on you):")
         click.echo(
             f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
             f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
         )
-        click.echo('       Click the extension\'s toolbar icon -> Settings -> "Pair with a hub".')
+        click.echo("     The extension should pair itself; otherwise Settings -> Pair.")
         click.echo("")
-        click.echo("  4. Confirm it worked:")
+        click.echo("  4. Confirm:")
         click.echo(
             f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
             f"--hub-url ws://{resolved_host}:{hub_port}/agent"
@@ -1756,19 +1759,20 @@ def init(
 
     code = f"{pairing_result['ticket']}@{resolved_host}:{hub_port}"
     expires_at = time.time() + DEFAULT_TICKET_TTL_SECONDS
-    ttl_i = int(DEFAULT_TICKET_TTL_SECONDS)
 
+    # Auto-copies the link to the terminal's clipboard via OSC 52 (works over SSH --
+    # see clipboard.py) before printing it -- maintainer feedback: "can't we auto
+    # put it into the user's clipboard". The printout below is the fallback for any
+    # terminal that doesn't support OSC 52.
+    link = _setup_pair_url(resolved_host, hub_port, code, expires_at=expires_at)
+    copied = copy_to_clipboard(link)
+    expires_str = time.strftime("%H:%M:%S", time.localtime(expires_at))
+    suffix = ", copied to clipboard" if copied else ""
     click.echo("")
-    click.echo("  2. Add this browser -- open this link ON THE BROWSER YOU WANT TO ADD (any")
-    click.echo("     device on your tailnet, not necessarily this machine). The pairing code is")
-    click.echo(
-        f"     already included -- valid {ttl_i}s, expires {time.strftime('%H:%M:%S', time.localtime(expires_at))}:"
-    )
-    click.echo(f"       {_setup_pair_url(resolved_host, hub_port, code, expires_at=expires_at)}")
-    click.echo("     It downloads the extension, walks through 'Load unpacked', then Settings -> Pair")
-    click.echo("     (code pre-filled). Same machine as this hub? Skip straight to Settings -> Pair:")
-    click.echo(f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}")
-    click.echo("     Code expired, or pairing a different browser? amplifier-browser-bridge pair")
+    click.echo(f"  2. Open on the browser you're adding (expires {expires_str}{suffix}):")
+    click.echo(f"       {link}")
+    click.echo(f"     Same machine? edge://extensions -> Load unpacked -> {staged_dir}")
+    click.echo("     Expired, or a different browser? amplifier-browser-bridge pair")
 
     # Replaces TWO separate [Y/n] prompts ("Loaded, and its Settings page is
     # open?" / "Entered the code and clicked Pair?") with observation of the

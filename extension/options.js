@@ -28,6 +28,21 @@
 // parser and src/amplifier_browser_bridge/pairing.py for the server-side ticket design
 // (entropy/lifetime/threat-model reasoning).
 //
+// Zero-copy-paste pairing (real-run maintainer feedback, 2026-08): typing/pasting a
+// code at all is a step this extension can usually skip entirely. The `tabs`
+// permission this extension already holds can see an already-open
+// `/setup#pair=...` tab's URL (fragment included), which is exactly what a user who
+// just followed the setup link is looking at. `runPairingDiscovery` below tries, in
+// order, until one works: (1) an open pairing tab (`pair_discovery.mjs` -- see that
+// module's docstring for the origin-check security invariant this relies on), (2) the
+// system clipboard (`navigator.clipboard.readText()`, gated on the `clipboardRead`
+// permission), (3) a "Check again" button the user can click to retry both with a
+// real user gesture (some clipboard-permission policies require one). Only the last
+// resort -- typing/pasting a code into the "Enter a code by hand" field -- is
+// unchanged from before. Never runs at all once this device is already configured:
+// an auto-redeem is only appropriate for a brand-new, never-paired install, never a
+// silent re-pair against whatever `/setup` tab happens to be open later.
+//
 // Connection-status detail (craft-inspector / human-advocate review, 2026-08): the
 // status line used to collapse EVERY "configured but not connected" cause into one
 // generic sentence -- a hub that's unreachable and a hub that rejected this device's
@@ -53,6 +68,7 @@
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
 import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
 import { parsePairingCode, buildDeviceWsUrl, buildRedeemUrl } from "./pairing_code.mjs";
+import { discoverPairingCandidate } from "./pair_discovery.mjs";
 
 const urlInput = document.getElementById("hub-url");
 const tokenInput = document.getElementById("hub-token");
@@ -64,6 +80,15 @@ const provenanceEl = document.getElementById("provenance");
 const pairCodeInput = document.getElementById("pair-code");
 const pairErrorEl = document.getElementById("pair-error");
 const pairButton = document.getElementById("pair");
+const pairAutoStatusEl = document.getElementById("pair-auto-status");
+const pairRetryButton = document.getElementById("pair-retry");
+
+// Storage key mirrored from persistConfigAndPoll below -- checked BEFORE any
+// auto-discovery attempt runs. An already-paired device must never be
+// silently re-pointed at a different hub just because some `/setup` tab
+// happens to be open; auto-discovery is for first-run only. See this file's
+// module docstring.
+const SETUP_COMPLETED_STORAGE_KEY = "amplifier_browser_bridge_setup_completed";
 
 // Renders the "where did these values come from" line -- see bundled_config.mjs's
 // describeConfigProvenance for why this exists: a field silently pre-filled with a baked
@@ -306,62 +331,87 @@ if (saveButton) {
 
 // ---------------------------------------------------------------------------
 // Pairing -- see this file's module docstring and pairing_code.mjs.
+//
+// `redeemCode` is the ONE place a pairing code is ever turned into a
+// configured hub -- the manual "Pair" button, the auto-discovered tab, and
+// the clipboard rung all call this same function, so the three paths can
+// never drift apart on what counts as success or how an error is worded.
 // ---------------------------------------------------------------------------
+
+/**
+ * Parse and redeem a pairing code against its hub, persisting the resulting
+ * hub URL/token on success. Never throws -- every failure is reported via
+ * `onError` (a callback, not an exception) so callers with different UI
+ * surfaces (a visible error line vs. a quiet auto-discovery status line) can
+ * each render it their own way.
+ *
+ * @param {string} rawCode
+ * @param {{onError?: (message: string) => void}} [opts]
+ * @returns {Promise<boolean>} true iff redeemed and persisted.
+ */
+async function redeemCode(rawCode, { onError } = {}) {
+  const fail = (message) => {
+    if (onError) onError(message);
+    return false;
+  };
+
+  const parsed = parsePairingCode(rawCode);
+  if (!parsed.valid) return fail(parsed.error);
+
+  const deviceId = await getOrCreateDeviceId();
+  const redeemUrl = buildRedeemUrl(parsed.host, parsed.port);
+  let response;
+  try {
+    // Rides the extension's own <all_urls> host_permissions -- fetches from an
+    // extension page are not subject to the same-origin/CORS restrictions a
+    // normal web page's fetch would be, the same reason background.js's
+    // fetchBytes() can reach an arbitrary origin (see that function's comment).
+    response = await fetch(redeemUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ticket: parsed.ticket,
+        device_id: deviceId,
+        label: platformLabel(),
+        platform: (typeof navigator !== "undefined" && navigator.platform) || "unknown",
+      }),
+    });
+  } catch (err) {
+    return fail(
+      `Could not reach the hub at ${parsed.host}:${parsed.port} -- is \`amplifier-browser-bridge hub\` ` +
+        `(or the service) running, and is this device on the same tailnet? (${(err && err.message) || err})`
+    );
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    return fail(`Hub at ${parsed.host}:${parsed.port} returned an unreadable response (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok || !data || !data.ok) {
+    return fail((data && data.error) || `Pairing failed (HTTP ${response.status}).`);
+  }
+
+  const hubUrl = buildDeviceWsUrl(parsed.host, parsed.port);
+  await persistConfigAndPoll(hubUrl, data.token || "", CONFIG_SOURCE_PAIRED);
+  return true;
+}
 
 if (pairButton) {
   pairButton.addEventListener("click", async () => {
     pairErrorEl.textContent = "";
-    const parsed = parsePairingCode(pairCodeInput.value);
-    if (!parsed.valid) {
-      pairErrorEl.textContent = parsed.error;
-      return;
-    }
-
     pairButton.disabled = true;
     const originalLabel = pairButton.textContent;
     pairButton.textContent = "Pairing...";
     try {
-      const deviceId = await getOrCreateDeviceId();
-      const redeemUrl = buildRedeemUrl(parsed.host, parsed.port);
-      let response;
-      try {
-        // Rides the extension's own <all_urls> host_permissions -- fetches from an
-        // extension page are not subject to the same-origin/CORS restrictions a
-        // normal web page's fetch would be, the same reason background.js's
-        // fetchBytes() can reach an arbitrary origin (see that function's comment).
-        response = await fetch(redeemUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ticket: parsed.ticket,
-            device_id: deviceId,
-            label: platformLabel(),
-            platform: (typeof navigator !== "undefined" && navigator.platform) || "unknown",
-          }),
-        });
-      } catch (err) {
-        pairErrorEl.textContent =
-          `Could not reach the hub at ${parsed.host}:${parsed.port} -- is \`amplifier-browser-bridge hub\` ` +
-          `(or the service) running, and is this device on the same tailnet? (${(err && err.message) || err})`;
-        return;
-      }
-
-      let data;
-      try {
-        data = await response.json();
-      } catch {
-        pairErrorEl.textContent = `Hub at ${parsed.host}:${parsed.port} returned an unreadable response (HTTP ${response.status}).`;
-        return;
-      }
-
-      if (!response.ok || !data || !data.ok) {
-        pairErrorEl.textContent = (data && data.error) || `Pairing failed (HTTP ${response.status}).`;
-        return;
-      }
-
-      const hubUrl = buildDeviceWsUrl(parsed.host, parsed.port);
-      await persistConfigAndPoll(hubUrl, data.token || "", CONFIG_SOURCE_PAIRED);
-      pairCodeInput.value = "";
+      const ok = await redeemCode(pairCodeInput.value, {
+        onError: (message) => {
+          pairErrorEl.textContent = message;
+        },
+      });
+      if (ok) pairCodeInput.value = "";
     } finally {
       pairButton.disabled = false;
       pairButton.textContent = originalLabel;
@@ -369,12 +419,122 @@ if (pairButton) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Zero-copy-paste auto-discovery -- see this file's module docstring.
+// ---------------------------------------------------------------------------
+
+function setAutoStatus(text, { showRetry = false } = {}) {
+  if (pairAutoStatusEl) pairAutoStatusEl.textContent = text;
+  if (pairRetryButton) pairRetryButton.style.display = showRetry ? "" : "none";
+}
+
+/**
+ * Rung 1: scan every open tab for a redeemable, origin-checked pairing code.
+ * Never throws -- `chrome.tabs.query` failing (should not happen given this
+ * extension's `tabs` permission, but defensive regardless) is treated as
+ * "found nothing," not a fatal error. Rejected candidates (see
+ * pair_discovery.mjs) are logged quietly, never surfaced as a user warning --
+ * a hostile or malformed tab is not something the user did wrong.
+ *
+ * @returns {Promise<string|null>}
+ */
+async function discoverFromTabs() {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (err) {
+    console.debug("pairing auto-discovery: chrome.tabs.query failed", err);
+    return null;
+  }
+  const { candidate, rejected } = discoverPairingCandidate(tabs);
+  for (const r of rejected) {
+    console.debug(`pairing auto-discovery: rejected tab ${r.tabId} (${r.url}): ${r.reason}`);
+  }
+  return candidate ? candidate.code : null;
+}
+
+/**
+ * Rung 2: read a pairing code straight out of the system clipboard, if the
+ * `clipboardRead` permission is granted and the API is usable right now.
+ * `navigator.clipboard.readText()` can reject for reasons that have nothing
+ * to do with whether a code is actually there -- no permission, the
+ * document not focused, or (on browsers stricter than Chromium's own
+ * extension-permission model) no transient user activation -- all of which
+ * this treats identically as "nothing found," never a user-facing error.
+ * The retry button below supplies a real user gesture for the stricter case.
+ *
+ * @returns {Promise<string|null>}
+ */
+async function discoverFromClipboard() {
+  if (typeof navigator === "undefined" || !navigator.clipboard || typeof navigator.clipboard.readText !== "function") {
+    return null;
+  }
+  let text;
+  try {
+    text = await navigator.clipboard.readText();
+  } catch (err) {
+    console.debug("pairing auto-discovery: clipboard read unavailable (permission/focus/gesture)", err);
+    return null;
+  }
+  const parsed = parsePairingCode(text);
+  return parsed.valid ? text.trim() : null;
+}
+
+async function tryAutoRedeem(rawCode, foundMessage) {
+  setAutoStatus(`${foundMessage} Connecting...`);
+  const ok = await redeemCode(rawCode, {
+    onError: (message) => setAutoStatus(`Found a pairing code, but couldn't use it: ${message}`, { showRetry: true }),
+  });
+  if (ok) setAutoStatus(`${foundMessage} Paired automatically.`);
+}
+
+/**
+ * The full ladder, in order: an open pairing tab, then the clipboard, then
+ * (if neither worked) a "Check again" button -- the last, always-available
+ * rung is the "Enter a code by hand" details already in options.html.
+ * Skipped entirely once this device is already configured (see this file's
+ * module docstring) and skipped in tests via the same test flag the status
+ * poll uses below.
+ */
+async function runPairingDiscovery() {
+  const stored = await chrome.storage.local.get(SETUP_COMPLETED_STORAGE_KEY);
+  if (stored[SETUP_COMPLETED_STORAGE_KEY]) {
+    setAutoStatus("Already paired. Pairing again below replaces the current connection.");
+    return;
+  }
+
+  setAutoStatus("Looking for a pairing code...");
+
+  const tabCode = await discoverFromTabs();
+  if (tabCode) return tryAutoRedeem(tabCode, "Found an open pairing tab.");
+
+  const clipCode = await discoverFromClipboard();
+  if (clipCode) return tryAutoRedeem(clipCode, "Found a pairing code in your clipboard.");
+
+  setAutoStatus("No pairing code found nearby.", { showRetry: true });
+}
+
+if (pairRetryButton) {
+  pairRetryButton.addEventListener("click", async () => {
+    pairRetryButton.disabled = true;
+    try {
+      // The click itself is a real user gesture -- the best chance a stricter
+      // clipboard-permission policy has of allowing discoverFromClipboard to
+      // succeed, even if the automatic attempt above could not.
+      await runPairingDiscovery();
+    } finally {
+      pairRetryButton.disabled = false;
+    }
+  });
+}
+
 // Auto-run on real page load, skipped when options.test.mjs sets this flag before
-// importing -- tests drive queryStatusOnce/pollStatusUntilKnown directly with their
-// own fast, deterministic delay schedules instead of waiting out the real one.
+// importing -- tests drive queryStatusOnce/pollStatusUntilKnown/runPairingDiscovery
+// directly with their own fake chrome.*/deterministic inputs instead of the real ones.
 if (!globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__) {
   loadCurrentValues();
   pollStatusUntilKnown(LOAD_STATUS_POLL_DELAYS_MS);
+  runPairingDiscovery();
 }
 
 // Exported for extension/options.test.mjs only -- not used by any other runtime file.
@@ -385,6 +545,7 @@ export {
   renderUnknown,
   pollStatusUntilKnown,
   getOrCreateDeviceId,
+  runPairingDiscovery,
   LOAD_STATUS_POLL_DELAYS_MS,
   SAVE_STATUS_POLL_DELAYS_MS,
 };

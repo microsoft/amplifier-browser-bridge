@@ -39,12 +39,22 @@ CheckStatus = Literal["ok", "fail", "skipped"]
 # the "tailnet boundary" is a no-op and the per-device token is the only
 # real gate. See docs/tailscale-acl-example.json for a starting-point
 # restrictive policy, and SECURITY.md's rewritten threat-model section.
+#
+# Two forms of this fact (real-run maintainer feedback, 2026-08: this check
+# printed ~400 characters of ACL explanation at what should be a success
+# moment). `_ACL_DISCLOSURE` (full) is reserved for genuinely concerning
+# states this check can detect -- a wildcard bind, an inconclusive loopback
+# target, or auth disabled -- where the extra detail is actually load-bearing.
+# The common case (a specific tailnet-looking host, auth enabled -- nothing
+# here needs explaining) gets `_ACL_POINTER` instead: the same underlying
+# fact, in one line, with a pointer to the rest rather than the rest itself.
 _ACL_DISCLOSURE = (
     "Tailscale's default ACL allows every device on your tailnet to reach every port on "
     "every other device -- unless you've written a restrictive ACL of your own "
     "(https://login.tailscale.com/admin/acls), the per-device token is your real security "
     "boundary, not the tailnet. Starting-point ACL: docs/tailscale-acl-example.hujson."
 )
+_ACL_POINTER = "Your real security boundary is your Tailscale ACL (default: allow-all), not the tailnet -- docs/POLICY.md."
 
 
 @dataclass
@@ -131,25 +141,33 @@ def _check_network_exposure(hub_url: str, auth_enabled: bool) -> DoctorCheck:
     else:
         message = f"targets {host!r} -- confirm this is your tailnet IP, not something wider."
 
+    wildcard = is_wildcard_bind(host)
+    loopback = is_loopback(host)
+    # An unusual bind (wildcard) or an inconclusive check (loopback) is where the
+    # detected-IP cross-check is actually useful; skip it in the common case
+    # (see this function's own note on `_ACL_POINTER` above).
+    needs_full_detail = wildcard or loopback
+
     detail_lines: list[str] = []
-    if is_wildcard_bind(host):
+    if wildcard:
         detail_lines.append(
             "if the running hub was actually started with --host matching this, it is reachable "
             "from EVERY network interface this machine has, not just the tailnet."
         )
-    elif is_loopback(host):
+    elif loopback:
         detail_lines.append(
             "this check can only see what host YOU pointed doctor at -- it cannot prove the "
             "running hub process isn't ALSO bound to a wider address (e.g. started with "
             "--host 0.0.0.0). Confirm separately how the hub you're diagnosing was actually started."
         )
 
-    if detected_tailscale_ip:
-        detail_lines.append(f"this machine's own Tailscale IP: {detected_tailscale_ip}.")
-    else:
-        detail_lines.append(
-            "could not detect a Tailscale IP on this machine (`tailscale ip -4` unavailable or failed)."
-        )
+    if needs_full_detail:
+        if detected_tailscale_ip:
+            detail_lines.append(f"this machine's own Tailscale IP: {detected_tailscale_ip}.")
+        else:
+            detail_lines.append(
+                "could not detect a Tailscale IP on this machine (`tailscale ip -4` unavailable or failed)."
+            )
 
     if not auth_enabled:
         message = "CRITICAL COMBINATION: auth is DISABLED and doctor " + message
@@ -158,8 +176,14 @@ def _check_network_exposure(hub_url: str, auth_enabled: bool) -> DoctorCheck:
             "beyond this machine, ANY device that can reach the port controls every connected "
             "browser, with no token check at all."
         )
+        detail_lines.append(_ACL_DISCLOSURE)
+    elif needs_full_detail:
+        detail_lines.append(_ACL_DISCLOSURE)
+    else:
+        # The common, everything-is-fine case: one line, not a paragraph (real-run
+        # maintainer feedback -- see this function's docstring note above).
+        detail_lines.append(_ACL_POINTER)
 
-    detail_lines.append(_ACL_DISCLOSURE)
     return DoctorCheck("network_exposure", "ok", message, detail="\n".join(detail_lines))
 
 

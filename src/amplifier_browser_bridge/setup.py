@@ -51,6 +51,10 @@ _EXTENSION_FILES = (
     # pair` command): pure parse/format logic for the pairing code, imported statically
     # by options.js -- same 87ce68d whitelist-omission failure mode applies if omitted.
     "pairing_code.mjs",
+    # Zero-copy-paste auto-discovery (options.js's runPairingDiscovery): pure tab-scan
+    # + origin-check logic, imported statically by options.js. Same 87ce68d
+    # whitelist-omission failure mode applies if omitted.
+    "pair_discovery.mjs",
     # Connection-error classification (background.js's lastConnectError tracking,
     # options.js's renderStatus) -- imported statically by background.js. Same
     # 87ce68d whitelist-omission failure mode applies if omitted.

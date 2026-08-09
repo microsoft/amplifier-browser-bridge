@@ -57,31 +57,27 @@
 </head>
 <body>
   <h1>Amplifier Browser Bridge</h1>
-  <p>
-    This extension connects to a hub process running on your tailnet and lets an agent
-    observe/drive this browser. Nothing is committed to source for this -- configuration
-    lives only in this browser's local extension storage.
-  </p>
+  <p>Connects this browser to a hub on your tailnet so an agent can use it.</p>
 
   <div id="provenance" class="hint"></div>
 
   <h2>Pair with a hub</h2>
-  <p class="hint">
-    Run <code>amplifier-browser-bridge pair</code> on the machine running your hub. It prints a
-    short, single-use pairing code -- paste it below. This fetches the real hub address and a
-    fresh per-device token automatically; you never type or copy a raw hub URL or a 32-character
-    token by hand.
-  </p>
-  <label for="pair-code">Pairing code</label>
-  <input type="text" id="pair-code" placeholder="7F3K9-QXTM2@100.x.y.z:8900" autocomplete="off" />
-  <div id="pair-error"></div>
-  <button id="pair" type="button">Pair</button>
+  <p id="pair-auto-status" class="hint">Looking for a pairing code...</p>
+  <button id="pair-retry" type="button" style="display: none;">Check again</button>
+
+  <details id="manual-pair">
+    <summary>Enter a code by hand</summary>
+    <p class="hint">From <code>amplifier-browser-bridge pair</code>, run on your hub.</p>
+    <label for="pair-code">Pairing code</label>
+    <input type="text" id="pair-code" placeholder="7F3K9-QXTM2@100.x.y.z:8900" autocomplete="off" />
+    <div id="pair-error"></div>
+    <button id="pair" type="button">Pair</button>
+  </details>
 
   <details id="manual-config">
     <summary>Manual configuration (advanced)</summary>
     <p class="hint">
-      For scripting, a hub with no running pairing session, or entering values by hand. A
-      deliberate Save here always takes ownership of the configuration, the same as pairing does.
+      For scripting or a hub with no pairing session. Save always takes ownership, same as pairing.
     </p>
 
     <label for="hub-url">Hub URL</label>

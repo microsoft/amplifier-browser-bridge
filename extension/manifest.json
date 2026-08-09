@@ -34,7 +34,8 @@
     "downloads",
     "tabGroups",
     "debugger",
-    "webNavigation"
+    "webNavigation",
+    "clipboardRead"
   ],
   "host_permissions": [
     "<all_urls>"

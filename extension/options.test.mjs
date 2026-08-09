@@ -33,6 +33,8 @@ function installFakeDom() {
     "pair-code": makeElement(),
     "pair-error": makeElement(),
     pair: makeElement({ textContent: "Pair" }),
+    "pair-auto-status": makeElement(),
+    "pair-retry": makeElement({ style: { display: "none" } }),
   };
   globalThis.document = { getElementById: (id) => elements[id] };
   return elements;
@@ -388,6 +390,140 @@ test("Pair button: success stores the hub URL/token, CONFIG_SOURCE_PAIRED, and c
   assert.equal(stored.amplifier_browser_bridge_setup_completed, true);
   assert.equal(elements["pair-code"].value, "");
   assert.equal(elements["pair-error"].textContent, "");
+});
+
+// --- Zero-copy-paste auto-discovery (runPairingDiscovery) --------------------
+
+function installFakeChromeForDiscovery({ setupCompleted = false, tabs = [], clipboardText = null, clipboardThrows = null } = {}) {
+  setFakeCrypto("device-uuid");
+  const stored = { amplifier_browser_bridge_setup_completed: setupCompleted };
+  globalThis.chrome = {
+    storage: {
+      local: {
+        get: async () => ({ ...stored }),
+        set: async (values) => Object.assign(stored, values),
+      },
+    },
+    runtime: { sendMessage: async () => ({ configured: setupCompleted, connected: false }) },
+    tabs: { query: async () => tabs },
+  };
+  if (clipboardThrows) {
+    globalThis.navigator = { clipboard: { readText: async () => { throw clipboardThrows; } } };
+  } else if (clipboardText !== null) {
+    globalThis.navigator = { clipboard: { readText: async () => clipboardText } };
+  } else {
+    globalThis.navigator = {};
+  }
+  return stored;
+}
+
+test("runPairingDiscovery auto-redeems from an already-open, origin-matching /setup tab with zero user interaction", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  const stored = installFakeChromeForDiscovery({
+    tabs: [{ id: 9, url: "http://100.124.126.19:8900/setup#pair=7F3K9-QXTM2@100.124.126.19:8900&exp=9999999999" }],
+  });
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "http://100.124.126.19:8900/pair/redeem");
+    return { ok: true, status: 200, json: async () => ({ ok: true, token: "b".repeat(32) }) };
+  };
+
+  const mod = await importOptionsFresh();
+  await mod.runPairingDiscovery();
+
+  assert.equal(stored.amplifier_browser_bridge_hub_url, "ws://100.124.126.19:8900/device");
+  assert.equal(stored.amplifier_browser_bridge_hub_token, "b".repeat(32));
+  assert.equal(stored.amplifier_browser_bridge_config_source, "paired");
+  assert.match(elements["pair-auto-status"].textContent, /paired automatically/i);
+  assert.equal(elements["pair-retry"].style.display, "none", "no retry button needed on success");
+});
+
+test("runPairingDiscovery REJECTS a hostile tab's code (origin mismatch) and never calls fetch for it", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  installFakeChromeForDiscovery({
+    tabs: [{ id: 66, url: "http://evil.example.com/whatever#pair=7F3K9-QXTM2@100.124.126.19:8900" }],
+  });
+  let fetchCalled = false;
+  globalThis.fetch = async () => {
+    fetchCalled = true;
+    throw new Error("must not be called for a rejected origin-mismatched tab");
+  };
+
+  const mod = await importOptionsFresh();
+  await mod.runPairingDiscovery();
+
+  assert.equal(fetchCalled, false);
+  assert.match(elements["pair-auto-status"].textContent, /no pairing code found nearby/i);
+  assert.equal(elements["pair-retry"].style.display, "", "retry button shown when nothing redeemable was found");
+});
+
+test("runPairingDiscovery falls back to the clipboard when no tab carries a pairing code", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  const stored = installFakeChromeForDiscovery({
+    tabs: [{ id: 1, url: "https://example.com/" }],
+    clipboardText: "7F3K9-QXTM2@100.124.126.19:8900",
+  });
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, token: "c".repeat(32) }) });
+
+  const mod = await importOptionsFresh();
+  await mod.runPairingDiscovery();
+
+  assert.equal(stored.amplifier_browser_bridge_hub_token, "c".repeat(32));
+  assert.match(elements["pair-auto-status"].textContent, /clipboard/i);
+});
+
+test("runPairingDiscovery treats a clipboard read failure (permission/focus/gesture) as 'nothing found', never a crash or user-facing error", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  installFakeChromeForDiscovery({ tabs: [], clipboardThrows: new Error("Document is not focused") });
+  globalThis.fetch = async () => {
+    throw new Error("must not be called");
+  };
+
+  const mod = await importOptionsFresh();
+  await mod.runPairingDiscovery();
+
+  assert.match(elements["pair-auto-status"].textContent, /no pairing code found nearby/i);
+  assert.equal(elements["pair-retry"].style.display, "");
+});
+
+test("runPairingDiscovery never runs auto-redeem at all when this device is already configured", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  installFakeChromeForDiscovery({
+    setupCompleted: true,
+    tabs: [{ id: 9, url: "http://100.124.126.19:8900/setup#pair=7F3K9-QXTM2@100.124.126.19:8900" }],
+  });
+  globalThis.fetch = async () => {
+    throw new Error("must never redeem automatically once already configured");
+  };
+
+  const mod = await importOptionsFresh();
+  await mod.runPairingDiscovery();
+
+  assert.match(elements["pair-auto-status"].textContent, /already paired/i);
+});
+
+test("Check again button re-runs discovery on click", async () => {
+  const elements = installFakeDom();
+  let captured = null;
+  elements["pair-retry"].addEventListener = (eventName, handler) => {
+    if (eventName === "click") captured = handler;
+  };
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  const stored = installFakeChromeForDiscovery({ tabs: [] }); // nothing found on the automatic pass
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, token: "d".repeat(32) }) });
+
+  await importOptionsFresh();
+  // Simulate a /setup tab opening AFTER the automatic pass already ran and found nothing.
+  globalThis.chrome.tabs.query = async () => [
+    { id: 5, url: "http://100.124.126.19:8900/setup#pair=7F3K9-QXTM2@100.124.126.19:8900" },
+  ];
+  await captured();
+
+  assert.equal(stored.amplifier_browser_bridge_hub_token, "d".repeat(32));
 });
 
 test("queryStatusOnce never throws and always returns an explicit ok/error result", async () => {

@@ -83,6 +83,35 @@ def test_render_setup_page_leads_with_purpose_not_defensive_copy() -> None:
     assert "no third-party relay" in html
 
 
+def test_render_setup_page_auto_copies_and_offers_a_copy_button() -> None:
+    """Maintainer feedback: "if we HAVE to copy and paste the pairing code,
+    can't we auto put it into the user's clipboard, and as a fallback have a
+    copy button next to it?" -- both must be present. The page is served over
+    plain http (see hub.py/pairing.py), so `navigator.clipboard` is undefined
+    (secure-context requirement) -- `execCommand("copy")` must be the PRIMARY
+    mechanism here, not merely mentioned as a fallback."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_artifact_available=False)
+    assert "copyText(code)" in html  # auto-copy fires the moment a code is shown
+    assert 'id="pair-copy-btn"' in html  # the visible fallback button
+    assert 'document.execCommand("copy")' in html
+    assert "secure context" in html  # the reasoning is documented, not assumed
+
+
+def test_render_setup_page_desktop_section_is_concise() -> None:
+    """Real-run maintainer feedback: the desktop section opened with a
+    four-sentence "what this does and does not do" paragraph on the path,
+    then six steps. The explanatory reasoning now lives behind its own
+    disclosure; the numbered steps a non-technical user must follow are down
+    to three."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_artifact_available=False)
+    assert "What this does and does not do" not in html
+    # The "why" is still present, but behind a nested <details>, not on the path.
+    assert "Why not one click?" in html
+    # Three steps, not five/six.
+    desktop_section = html.split("Desktop Edge (Windows")[1].split("Android (experimental)")[0]
+    assert desktop_section.count("<li>") == 3
+
+
 def test_render_setup_page_countdown_script_present() -> None:
     """human-advocate review finding: the ticket's real, short TTL had no visible
     countdown anywhere. The setup page now ticks one down from an `exp` fragment

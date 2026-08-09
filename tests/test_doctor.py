@@ -241,6 +241,24 @@ def test_doctor_network_exposure_includes_tailscale_acl_disclosure(tmp_path: Pat
     assert len(check.message) < 120
 
 
+def test_doctor_network_exposure_is_terse_for_the_common_clean_case(tmp_path: Path, token_file: Path) -> None:
+    """Real-run maintainer feedback: this check printed ~400 characters of ACL
+    explanation at what should be a success moment -- a specific, non-loopback,
+    non-wildcard tailnet-looking host with auth enabled. That case now gets one
+    short pointer instead of the full paragraph; the full explanation remains
+    for the cases that actually need it (see the other tests in this section)."""
+    with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value="100.124.126.19"):
+        checks = asyncio.run(run_doctor("ws://100.124.126.19:8900/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "network_exposure")
+    assert check.detail is not None
+    assert "allows every device on your tailnet" not in check.detail, (
+        "full paragraph should not print when nothing needs explaining"
+    )
+    assert "Tailscale ACL" in check.detail  # the load-bearing fact survives, just shorter
+    assert len(check.detail) < 150
+
+
 def test_doctor_network_exposure_flags_critical_combo_when_auth_disabled(tmp_path: Path) -> None:
     """Auth disabled + a non-loopback target is the specific dangerous
     combination this check exists to name loudly."""

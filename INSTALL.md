@@ -307,6 +307,7 @@ particular). In short:
 | `debugger` | Optional escalation for trusted (non-synthetic) input events and screenshotting a tab that isn't in the foreground. Not used unless a command specifically asks for it. |
 | `storage` | Stores the Hub URL/token you enter in Step 3, and this device's own identifier. |
 | `downloads`, `alarms`, `tabGroups` | Support specific commands (download claiming, keepalive, tab-group-aware addressing). |
+| `clipboardRead` | Lets the Settings page auto-fill a pairing code from your clipboard when no already-open pairing tab is found, so pairing needs no manual copy/paste. Never sent anywhere; only used if it looks like this project's own pairing code shape. |
 
 There is **no telemetry and no third party** -- the only network connection
 this extension makes is the WebSocket to the hub you configured in Step 3,

@@ -149,6 +149,10 @@ _STYLE = """
   }
   .muted { color: #8B949E; font-size: 0.9rem; }
   #pair-section-none, #pair-section-found { display: none; }
+  .copy-btn {
+    background: #21262D; color: #E6EDF3; border: 1px solid #30363D; border-radius: 6px;
+    padding: 4px 12px; font-size: 0.85rem; cursor: pointer; margin-top: 8px;
+  }
 """
 
 # Reused near-verbatim from the now-retired `scripts/serve-android-setup.py`
@@ -179,21 +183,20 @@ def _desktop_section(open_attr: str) -> str:
 <details data-platform="desktop"{open_attr}>
 <summary>Desktop Edge (Windows / macOS / Linux)</summary>
 <div class="honesty">
-  <b>What this does and does not do.</b> Chromium cannot install an extension
-  directly from a zip file -- there is no one-click install here. What changes
-  is that the file is now downloaded <b>onto this machine</b>, the one running
-  the browser, instead of you needing to find a path on the hub's filesystem.
-  You still unzip it and still pick the folder yourself in the next step.
+  Downloads to <b>this device</b>. You'll unzip it and load it below.
+  <details style="display:inline;"><summary style="display:inline;font-weight:normal;color:#8B949E;">Why not one click?</summary><br>
+  Chromium can't install an extension straight from a zip file -- there's no
+  one-click path. This just gets the file onto the machine running the
+  browser instead of the hub's, so the next steps are the only ones left.
+  </details>
 </div>
 <a class="dl" href="/setup/extension.zip" download>Download extension (.zip)</a>
 <ol>
-  <li>Unzip the downloaded file somewhere stable on this machine.</li>
-  <li>Open <code>edge://extensions</code>.</li>
-  <li>Toggle <b>Developer mode</b> on (bottom-left).</li>
-  <li>Click <b>Load unpacked</b> and select the unzipped folder.</li>
-  <li>The extension's Settings page should open automatically. If not, click
-      its toolbar icon.</li>
+  <li>Unzip the download.</li>
+  <li>Open <code>edge://extensions</code>, turn on <b>Developer mode</b>.</li>
+  <li>Click <b>Load unpacked</b> &rarr; pick the unzipped folder.</li>
 </ol>
+<div class="muted">Settings opens automatically. If not, click the toolbar icon.</div>
 </details>
 """
 
@@ -249,6 +252,35 @@ def _android_section(open_attr: str, *, artifact_available: bool) -> str:
 
 _PAIR_SCRIPT = """
 <script>
+// Best-effort clipboard copy. This page is served over plain http (the hub
+// deliberately never terminates TLS -- see hub.py/pairing.py), and the modern
+// Clipboard API (`navigator.clipboard`) requires a secure context (https or
+// localhost) -- it is simply UNDEFINED here. `execCommand("copy")` has no
+// such requirement and still works on an insecure origin, so it is the
+// PRIMARY mechanism on this page, not a fallback -- navigator.clipboard is
+// tried first only in case a future deployment ever does terminate TLS.
+// Never throws outward: a browser/policy that blocks copying entirely just
+// means the visible Copy button (real user gesture) is the fallback, and the
+// code is always ALSO shown as plain text regardless -- copying is a
+// convenience here, never the only way to get the code.
+function copyText(text) {
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(function () { execCommandCopy(text); });
+    return;
+  }
+  execCommandCopy(text);
+}
+function execCommandCopy(text) {
+  var ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); } catch (e) { /* best-effort */ }
+  document.body.removeChild(ta);
+}
 (function () {
   var hash = (window.location.hash || "").replace(/^#/, "");
   var params = new URLSearchParams(hash);
@@ -258,9 +290,22 @@ _PAIR_SCRIPT = """
   var none = document.getElementById("pair-section-none");
   var countdownEl = document.getElementById("pair-countdown");
   var expiredEl = document.getElementById("pair-expired");
+  var copyBtn = document.getElementById("pair-copy-btn");
   if (code) {
     document.getElementById("pair-code-value").textContent = code;
     found.style.display = "block";
+    // Auto-copy the moment the code is shown (maintainer feedback: never make
+    // the user copy something by hand when the page can just do it) -- the
+    // visible Copy button below is the fallback for whatever this can't reach.
+    copyText(code);
+    if (copyBtn) {
+      copyBtn.addEventListener("click", function () {
+        copyText(code);
+        var original = copyBtn.textContent;
+        copyBtn.textContent = "Copied";
+        setTimeout(function () { copyBtn.textContent = original; }, 1500);
+      });
+    }
     // Countdown (human-advocate review finding: the ticket's real, short TTL had
     // NO visible countdown anywhere -- a code could silently die mid-read with no
     // warning). `exp` is a Unix-epoch-seconds expiry, carried in the URL FRAGMENT
@@ -353,9 +398,10 @@ only power is bootstrapping one new device -- see <code>pairing.py</code>.
 <h2>2 &mdash; Pair with this hub</h2>
 <div id="pair-section-found" class="pair-box">
   <div class="pair-code" id="pair-code-value"></div>
+  <button id="pair-copy-btn" type="button" class="copy-btn">Copy</button>
   <div class="pair-countdown" id="pair-countdown"></div>
-  <div class="pair-hint">Open the extension's toolbar icon &rarr; Settings &rarr;
-  paste this under "Pair with a hub" &rarr; click Pair.</div>
+  <div class="pair-hint">Copied to your clipboard. Open the extension's Settings
+  &mdash; it should pair itself. If not, paste under "Enter a code by hand".</div>
   <div class="pair-expired" id="pair-expired" style="display:none;">This code has
   expired. Get a fresh one: <code>amplifier-browser-bridge pair</code></div>
 </div>

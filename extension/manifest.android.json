@@ -32,7 +32,8 @@
     "storage",
     "alarms",
     "downloads",
-    "tabGroups"
+    "tabGroups",
+    "clipboardRead"
   ],
   "host_permissions": [
     "<all_urls>"

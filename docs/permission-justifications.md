@@ -247,6 +247,50 @@ complete answer.**
 
 ---
 
+## 4. `clipboardRead`
+
+### What it grants
+
+Lets the extension call `navigator.clipboard.readText()` without a per-call
+permission prompt (Chrome's extension permission model grants this outright,
+unlike a normal web page, which needs a fresh user gesture and/or a focused
+document each time -- see `docs/designs/browser-bridge.md`'s pairing section
+for what was actually verified in practice). In principle this lets the
+extension read anything on the system clipboard, at any time its options page
+is open, not just a pairing code.
+
+### The defense
+
+Added specifically for zero-copy-paste pairing (options.js's
+`runPairingDiscovery`): if no already-open `/setup` tab carries a pairing code
+(the preferred, origin-checked mechanism -- see `pair_discovery.mjs`), the
+options page falls back to the clipboard as the next-best "the user shouldn't
+have to type or paste anything" rung, before finally asking for a manual
+paste. What is read is validated with the exact same parser the manual-entry
+field uses (`parsePairingCode`) -- content that doesn't look like this
+project's own `ticket@host:port` shape is discarded immediately and never
+displayed, logged, or transmitted anywhere. The clipboard is never written
+here at all (only read); nothing this extension does puts anything new on it.
+
+### Where this defense is honestly weaker than it sounds
+
+- **The permission itself is not scoped to "only during pairing."** Chrome's
+  manifest model is all-or-nothing, same limitation named for `chrome.debugger`
+  above -- the extension technically *could* read the clipboard at other
+  times; it simply doesn't, in this version of this codebase.
+- **A pairing code is short-lived and narrow in what it can do on its own**
+  (see `pairing.py`'s module docstring), which bounds the actual harm of a
+  clipboard read finding something it shouldn't -- but that is a property of
+  what gets validated and acted on, not a limit the permission grant itself
+  enforces.
+
+**Verdict: honestly justifiable -- the capability is used for exactly one
+narrow purpose, validated before use, and only ever read, but the permission
+Chrome actually grants is broader than that one purpose, same pattern as
+every other permission in this document.**
+
+---
+
 ## Summary for a time-pressed reviewer
 
 | Permission | Can be honestly defended as-is? | Caveat |
@@ -254,6 +298,7 @@ complete answer.**
 | `<all_urls>` | Yes, as a deliberate design choice | Compensating controls live entirely outside the manifest, in a trusted hub process; the denylist is short and hand-maintained |
 | `chrome.debugger` | **Only partially** | Two narrow use cases; permission granted is far broader than either, requested unconditionally rather than lazily -- treat a "no" here as reasonable, not a misunderstanding |
 | Persistent hub WebSocket | Yes, conditionally | Depends entirely on the user's own hub deployment being sound; the extension cannot verify this |
+| `clipboardRead` | Yes, as a narrow, validated-before-use fallback | The grant itself is broader than the one purpose it's used for -- same limitation as every Chrome permission in this document |
 
 If you are approving a force-install policy or a store submission and need
 exactly one takeaway: **`chrome.debugger` is the permission this document
