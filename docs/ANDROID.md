@@ -257,33 +257,54 @@ device. That is a genuinely different question -- see the final section.
    # http://<this-machine's-tailnet-IP>:8765/amplifier-browser-bridge-android-v0.4.0.bin
    ```
 
-   **Preferred: point the hub itself at the artifact instead of running a
-   second server.** An earlier version of this project ran a separate,
-   hand-rolled ~10KB HTTP server (`scripts/serve-android-setup.py`) just for
-   this -- a second listener, on a second port, that two design/product
-   council reviews both flagged as "two unbridged mechanisms nobody
-   reconciled" against the desktop onboarding path. That script is retired.
-   The hub (already running for the desktop path -- see INSTALL.md) now
-   serves the identical bytes, plus the identical experimental framing this
-   document opens with, from its own `GET /setup` page:
+   **Preferred, and now the default: let the hub build it for you.** An
+   earlier version of this project ran a separate, hand-rolled ~10KB HTTP
+   server (`scripts/serve-android-setup.py`) just for this -- a second
+   listener, on a second port, that two design/product council reviews both
+   flagged as "two unbridged mechanisms nobody reconciled" against the
+   desktop onboarding path. That script is retired. The hub (already running
+   for the desktop path -- see INSTALL.md) now serves the artifact itself
+   from its own `GET /setup/android-extension.bin` route -- and, unlike
+   earlier versions of this project, does not require an operator to have
+   run `scripts/package-android.sh` by hand first:
+
    ```bash
-   amplifier-browser-bridge hub --host "$(tailscale ip -4)" --port 8900 \
-     --android-artifact dist/android/amplifier-browser-bridge-android-v0.4.0.bin
+   amplifier-browser-bridge hub --host "$(tailscale ip -4)" --port 8900
    # then, on the phone's browser: http://<that tailnet IP>:8900/setup
-   # (auto-detects it's a phone from the User-Agent and opens the Android
-   # section; the desktop section on the same page is what a laptop/desktop
-   # visiting the SAME URL sees instead)
+   # -> "Android (experimental)" -> the hub packs a real, signed CRX3 on
+   # the spot, baked from ITS OWN currently-running token (android_pack.py),
+   # and serves it. No --android-artifact flag, no manual build step.
    ```
-   Already running the hub as a service (`amplifier-browser-bridge service
-   install`)? Pass the same `--android-artifact <path>` to that command
-   instead -- it bakes into the service unit the same way `--host`/`--port`
-   already do. Without `--android-artifact`, the hub's `/setup` page still
-   shows the Android section (so the phone-side instructions/warnings are
-   visible either way) but has no working download link, and
-   `GET /setup/android-extension.bin` 404s with an actionable message rather
-   than silently serving nothing.
-   It refuses to start if the named artifact is missing, and serves everything
-   except `/setup` as an opaque `application/octet-stream` attachment.
+
+   **This on-demand path requires a real Chromium/Chrome/Edge binary on the
+   host running the hub** -- packing a genuine, installable CRX3 (`Cr24`
+   magic + a signed header, never a hand-rolled zip -- see "Two packaging
+   traps" above) is not possible without one. `android_pack.py`'s
+   `find_packer_binary()` checks, in order: `CHROME_BIN`, then
+   `microsoft-edge`/`google-chrome`/`chromium` on `PATH`, then Playwright's
+   own bundled Chromium cache (`~/.cache/ms-playwright` by default) -- which
+   is what this project's own dev host uses, since it has no system browser
+   installed at all. If none of those resolve to a real binary, the
+   `/setup/android` page shows an honest "no build available on this hub
+   yet" message naming exactly what's missing (e.g. "set CHROME_BIN to a
+   real browser binary") -- it never shows a download link that would 404 or
+   silently fail.
+
+   **A pre-built static artifact still works, and always takes priority.**
+   If you'd rather build once with `scripts/package-android.sh` and pin a
+   specific file (e.g. no browser binary on the hub host, or you want a
+   reproducible artifact you control), pass `--android-artifact <path>` to
+   `hub` (or `service install`, which bakes it into the service unit the same
+   way `--host`/`--port` already do) exactly as before -- it is checked
+   FIRST, before any on-demand packing is attempted.
+
+   **The Android section of `/setup` is now its own page,
+   `/setup/android`** (linked from `/setup`'s step 1), not a disclosure on
+   the main page -- it remained the heaviest thing on `/setup` even
+   collapsed, since a `<details>` element still ships its entire subtree in
+   the HTML response. Splitting it out keeps the primary desktop path short
+   while giving Android's credential warning, install steps, and "Known
+   limits" section their own page to be as thorough as they need to be.
 2. **On the phone**, once the `.bin` file is downloaded, use a file manager (e.g.
    My Files) to rename it back to `.crx` before the install step below.
 3. **Enable Developer Options in Edge Canary**, if not already done: Settings ->

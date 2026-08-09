@@ -205,6 +205,80 @@ async def test_redeem_does_not_require_the_agent_token_at_all(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_pair_status_is_pending_before_redemption(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    raw_ticket = hub._handle_create_pairing({})["ticket"]
+    async with TestServer(hub.build_app()) as server, AiohttpTestClient(server) as client:
+        resp = await client.post("/pair/status", json={"ticket": raw_ticket})
+        assert resp.status == 200
+        body = await resp.json()
+    assert body == {"ok": True, "status": "pending"}
+
+
+@pytest.mark.asyncio
+async def test_pair_status_flips_to_redeemed_after_a_real_redemption(tmp_path: Path) -> None:
+    """The real bug this closes: the `/setup` page must be able to learn --
+    without redeeming the ticket itself -- that ITS OWN code was redeemed by
+    the extension's options page (a different tab, possibly a different
+    device), so it can flip from a live countdown to "Connected" instead of
+    silently continuing to count down a code that has already been used."""
+    hub = _hub(tmp_path)
+    raw_ticket = hub._handle_create_pairing({})["ticket"]
+    async with TestServer(hub.build_app()) as server, AiohttpTestClient(server) as client:
+        redeem_resp = await client.post("/pair/redeem", json={"ticket": raw_ticket, "device_id": "dev-1"})
+        assert (await redeem_resp.json())["ok"] is True
+
+        status_resp = await client.post("/pair/status", json={"ticket": raw_ticket})
+        assert status_resp.status == 200
+        body = await status_resp.json()
+    assert body == {"ok": True, "status": "redeemed"}
+
+
+@pytest.mark.asyncio
+async def test_pair_status_is_unknown_for_a_ticket_that_never_existed(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    async with TestServer(hub.build_app()) as server, AiohttpTestClient(server) as client:
+        resp = await client.post("/pair/status", json={"ticket": "NOTREAL123"})
+        body = await resp.json()
+    assert body == {"ok": True, "status": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_pair_status_requires_a_ticket_field(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    async with TestServer(hub.build_app()) as server, AiohttpTestClient(server) as client:
+        resp = await client.post("/pair/status", json={})
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["ok"] is False
+        assert "ticket" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_pair_status_rejects_malformed_json_body(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    async with TestServer(hub.build_app()) as server, AiohttpTestClient(server) as client:
+        resp = await client.post(
+            "/pair/status", data="not json", headers={"Content-Type": "application/json"}
+        )
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_pair_status_never_requires_the_agent_token(tmp_path: Path) -> None:
+    """Same asymmetry as `/pair/redeem` (see pairing.py's module docstring):
+    a status check reveals only the state of a ticket the caller already
+    holds the code for, so it is unauthenticated by design."""
+    hub = _hub(tmp_path)
+    raw_ticket = hub._handle_create_pairing({})["ticket"]
+    async with TestServer(hub.build_app()) as server, AiohttpTestClient(server) as client:
+        resp = await client.post("/pair/status", json={"ticket": raw_ticket})
+        assert resp.status == 200
+
+
+@pytest.mark.asyncio
 async def test_create_pairing_over_the_real_agent_ws_route_requires_the_token(tmp_path: Path) -> None:
     """The MINTING half of the asymmetry, proven over the real wire route (not
     just the internal handler): an agent connection with no/wrong token cannot

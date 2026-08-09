@@ -64,6 +64,7 @@ from typing import Any
 from aiohttp import ContentTypeError, WSMsgType, web
 
 from .addressing import Target, TargetError
+from .android_pack import AndroidPackError, PackerUnavailableError, build_android_crx, find_packer_binary
 from .args_bool import truthy
 from .audit import AuditLog
 from .auth import TokenStore, persist_device_token
@@ -71,7 +72,7 @@ from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .effects import EffectsReport
 from .extension_integrity import ExtensionIntegrityError
 from .extension_zip import build_extension_zip_bytes
-from .onboarding import detect_platform, render_setup_page
+from .onboarding import detect_platform, render_android_setup_page, render_setup_page
 from .pairing import DEFAULT_TICKET_TTL_SECONDS, PairingError, PairingStore, format_ticket
 from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
 from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
@@ -306,6 +307,15 @@ class Hub:
         # stale or wrong artifact by accident would hand out a live
         # credential (see android_bake.py) to the wrong build.
         self.android_artifact = android_artifact
+        # On-demand Android packing (android_pack.py) -- when no static
+        # `--android-artifact` is configured, the hub can build one itself,
+        # from its OWN currently-running token, the moment a browser asks for
+        # it (see android_pack.py's module docstring for why the artifact
+        # must always be baked from the LIVE token rather than a stale one).
+        # Cached by the token actually baked in last time, so repeated
+        # requests are fast and a token rotation (`init --force`) is picked
+        # up on the very next request rather than serving a stale credential.
+        self._android_pack_cache: tuple[str, bytes] | None = None
         if not token_store.auth_enabled:
             logger.warning(
                 "No hub token configured (AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN / token file) -- running with "
@@ -323,6 +333,16 @@ class Hub:
         # unauthenticated-by-token route is the correct design here, bounded
         # instead by the ticket's own short TTL/single-use/attempt-count limits.
         app.router.add_post("/pair/redeem", self._handle_pair_redeem)
+        # Read-only redemption-status poll (pairing.py's `PairingStore.status`,
+        # this module's "Onboarding" section below) -- the `/setup` page polls
+        # this on the same ~1s cadence as its own visible countdown to learn
+        # that ITS code was redeemed elsewhere and flip waiting -> paired,
+        # instead of continuing to count down a code that has already been
+        # used (see onboarding.py's module docstring for the bug this closes).
+        # Unauthenticated for the identical bootstrapping reason `/pair/redeem`
+        # is: the only thing it reveals is the state of a ticket the caller
+        # already possesses the code for.
+        app.router.add_post("/pair/status", self._handle_pair_status)
         # Onboarding routes (this module's "Onboarding" section below,
         # onboarding.py, extension_zip.py) -- deliberately plain HTTP, NOT
         # gated by the long-lived token, for the identical bootstrapping
@@ -332,6 +352,7 @@ class Hub:
         # do not expose.
         app.router.add_get("/setup", self._handle_setup_page)
         app.router.add_get("/setup/extension.zip", self._handle_setup_extension_zip)
+        app.router.add_get("/setup/android", self._handle_setup_android_page)
         app.router.add_get("/setup/android-extension.bin", self._handle_setup_android_artifact)
         # Background soft-detach sweep (design doc §6.3/§7) -- started/stopped
         # via aiohttp's own app lifecycle so `cli.py`'s `hub` command needs no
@@ -457,7 +478,19 @@ class Hub:
             platform=platform,
             host=host,
             port=port,
-            android_artifact_available=self.android_artifact is not None,
+            android_available=self._android_download_available(),
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    async def _handle_setup_android_page(self, request: web.Request) -> web.Response:
+        host = request.url.host or "127.0.0.1"
+        port = request.url.port or DEFAULT_PORT
+        available = self._android_download_available()
+        html = render_android_setup_page(
+            host=host,
+            port=port,
+            download_available=available,
+            unavailable_reason=None if available else self._android_unavailable_reason(),
         )
         return web.Response(text=html, content_type="text/html")
 
@@ -476,23 +509,78 @@ class Hub:
             headers={"Content-Disposition": 'attachment; filename="amplifier-browser-bridge-extension.zip"'},
         )
 
+    # ------------------------------------------------------------------
+    # On-demand Android packing (android_pack.py) -- see this class's
+    # `_android_pack_cache` field comment and android_pack.py's module
+    # docstring for the "why" behind on-demand-from-the-live-token packing.
+    # ------------------------------------------------------------------
+
+    def _android_download_available(self) -> bool:
+        """True iff `GET /setup/android-extension.bin` will actually produce
+        bytes right now -- a configured static artifact, OR (since no static
+        artifact is a hard requirement, only a convenience) a host capable of
+        packing one on demand. Never claims availability it can't back up --
+        see this module's `_handle_setup_android_artifact`."""
+        if self.android_artifact is not None and self.android_artifact.is_file():
+            return True
+        return find_packer_binary() is not None
+
+    def _android_unavailable_reason(self) -> str:
+        """A short, honest, actionable explanation for why the Android
+        download isn't available right now -- never a vague "something went
+        wrong". See android_pack.py's `PackerUnavailableError`."""
+        return (
+            "this hub can't build a package right now -- no Chromium/Chrome/Edge binary was "
+            "found to pack a CRX with. An operator can fix this by setting CHROME_BIN to a real "
+            "browser binary on this host, or by pre-building with scripts/package-android.sh and "
+            "restarting the hub with --android-artifact <path> (see docs/ANDROID.md)."
+        )
+
+    async def _get_or_pack_android_artifact(self, *, host: str, port: int) -> bytes:
+        """Return the Android CRX bytes to serve, packing on demand (and
+        caching the result, keyed by the token actually baked in) if no
+        static `--android-artifact` was configured. Raises `AndroidPackError`
+        (including its `PackerUnavailableError` subclass) on failure -- the
+        caller turns that into an honest HTTP response, never a silently
+        broken download."""
+        hub_token = self.token_store.default_token or ""
+        cache_key = f"ws://{host}:{port}/device|{hub_token}"
+        if self._android_pack_cache is not None and self._android_pack_cache[0] == cache_key:
+            return self._android_pack_cache[1]
+
+        data = await build_android_crx(hub_url=f"ws://{host}:{port}/device", hub_token=hub_token)
+        self._android_pack_cache = (cache_key, data)
+        return data
+
     async def _handle_setup_android_artifact(self, request: web.Request) -> web.Response:
-        if self.android_artifact is None or not self.android_artifact.is_file():
+        if self.android_artifact is not None and self.android_artifact.is_file():
+            # Served as an opaque octet-stream `.bin` regardless of the source
+            # file's own extension -- the same fix `scripts/serve-android-setup.py`
+            # (now retired) applied for the same reason: Chromium intercepts a
+            # `.crx`-recognized download and Edge Android silently discards it.
+            # See docs/ANDROID.md's "Two packaging traps".
+            data = self.android_artifact.read_bytes()
+            filename = f"{self.android_artifact.stem}.bin"
             return web.Response(
-                status=404,
-                text=(
-                    "no Android artifact configured on this hub -- build one with "
-                    "scripts/package-android.sh and restart the hub with "
-                    "--android-artifact <path to the .crx/.bin file> (see docs/ANDROID.md)"
-                ),
+                body=data,
+                content_type="application/octet-stream",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
-        # Served as an opaque octet-stream `.bin` regardless of the source
-        # file's own extension -- the same fix `scripts/serve-android-setup.py`
-        # (now retired) applied for the same reason: Chromium intercepts a
-        # `.crx`-recognized download and Edge Android silently discards it.
-        # See docs/ANDROID.md's "Two packaging traps".
-        data = self.android_artifact.read_bytes()
-        filename = f"{self.android_artifact.stem}.bin"
+
+        host = request.url.host or "127.0.0.1"
+        port = request.url.port or DEFAULT_PORT
+        try:
+            data = await self._get_or_pack_android_artifact(host=host, port=port)
+        except PackerUnavailableError as e:
+            # Honest, actionable unavailability -- never a download that 404s
+            # or serves something broken with no explanation (see
+            # android_pack.py's module docstring).
+            return web.Response(status=503, text=str(e))
+        except AndroidPackError as e:
+            logger.error("on-demand Android packing failed for /setup/android-extension.bin: %s", e)
+            return web.Response(status=500, text=f"could not build Android package: {e}")
+
+        filename = "amplifier-browser-bridge-android.bin"
         return web.Response(
             body=data,
             content_type="application/octet-stream",
@@ -1121,6 +1209,32 @@ class Hub:
             "pairing_redeemed", device_id=device_id, label=label, platform=platform, persisted=persisted
         )
         return web.json_response({"ok": True, "token": token, "device_id": device_id, "persisted": persisted})
+
+    async def _handle_pair_status(self, request: web.Request) -> web.Response:
+        """`POST /pair/status` -- read-only redemption-status poll for a ticket
+        (`pairing.py`'s `PairingStore.status`; see this module's `build_app`
+        comment on this route for the full reasoning). Returns
+        `{"ok": true, "status": "pending" | "redeemed" | "unknown"}`.
+
+        Deliberately POST (ticket in the JSON body), not GET-with-query-string,
+        even though this never mutates anything -- matching `/pair/redeem`'s own
+        shape keeps the ticket out of the kind of URL/query-string logging a GET
+        request commonly attracts, for a value that (while low-sensitivity and
+        short-lived) is still a real bootstrap credential.
+        """
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ContentTypeError, UnicodeDecodeError):
+            return web.json_response({"ok": False, "error": "request body must be JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "request body must be a JSON object"}, status=400)
+
+        raw_ticket = body.get("ticket")
+        if not isinstance(raw_ticket, str) or not raw_ticket:
+            return web.json_response({"ok": False, "error": "'ticket' is required"}, status=400)
+
+        status = self.pairing.status(raw_ticket)
+        return web.json_response({"ok": True, "status": status})
 
     def _maybe_seal_session(self, session_id: str | None) -> None:
         """Seal a session the first time any of its commands yields page

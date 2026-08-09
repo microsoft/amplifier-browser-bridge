@@ -207,17 +207,22 @@ built into it (minted right after the hub comes up, not later):
 ```
 
 Opening that link (on the browser being paired) shows the same code with a live
-countdown -- click the extension's toolbar icon, open **Settings**, paste it
-into **"Pair with a hub"**, and click **Pair**. It fetches the Hub URL and a
-freshly-minted token automatically, so there is nothing else to copy by hand.
-Once the hub sees the connection, `init` continues on its own -- there is no
-"did you finish?" prompt to answer. If nothing connects within a few minutes,
-`init` falls back to asking once; if the code expires before then, it also
-prints the exact command to mint a fresh one.
+countdown. Usually you don't need to do anything else: the moment the
+extension's options page opens (Step 2 above), it scans open tabs and the
+clipboard for that same code and redeems it on its own -- the options page's
+step 2 flips straight to "Connected" with no paste required. If it doesn't
+connect within a few seconds, open **"It didn't connect on its own"** on the
+setup page (or **"Enter a code by hand"** on the options page) and paste the
+code manually, then click **Pair**. Either way, the Hub URL and a
+freshly-minted token are fetched automatically -- there is nothing else to
+copy by hand. Once the hub sees the connection, `init` continues on its own --
+there is no "did you finish?" prompt to answer. If nothing connects within a
+few minutes, `init` falls back to asking once; if the code expires before
+then, it also prints the exact command to mint a fresh one.
 
 **Configuring manually instead** (piped/non-interactive `init`, or you just
 prefer typing both values in yourself)? On the options page opened in Step 2,
-choose "Manual configuration (advanced)":
+open **"Manual setup"**:
 
 - **Hub URL**: paste the URL `init` printed (`ws://<host>:<port>/device`).
 - **Token**: paste the token `init` printed.

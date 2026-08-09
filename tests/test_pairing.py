@@ -9,6 +9,7 @@ import pytest
 
 from amplifier_browser_bridge.pairing import (
     MAX_REDEEM_ATTEMPTS,
+    REDEEMED_TOMBSTONE_SECONDS,
     TICKET_ALPHABET,
     TICKET_LENGTH,
     PairingError,
@@ -61,7 +62,10 @@ def test_redeem_succeeds_exactly_once() -> None:
 
     redeemed = store.redeem(record.ticket, now=1001.0)
     assert redeemed.ticket == record.ticket
-    assert len(store) == 0  # single-use: gone from the store immediately
+    # NOT deleted immediately -- tombstoned (kept, marked redeemed) so status()
+    # can still report "redeemed" within the grace window. See test_status_*.
+    assert len(store) == 1
+    assert store._tickets[record.ticket].redeemed_at == 1001.0  # type: ignore[attr-defined]
 
     with pytest.raises(PairingError, match="unknown or already-used"):
         store.redeem(record.ticket, now=1002.0)
@@ -119,3 +123,66 @@ def test_create_purges_expired_tickets_opportunistically() -> None:
 
     store.create(ttl_seconds=600.0, now=2000.0)  # far past the first ticket's expiry
     assert len(store) == 1  # the expired one was purged; only the fresh one remains
+
+
+# --- status() -- read-only redemption polling (onboarding.py's /setup fix) -----
+
+
+def test_status_is_pending_for_a_fresh_ticket() -> None:
+    store = PairingStore()
+    record = store.create(now=1000.0)
+    assert store.status(record.ticket, now=1000.5) == "pending"
+
+
+def test_status_is_unknown_for_a_ticket_that_never_existed() -> None:
+    store = PairingStore()
+    assert store.status("NOTATICKET1", now=1000.0) == "unknown"
+
+
+def test_status_flips_to_redeemed_after_redeem_succeeds() -> None:
+    store = PairingStore()
+    record = store.create(now=1000.0)
+    store.redeem(record.ticket, now=1001.0)
+    assert store.status(record.ticket, now=1001.5) == "redeemed"
+
+
+def test_status_never_mutates_attempts_or_burns_the_ticket() -> None:
+    """The core regression this exists to prevent: a ~1s poll must never count
+    against MAX_REDEEM_ATTEMPTS, or a long enough wait would invalidate a
+    ticket the user never even tried to redeem."""
+    store = PairingStore()
+    record = store.create(now=1000.0)
+    for i in range(MAX_REDEEM_ATTEMPTS + 5):
+        assert store.status(record.ticket, now=1000.0 + i) == "pending"
+    # Still fully redeemable after all that polling (well within the ticket's TTL).
+    redeemed = store.redeem(record.ticket, now=1030.0)
+    assert redeemed.ticket == record.ticket
+
+
+def test_status_is_unknown_once_the_tombstone_grace_window_elapses() -> None:
+    store = PairingStore()
+    record = store.create(now=1000.0)
+    store.redeem(record.ticket, now=1001.0)
+    assert store.status(record.ticket, now=1001.0 + REDEEMED_TOMBSTONE_SECONDS - 1) == "redeemed"
+    assert store.status(record.ticket, now=1001.0 + REDEEMED_TOMBSTONE_SECONDS + 1) == "unknown"
+
+
+def test_status_is_unknown_for_an_expired_never_redeemed_ticket_without_purging_it_here() -> None:
+    """status() is read-only -- it must not purge an expired-but-unredeemed
+    record itself (that stays redeem()/create()'s job); it just reports
+    "unknown" honestly either way."""
+    store = PairingStore()
+    record = store.create(ttl_seconds=10.0, now=1000.0)
+    assert store.status(record.ticket, now=1500.0) == "unknown"
+
+
+def test_redeem_a_second_time_after_tombstoning_still_fails_the_same_way() -> None:
+    """A tombstoned (not yet purged) ticket must still behave, from redeem()'s
+    perspective, exactly like a ticket that was never valid -- the existing
+    single-use guarantee must not weaken just because the record now lingers
+    for status()'s benefit."""
+    store = PairingStore()
+    record = store.create(now=1000.0)
+    store.redeem(record.ticket, now=1001.0)
+    with pytest.raises(PairingError, match="unknown or already-used"):
+        store.redeem(record.ticket, now=1002.0)  # tombstone still present, not yet purged

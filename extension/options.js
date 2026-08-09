@@ -4,6 +4,20 @@
 // config_validate.mjs for the shared validation logic and background.js's "Runtime
 // configuration" section for why this replaced the old tracked extension/config.js.
 //
+// One ladder, two screens (docs/designs/onboarding-ux.md): this page and the hub's
+// `/setup` page render the SAME three-step ladder off the same copy-pasted CSS token
+// block (see options.html's <style> and onboarding.py's `_TOKENS_CSS` --
+// tests/test_shared_design_tokens.py guards the two staying byte-identical). Step 1
+// ("Extension installed") is always done -- this page running proves it. Step 2
+// ("Connect it" / "Connected to <host>") collapses to a single done line the moment
+// this device has ever been paired. Step 3 is the dynamic slot: the same four-class
+// status vocabulary this file has always used (ok/pending/alert), now expressed as
+// this step's own marker/title/context, with its body holding either the pairing
+// controls (while unpaired) or the post-pairing payload -- the moment the product
+// finally says what it's for: what the agent can see, what it can do, and "you can
+// close this tab." `renderLadder` below is the single place that decides all of this;
+// `renderStatus`'s prior job (four-class status text) is now folded into it.
+//
 // Status-query fail-loud discipline (bug report, 2026-08): this file used to have two
 // silent `return`s in its status query -- one in a bare `catch`, one on `!response` --
 // plus a fixed three-poll retry (500/2000/5000ms) after Save. If EVERY attempt took a
@@ -21,11 +35,11 @@
 // Pairing (design/product council review, 2026-08): the primary configuration path is
 // now "Pair with a hub" -- a single pairing code (from `amplifier-browser-bridge pair`)
 // replaces hand-transcribing a raw ws:// URL and a 32-hex token into two separate
-// fields. The Hub URL/Token fields still exist (collapsed under "Manual configuration
-// (advanced)" in options.html) for scripting, dev hubs with no running pairing session,
-// or an operator who prefers typing values directly -- pairing does not remove that
-// capability, it just stops being the default path. See pairing_code.mjs for the code
-// parser and src/amplifier_browser_bridge/pairing.py for the server-side ticket design
+// fields. The Hub URL/Token fields still exist (collapsed under "Manual setup" in
+// options.html) for scripting, dev hubs with no running pairing session, or an operator
+// who prefers typing values directly -- pairing does not remove that capability, it
+// just stops being the default path. See pairing_code.mjs for the code parser and
+// src/amplifier_browser_bridge/pairing.py for the server-side ticket design
 // (entropy/lifetime/threat-model reasoning).
 //
 // Zero-copy-paste pairing (real-run maintainer feedback, 2026-08): typing/pasting a
@@ -43,45 +57,32 @@
 // an auto-redeem is only appropriate for a brand-new, never-paired install, never a
 // silent re-pair against whatever `/setup` tab happens to be open later.
 //
-// Connection-status detail (craft-inspector / human-advocate review, 2026-08): the
-// status line used to collapse EVERY "configured but not connected" cause into one
-// generic sentence -- a hub that's unreachable and a hub that rejected this device's
-// token rendered identically, and there was no error text identifying which. That is a
-// WCAG 3.3.1 (Error Identification) gap: an error occurred with no error identified.
-// `renderStatus` below now branches on `response.lastError.code` (background.js,
-// connection_error.mjs) so "hub unreachable", "token rejected", and "connected and
-// working" are each their own distinct, actionable message.
-//
-// Pre-pair state authorship (real-run bug report + craft-inspector/emotion-reader
-// review, 2026-08): "not configured yet" is the FIRST thing a brand-new user sees --
-// and until this fix it rendered with the identical red `.warn` styling as a genuine
-// error (hub unreachable, token rejected). A user who has done nothing wrong yet saw
-// what looks like a failure. The fix is a THIRD authored state, `.pending` (calm,
-// neutral blue, options.html) -- for "expected, not done yet" rather than "something
-// is wrong". It is used here for the fresh-install case and for "configured but no
-// lastError yet" (the first moment after Save/Pair, before the hub round trip has had
-// time to succeed OR fail -- also expected, also not an error). `.warn` remains
-// reserved for states that name an actual, confirmed problem: a stale pre-rename
-// config (legacyConfigDetected -- something really did break), and every branch that
-// carries a concrete `lastError` code.
+// Auto-pair provenance (docs/designs/onboarding-ux.md section 6.1): a new storage flag,
+// `amplifier_browser_bridge_paired_auto`, is set true ONLY by the auto-discovery path
+// (`tryAutoRedeem`) -- never by the manual "Pair"/"Save" buttons. It drives the ONE
+// conditional line under step 2 ("Paired automatically -- nothing to copy.") that
+// replaces the old, always-visible provenance paragraph (deleted -- it explained a
+// mechanism to a user who watched it happen, in a state where it may not even be true).
+// The full provenance description still exists, computed live from CURRENT storage
+// state, but moved into the "Connection details" disclosure (see
+// `renderConnectionDetails`) -- useful diagnostic info once actually connected, no
+// longer a paragraph sitting on the path before anything has happened.
 
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
 import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
 import { parsePairingCode, buildDeviceWsUrl, buildRedeemUrl } from "./pairing_code.mjs";
 import { discoverPairingCandidate } from "./pair_discovery.mjs";
 
-const urlInput = document.getElementById("hub-url");
-const tokenInput = document.getElementById("hub-token");
-const toggleTokenLink = document.getElementById("toggle-token");
-const errorEl = document.getElementById("error");
-const statusEl = document.getElementById("status");
-const saveButton = document.getElementById("save");
-const provenanceEl = document.getElementById("provenance");
-const pairCodeInput = document.getElementById("pair-code");
-const pairErrorEl = document.getElementById("pair-error");
-const pairButton = document.getElementById("pair");
-const pairAutoStatusEl = document.getElementById("pair-auto-status");
-const pairRetryButton = document.getElementById("pair-retry");
+const step2El = document.getElementById("step-2");
+const step2TitleEl = document.getElementById("step-2-title");
+const step2AutoLineEl = document.getElementById("step-2-auto-line");
+const step3El = document.getElementById("step-3");
+const step3MarkerEl = document.getElementById("step-3-marker");
+const step3TitleEl = document.getElementById("step-3-title");
+const step3LineEl = document.getElementById("step-3-line");
+const step3BodyEl = document.getElementById("step-3-body");
+const pairingControlsTpl = document.getElementById("tpl-pairing-controls");
+const readyPayloadTpl = document.getElementById("tpl-ready-payload");
 
 // Storage key mirrored from persistConfigAndPoll below -- checked BEFORE any
 // auto-discovery attempt runs. An already-paired device must never be
@@ -89,30 +90,17 @@ const pairRetryButton = document.getElementById("pair-retry");
 // happens to be open; auto-discovery is for first-run only. See this file's
 // module docstring.
 const SETUP_COMPLETED_STORAGE_KEY = "amplifier_browser_bridge_setup_completed";
-
-// Renders the "where did these values come from" line -- see bundled_config.mjs's
-// describeConfigProvenance for why this exists: a field silently pre-filled with a baked
-// hub URL/token, with no indication it wasn't typed by a human, is exactly how someone
-// ends up debugging a stale token for an hour with no idea where it came from.
-function renderProvenance({ configSource, configBundledAt }) {
-  if (!provenanceEl) return; // defensive -- absent only if options.html and this file drift apart
-  const text = describeConfigProvenance({ configSource, configBundledAt });
-  provenanceEl.textContent = text || "";
-}
+const PAIRED_AUTO_STORAGE_KEY = "amplifier_browser_bridge_paired_auto";
 
 async function loadCurrentValues() {
   const stored = await chrome.storage.local.get([
     "amplifier_browser_bridge_hub_url",
     "amplifier_browser_bridge_hub_token",
-    "amplifier_browser_bridge_config_source",
-    "amplifier_browser_bridge_config_bundled_at",
   ]);
+  const urlInput = document.getElementById("hub-url");
+  const tokenInput = document.getElementById("hub-token");
   if (urlInput) urlInput.value = stored.amplifier_browser_bridge_hub_url || "";
   if (tokenInput) tokenInput.value = stored.amplifier_browser_bridge_hub_token || "";
-  renderProvenance({
-    configSource: stored.amplifier_browser_bridge_config_source,
-    configBundledAt: stored.amplifier_browser_bridge_config_bundled_at,
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +133,18 @@ function platformLabel() {
   return "edge-unknown";
 }
 
+// Extracts "host:port" from a stored ws://host:port/device URL, for step 2's
+// "Connected to <host>" title -- falls back to the raw URL if parsing fails
+// for any reason (never throws, never shows a blank title).
+function hostPortFromHubUrl(hubUrl) {
+  try {
+    const parsed = new URL(hubUrl);
+    return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+  } catch {
+    return hubUrl;
+  }
+}
+
 // Sends the status query exactly once. NEVER throws and NEVER returns a bare
 // value the caller could confuse with a real answer -- always `{ ok: true,
 // response }` (a real answer arrived) or `{ ok: false, error }` (it didn't, for
@@ -171,82 +171,130 @@ async function queryStatusOnce() {
   return { ok: true, response };
 }
 
-// Renders a REAL response. This is the only place allowed to show a "we know the truth"
-// status -- every branch here is an honest description of what the background script
-// just told us, never an assumption about what it's probably still doing.
-//
-// Three distinguishable "not connected" causes (craft-inspector / human-advocate
-// review, see this file's module docstring): `response.lastError.code` is one of
-// "auth_rejected" (the hub rejected this device's token), "unreachable" (nothing
-// answered at the configured address), or "hub_error" (the hub returned some other
-// error) -- see connection_error.mjs for exactly how background.js derives this.
-// `lastError` is `null` when the most recent attempt is still in flight (e.g. right
-// after a fresh Save/Pair) -- that case falls through to the pre-existing generic
-// message, which remains honest ("not connected yet," not "here's why").
-function renderStatus(response) {
+// ---------------------------------------------------------------------------
+// The ladder -- one function decides step 2 and step 3's entire visible state.
+// Replaces the old, single `#status` div's four-class vocabulary; the classes
+// are the same four (ok/pending/alert -- there was never a fourth "unknown"
+// CSS class, see renderUnknown below), just now expressed through the shared
+// step component's marker/title/context instead of a standalone div.
+// ---------------------------------------------------------------------------
+
+function clearStep3Body() {
+  step3BodyEl.replaceChildren();
+}
+
+function mountPairingControls() {
+  clearStep3Body();
+  step3BodyEl.appendChild(pairingControlsTpl.content.cloneNode(true));
+  wirePairingControls();
+}
+
+function mountReadyPayload(response) {
+  clearStep3Body();
+  step3BodyEl.appendChild(readyPayloadTpl.content.cloneNode(true));
+  wireReadyPayload(response);
+}
+
+/** Renders a REAL response. This is the only place allowed to show a "we know the
+ * truth" status -- every branch here is an honest description of what the
+ * background script just told us, never an assumption about what it's probably
+ * still doing. See docs/designs/onboarding-ux.md section 6.3's table -- this
+ * function implements that table exactly, one row per branch below. */
+function renderLadder(response) {
+  const pairedBefore = !!(response && response.configured);
+
   if (!response.configured) {
     if (response.legacyConfigDetected) {
-      // Distinct from the generic "never configured" message: this install HAD a working
-      // config under the old (pre-rename) storage keys, which are no longer read. See
-      // background.js's loadConfig()/legacyConfigDetected and MIGRATION.md. This IS a real
-      // problem (something that used to work no longer does) -- .warn is correct here.
-      statusEl.className = "warn";
-      statusEl.textContent =
+      step3El.setAttribute("data-marker-class", "alert");
+      step3TitleEl.textContent = "Settings need re-pairing";
+      step3LineEl.textContent =
         "Configuration key names changed in this version -- your previous Hub URL/token are " +
         "no longer read. Re-enter them below and click Save.";
     } else {
-      // Brand-new install, nothing pasted in yet -- expected, not an error. `.pending`
-      // (calm/neutral), never `.warn` (red) -- see this file's module docstring.
-      statusEl.className = "pending";
-      statusEl.textContent = "Not paired yet -- pair with a hub below, or enter a Hub URL and click Save.";
+      step3El.setAttribute("data-marker-class", "pending");
+      step3TitleEl.textContent = "Not connected yet";
+      step3LineEl.textContent = "Open your hub's setup link, or enter a code below.";
     }
-    return;
-  }
-  if (response.connected) {
-    statusEl.className = "ok";
-    statusEl.textContent = `Connected to ${response.hubUrl} as device ${response.deviceId || "(pending)"}.`;
-    return;
+    step3MarkerEl.textContent = response.legacyConfigDetected ? "!" : "3";
+    mountPairingControls();
+  } else if (response.connected) {
+    step3El.setAttribute("data-marker-class", "ok");
+    step3MarkerEl.textContent = "\u2713";
+    step3TitleEl.textContent = "You're ready";
+    step3LineEl.textContent = "Your agent can use this browser now.";
+    mountReadyPayload(response);
+  } else {
+    const lastError = response.lastError;
+    if (lastError && lastError.code === "auth_rejected") {
+      step3El.setAttribute("data-marker-class", "alert");
+      step3MarkerEl.textContent = "!";
+      step3TitleEl.textContent = "Hub refused this browser";
+      step3LineEl.textContent = `${lastError.message} Pair again to get a fresh code.`;
+      mountPairingControls();
+    } else if (lastError && lastError.code === "unreachable") {
+      step3El.setAttribute("data-marker-class", "alert");
+      step3MarkerEl.textContent = "!";
+      step3TitleEl.textContent = `Can't reach ${hostPortFromHubUrl(response.hubUrl)}`;
+      step3LineEl.textContent = `${lastError.message} Check the hub is running.`;
+      mountPairingControls();
+    } else if (lastError && lastError.code === "hub_error") {
+      step3El.setAttribute("data-marker-class", "alert");
+      step3MarkerEl.textContent = "!";
+      step3TitleEl.textContent = "Hub refused this browser";
+      step3LineEl.textContent = lastError.message;
+      mountPairingControls();
+    } else {
+      // Configured, not yet connected, no concrete error yet -- the window right
+      // after Save/Pair while the first attempt is still in flight. Expected and
+      // transient, not a confirmed problem -- pending, not alert.
+      step3El.setAttribute("data-marker-class", "pending");
+      step3MarkerEl.textContent = "3";
+      step3TitleEl.textContent = "Connecting\u2026";
+      step3LineEl.textContent = "Give it a moment.";
+      mountPairingControls();
+    }
   }
 
-  const lastError = response.lastError;
-  if (lastError && lastError.code === "auth_rejected") {
-    statusEl.className = "warn";
-    statusEl.textContent = lastError.message;
-    return;
-  }
-  if (lastError && lastError.code === "unreachable") {
-    statusEl.className = "warn";
-    statusEl.textContent = lastError.message;
-    return;
-  }
-  if (lastError && lastError.code === "hub_error") {
-    statusEl.className = "warn";
-    statusEl.textContent = lastError.message;
-    return;
+  // Step 2 collapses to "done" the moment this device has EVER been paired --
+  // independent of whether the LIVE socket is up right now (that's step 3's
+  // job). "Connected to <host>" stays visible even mid-error, since pairing
+  // itself already happened; only the connectivity axis is in question.
+  if (pairedBefore) {
+    step2El.setAttribute("data-state", "done");
+    step2TitleEl.textContent = `Connected to ${hostPortFromHubUrl(response.hubUrl)}`;
+  } else {
+    step2El.setAttribute("data-state", "next");
+    step2TitleEl.textContent = "Connect it";
   }
 
-  // Configured, not yet connected, and no concrete error reported yet -- this is the
-  // window right after Save/Pair while the first connection attempt is still in
-  // flight. Expected and transient, not a confirmed problem -- `.pending`, not `.warn`.
-  // (A REAL problem lands in one of the three lastError branches above instead.)
-  statusEl.className = "pending";
-  statusEl.textContent =
-    `Configured for ${response.hubUrl}, connecting... if this doesn't clear, is the hub ` +
-    "running and reachable? Run `amplifier-browser-bridge doctor` from the CLI for a full check.";
+  renderAutoPairLine(pairedBefore);
 }
 
-// The honest "we tried, and we still don't know" terminal state -- what a caller lands
-// on when every retry in pollStatusUntilKnown's budget failed. This is the answer to
-// "what happens when the truth is unavailable": we say so, plainly, with the concrete
-// reason, rather than leaving an optimistic string (e.g. "Saved. Connecting...") sitting
-// on screen forever pretending to still be in progress.
+/** The ONE line that replaces the old always-visible provenance paragraph --
+ * renders ONLY when auto-discovery actually won (docs/designs/onboarding-ux.md
+ * section 6.1). If the user pasted the code by hand (or used Manual setup),
+ * this line is omitted entirely -- never shown speculatively. */
+async function renderAutoPairLine(pairedBefore) {
+  if (!pairedBefore) {
+    step2AutoLineEl.style.display = "none";
+    return;
+  }
+  const stored = await chrome.storage.local.get(PAIRED_AUTO_STORAGE_KEY);
+  step2AutoLineEl.style.display = stored[PAIRED_AUTO_STORAGE_KEY] ? "block" : "none";
+}
+
+/** The honest "we tried, and we still don't know" terminal state -- what a caller
+ * lands on when every retry in pollStatusUntilKnown's budget failed. */
 function renderUnknown(lastError) {
-  statusEl.className = "warn";
+  step3El.setAttribute("data-marker-class", "alert");
+  step3MarkerEl.textContent = "!";
+  step3TitleEl.textContent = "Couldn't determine status";
   const reason = lastError && lastError.message ? ` (${lastError.message})` : "";
-  statusEl.textContent =
+  step3LineEl.textContent =
     `Couldn't determine connection status${reason} -- the extension's background script ` +
     "may not be running. Try reloading this page or the extension (edge://extensions), " +
     "or run `amplifier-browser-bridge doctor` from the CLI for a full check.";
+  mountPairingControls();
 }
 
 // Polls queryStatusOnce on the given delay schedule (each entry is a delay in ms BEFORE
@@ -261,7 +309,7 @@ async function pollStatusUntilKnown(delaysMs) {
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     const result = await queryStatusOnce();
     if (result.ok) {
-      renderStatus(result.response);
+      renderLadder(result.response);
       return;
     }
     lastError = result.error;
@@ -278,55 +326,136 @@ const LOAD_STATUS_POLL_DELAYS_MS = [0, 300, 800, 2000, 4000];
 // first attempt waits a beat; growing gaps after that cover slower reconnects.
 const SAVE_STATUS_POLL_DELAYS_MS = [500, 1500, 3000, 6000, 10000];
 
-if (toggleTokenLink) {
-  toggleTokenLink.addEventListener("click", () => {
-    const showing = tokenInput.type === "text";
-    tokenInput.type = showing ? "password" : "text";
-    toggleTokenLink.textContent = showing ? "show" : "hide";
-  });
+// ---------------------------------------------------------------------------
+// Wiring for step-3-body's two templates -- called each time one is mounted,
+// since a <template> clone's elements are fresh nodes with no listeners yet.
+// ---------------------------------------------------------------------------
+
+function wirePairingControls() {
+  const toggleTokenLink = document.getElementById("toggle-token");
+  const tokenInput = document.getElementById("hub-token");
+  if (toggleTokenLink && tokenInput) {
+    toggleTokenLink.addEventListener("click", () => {
+      const showing = tokenInput.type === "text";
+      tokenInput.type = showing ? "password" : "text";
+      toggleTokenLink.textContent = showing ? "show" : "hide";
+    });
+  }
+  loadCurrentValues();
+
+  const saveButton = document.getElementById("save");
+  if (saveButton) {
+    saveButton.addEventListener("click", async () => {
+      const errorEl = document.getElementById("error");
+      const urlInput = document.getElementById("hub-url");
+      errorEl.textContent = "";
+      const urlValidation = validateHubUrl(urlInput.value);
+      if (!urlValidation.valid) {
+        errorEl.textContent = urlValidation.error;
+        return;
+      }
+      const tokenValidation = validateHubToken(tokenInput.value);
+      if (!tokenValidation.valid) {
+        errorEl.textContent = tokenValidation.error;
+        return;
+      }
+      // A deliberate Save is the user affirmatively taking ownership of these values.
+      await persistConfigAndPoll(urlValidation.normalized, tokenInput.value, CONFIG_SOURCE_MANUAL, {
+        auto: false,
+      });
+    });
+  }
+
+  const pairCodeInput = document.getElementById("pair-code");
+  const pairErrorEl = document.getElementById("pair-error");
+  const pairButton = document.getElementById("pair");
+  if (pairButton) {
+    pairButton.addEventListener("click", async () => {
+      pairErrorEl.textContent = "";
+      pairButton.disabled = true;
+      const originalLabel = pairButton.textContent;
+      pairButton.textContent = "Pairing...";
+      try {
+        const ok = await redeemCode(pairCodeInput.value, {
+          auto: false,
+          onError: (message) => {
+            pairErrorEl.textContent = message;
+          },
+        });
+        if (ok) pairCodeInput.value = "";
+      } finally {
+        pairButton.disabled = false;
+        pairButton.textContent = originalLabel;
+      }
+    });
+  }
+
+  const pairRetryButton = document.getElementById("pair-retry");
+  if (pairRetryButton) {
+    pairRetryButton.addEventListener("click", async () => {
+      pairRetryButton.disabled = true;
+      try {
+        // The click itself is a real user gesture -- the best chance a stricter
+        // clipboard-permission policy has of allowing discoverFromClipboard to
+        // succeed, even if the automatic attempt above could not.
+        await runPairingDiscovery();
+      } finally {
+        pairRetryButton.disabled = false;
+      }
+    });
+  }
+
+  runPairingDiscovery();
 }
 
-// Shared by both the Pair and Save handlers: write the resolved hub URL/token to
-// storage under one config source, refresh the provenance line, and kick off the
-// same post-write status poll -- the two paths differ only in WHERE hubUrl/token
-// came from and which CONFIG_SOURCE_* to record.
-async function persistConfigAndPoll(hubUrl, token, configSource) {
+/** Human-readable provenance -- moved here (from an always-visible top-of-page
+ * paragraph) into the "Connection details" disclosure, computed live from
+ * CURRENT storage state so it's always accurate once actually read, never a
+ * stale claim sitting on the path before anything has happened (see this
+ * file's module docstring). */
+async function wireReadyPayload(response) {
+  const disconnectButton = document.getElementById("disconnect");
+  if (disconnectButton) {
+    disconnectButton.addEventListener("click", disconnect);
+  }
+  const detailsBody = document.getElementById("connection-details-body");
+  if (!detailsBody) return;
+  const stored = await chrome.storage.local.get([
+    "amplifier_browser_bridge_hub_url",
+    "amplifier_browser_bridge_config_source",
+    "amplifier_browser_bridge_config_bundled_at",
+    DEVICE_ID_STORAGE_KEY,
+  ]);
+  const provenance = describeConfigProvenance({
+    configSource: stored.amplifier_browser_bridge_config_source,
+    configBundledAt: stored.amplifier_browser_bridge_config_bundled_at,
+  });
+  const lines = [];
+  lines.push(`<div><code>${stored.amplifier_browser_bridge_hub_url || response.hubUrl || ""}</code></div>`);
+  if (response.deviceId || stored[DEVICE_ID_STORAGE_KEY]) {
+    lines.push(`<div>Device ID: <code>${response.deviceId || stored[DEVICE_ID_STORAGE_KEY]}</code></div>`);
+  }
+  if (provenance) lines.push(`<div>${provenance}</div>`);
+  detailsBody.innerHTML = lines.join("");
+}
+
+/** Disconnect -- the counterweight to broad access, one click from the top
+ * level (never behind a disclosure -- see options.html). Reverts steps 2 and
+ * 3 to their pre-pair state and reveals the pairing controls again. Does not
+ * touch the device identity (DEVICE_ID_STORAGE_KEY) -- re-pairing later
+ * reuses the same device_id, matching how the hub's own token file already
+ * keys per-device tokens. */
+async function disconnect() {
   await chrome.storage.local.set({
-    amplifier_browser_bridge_hub_url: hubUrl,
-    amplifier_browser_bridge_hub_token: token,
-    amplifier_browser_bridge_config_source: configSource,
+    amplifier_browser_bridge_hub_url: "",
+    amplifier_browser_bridge_hub_token: "",
+    amplifier_browser_bridge_config_source: null,
     amplifier_browser_bridge_config_bundled_at: null,
-    amplifier_browser_bridge_setup_completed: true,
+    amplifier_browser_bridge_setup_completed: false,
+    [PAIRED_AUTO_STORAGE_KEY]: false,
   });
-  renderProvenance({ configSource, configBundledAt: null });
-  statusEl.className = "unknown";
-  statusEl.textContent = configSource === CONFIG_SOURCE_PAIRED ? "Paired. Connecting..." : "Saved. Connecting...";
-  // storage.onChanged (background.js) reconnects immediately; pollStatusUntilKnown
-  // either catches that success or -- if it never arrives -- lands on the honest
-  // "couldn't determine status" state instead of leaving this line up forever.
-  pollStatusUntilKnown(SAVE_STATUS_POLL_DELAYS_MS);
-}
-
-if (saveButton) {
-  saveButton.addEventListener("click", async () => {
-    errorEl.textContent = "";
-    const urlValidation = validateHubUrl(urlInput.value);
-    if (!urlValidation.valid) {
-      errorEl.textContent = urlValidation.error;
-      return;
-    }
-    const tokenValidation = validateHubToken(tokenInput.value);
-    if (!tokenValidation.valid) {
-      errorEl.textContent = tokenValidation.error;
-      return;
-    }
-    // A deliberate Save is the user affirmatively taking ownership of these values --
-    // whether they were blank, hand-typed from scratch, or started out pre-filled from a
-    // bundled first-run default (see bundled_config.mjs). From this point on the config
-    // is "manual": setup_completed blocks any future bundled-config adoption from ever
-    // overwriting it again, even across a rebuild carrying a different baked token.
-    await persistConfigAndPoll(urlValidation.normalized, tokenInput.value, CONFIG_SOURCE_MANUAL);
-  });
+  step3LineEl.textContent = "Disconnected. Pair again to reconnect.";
+  pollStatusUntilKnown([0]);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +467,21 @@ if (saveButton) {
 // never drift apart on what counts as success or how an error is worded.
 // ---------------------------------------------------------------------------
 
+async function persistConfigAndPoll(hubUrl, token, configSource, { auto } = { auto: false }) {
+  await chrome.storage.local.set({
+    amplifier_browser_bridge_hub_url: hubUrl,
+    amplifier_browser_bridge_hub_token: token,
+    amplifier_browser_bridge_config_source: configSource,
+    amplifier_browser_bridge_config_bundled_at: null,
+    amplifier_browser_bridge_setup_completed: true,
+    [PAIRED_AUTO_STORAGE_KEY]: !!auto,
+  });
+  // storage.onChanged (background.js) reconnects immediately; pollStatusUntilKnown
+  // either catches that success or -- if it never arrives -- lands on the honest
+  // "couldn't determine status" state instead of leaving a stale line up forever.
+  pollStatusUntilKnown(SAVE_STATUS_POLL_DELAYS_MS);
+}
+
 /**
  * Parse and redeem a pairing code against its hub, persisting the resulting
  * hub URL/token on success. Never throws -- every failure is reported via
@@ -346,10 +490,10 @@ if (saveButton) {
  * each render it their own way.
  *
  * @param {string} rawCode
- * @param {{onError?: (message: string) => void}} [opts]
+ * @param {{onError?: (message: string) => void, auto?: boolean}} [opts]
  * @returns {Promise<boolean>} true iff redeemed and persisted.
  */
-async function redeemCode(rawCode, { onError } = {}) {
+async function redeemCode(rawCode, { onError, auto = false } = {}) {
   const fail = (message) => {
     if (onError) onError(message);
     return false;
@@ -395,28 +539,8 @@ async function redeemCode(rawCode, { onError } = {}) {
   }
 
   const hubUrl = buildDeviceWsUrl(parsed.host, parsed.port);
-  await persistConfigAndPoll(hubUrl, data.token || "", CONFIG_SOURCE_PAIRED);
+  await persistConfigAndPoll(hubUrl, data.token || "", CONFIG_SOURCE_PAIRED, { auto });
   return true;
-}
-
-if (pairButton) {
-  pairButton.addEventListener("click", async () => {
-    pairErrorEl.textContent = "";
-    pairButton.disabled = true;
-    const originalLabel = pairButton.textContent;
-    pairButton.textContent = "Pairing...";
-    try {
-      const ok = await redeemCode(pairCodeInput.value, {
-        onError: (message) => {
-          pairErrorEl.textContent = message;
-        },
-      });
-      if (ok) pairCodeInput.value = "";
-    } finally {
-      pairButton.disabled = false;
-      pairButton.textContent = originalLabel;
-    }
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +548,8 @@ if (pairButton) {
 // ---------------------------------------------------------------------------
 
 function setAutoStatus(text, { showRetry = false } = {}) {
+  const pairAutoStatusEl = document.getElementById("pair-auto-status");
+  const pairRetryButton = document.getElementById("pair-retry");
   if (pairAutoStatusEl) pairAutoStatusEl.textContent = text;
   if (pairRetryButton) pairRetryButton.style.display = showRetry ? "" : "none";
 }
@@ -483,6 +609,7 @@ async function discoverFromClipboard() {
 async function tryAutoRedeem(rawCode, foundMessage) {
   setAutoStatus(`${foundMessage} Connecting...`);
   const ok = await redeemCode(rawCode, {
+    auto: true,
     onError: (message) => setAutoStatus(`Found a pairing code, but couldn't use it: ${message}`, { showRetry: true }),
   });
   if (ok) setAutoStatus(`${foundMessage} Paired automatically.`);
@@ -514,38 +641,26 @@ async function runPairingDiscovery() {
   setAutoStatus("No pairing code found nearby.", { showRetry: true });
 }
 
-if (pairRetryButton) {
-  pairRetryButton.addEventListener("click", async () => {
-    pairRetryButton.disabled = true;
-    try {
-      // The click itself is a real user gesture -- the best chance a stricter
-      // clipboard-permission policy has of allowing discoverFromClipboard to
-      // succeed, even if the automatic attempt above could not.
-      await runPairingDiscovery();
-    } finally {
-      pairRetryButton.disabled = false;
-    }
-  });
-}
-
 // Auto-run on real page load, skipped when options.test.mjs sets this flag before
 // importing -- tests drive queryStatusOnce/pollStatusUntilKnown/runPairingDiscovery
 // directly with their own fake chrome.*/deterministic inputs instead of the real ones.
 if (!globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__) {
-  loadCurrentValues();
   pollStatusUntilKnown(LOAD_STATUS_POLL_DELAYS_MS);
-  runPairingDiscovery();
 }
 
 // Exported for extension/options.test.mjs only -- not used by any other runtime file.
 export {
   loadCurrentValues,
   queryStatusOnce,
-  renderStatus,
+  renderLadder,
   renderUnknown,
   pollStatusUntilKnown,
   getOrCreateDeviceId,
   runPairingDiscovery,
+  redeemCode,
+  disconnect,
+  hostPortFromHubUrl,
   LOAD_STATUS_POLL_DELAYS_MS,
   SAVE_STATUS_POLL_DELAYS_MS,
+  PAIRED_AUTO_STORAGE_KEY,
 };

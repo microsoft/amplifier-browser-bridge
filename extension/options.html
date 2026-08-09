@@ -4,107 +4,246 @@
 <meta charset="utf-8" />
 <title>Amplifier Browser Bridge -- Setup</title>
 <style>
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    max-width: 640px;
-    margin: 2rem auto;
-    padding: 0 1rem;
-    color: #1a1a1a;
+/* TOKENS:BEGIN -- docs/designs/onboarding-ux.md section 2 (byte-identical on both pages) */
+:root {
+  /* type -- 1.25 ratio, 16px base. Only 4 of the 5 appear on a given page. */
+  --t-meta:   0.75rem;  /* 12px  countdown, device id, footnotes */
+  --t-sm:     0.875rem; /* 14px  secondary line under a step title */
+  --t-body:   1rem;     /* 16px  default */
+  --t-title:  1.25rem;  /* 20px  step title, pairing code */
+  --t-page:   1.5rem;   /* 24px  page title (once per page) */
+
+  --lh-tight: 1.25;  /* titles */
+  --lh-body:  1.5;   /* everything else */
+  --w-normal: 400;
+  --w-semi:   600;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* space -- 4px base, only these seven values */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-6: 24px; --s-8: 32px; --s-12: 48px;
+
+  --radius: 8px;
+  --radius-sm: 4px;
+  --measure: 34rem;   /* max line length, ~66ch -- both pages */
+
+  /* color -- light */
+  --surface:        #FFFFFF;
+  --surface-raised: #F6F8FA;
+  --border:         #D8DEE4;
+  --ink:            #16202B;
+  --ink-dim:        #5A6B7C;
+  --ink-faint:      #7C8B99;
+
+  --accent:         #0B57D0;   /* links, step-now marker */
+  --accent-ink:     #FFFFFF;   /* text on --accent */
+
+  --ok-bg:      #E6F4EA;  --ok-ink:      #0E5C2F;  --ok-line:      #7BC49A;
+  --pending-bg: #EEF2F7;  --pending-ink: #33455C;  --pending-line: #B6C2D1;
+  --alert-bg:   #FDECEA;  --alert-ink:   #8C1D18;  --alert-line:   #E0A19C;
+  --caution-bg: #FFF4E0;  --caution-ink: #7A4E00;  --caution-line: #E0BE7B;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface:        #0D1117;
+    --surface-raised: #161B22;
+    --border:         #30363D;
+    --ink:            #E6EDF3;
+    --ink-dim:        #9BA7B4;
+    --ink-faint:      #7A8794;
+
+    --accent:         #58A6FF;
+    --accent-ink:     #06131F;
+
+    --ok-bg:      #0F2417;  --ok-ink:      #7EE787;  --ok-line:      #235C34;
+    --pending-bg: #161C24;  --pending-ink: #9FB3C8;  --pending-line: #2C3947;
+    --alert-bg:   #241318;  --alert-ink:   #FF9E92;  --alert-line:   #B4402A;
+    --caution-bg: #241A13;  --caution-ink: #FFB066;  --caution-line: #B4842A;
   }
-  h1 { font-size: 1.25rem; }
-  h2 { font-size: 1rem; margin-top: 2rem; }
-  label { display: block; font-weight: 600; margin-top: 1rem; }
-  input[type="text"], input[type="password"] {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 0.5rem;
-    font-family: monospace;
-    margin-top: 0.25rem;
-  }
-  .hint { font-size: 0.85rem; color: #555; margin-top: 0.25rem; }
-  .row { margin-top: 0.5rem; }
-  button {
-    margin-top: 1.25rem;
-    padding: 0.5rem 1.25rem;
-    font-size: 1rem;
-    cursor: pointer;
-  }
-  #status {
-    margin-top: 1.5rem;
-    padding: 0.75rem;
-    border-radius: 4px;
-    font-size: 0.9rem;
-  }
-  #status.ok { background: #e6f4ea; color: #1e4620; }
-  #status.warn { background: #fdecea; color: #611a15; }
-  #status.unknown { background: #f1f1f1; color: #333; }
-  /* "pending" is a calm, neutral state -- expected-and-not-done-yet (fresh
-     install, mid-pairing) -- deliberately NOT the same red as .warn, which is
-     reserved for a confirmed problem (auth rejected, hub unreachable, a real
-     hub-side error). A brand-new user landing on red before they've done
-     anything reads as "you broke it"; this does not. See options.js's
-     renderStatus for exactly which branches use which class. */
-  #status.pending { background: #eaf1fb; color: #1c3d5f; }
-  #pair-error, #error { color: #b00020; font-size: 0.9rem; margin-top: 0.5rem; min-height: 1.2em; }
-  #toggle-token { cursor: pointer; font-size: 0.85rem; margin-left: 0.5rem; }
-  details {
-    margin-top: 1.5rem;
-    border-top: 1px solid #ddd;
-    padding-top: 0.75rem;
-  }
-  summary { cursor: pointer; font-weight: 600; }
+}
+/* TOKENS:END */
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: var(--s-6) var(--s-4) var(--s-12);
+  background: var(--surface); color: var(--ink);
+  font: var(--t-body)/var(--lh-body) var(--font);
+}
+main { max-width: var(--measure); margin: 0 auto; }
+h1.page-title { font-size: var(--t-page); font-weight: var(--w-semi); line-height: var(--lh-tight); margin: 0 0 var(--s-6); }
+
+/* ---- step component ---- */
+.step { display: flex; gap: var(--s-3); margin: 0 0 var(--s-8); align-items: flex-start; }
+.step:last-child { margin-bottom: 0; }
+.step-marker {
+  flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: var(--t-sm); font-weight: var(--w-semi);
+  background: var(--surface-raised); color: var(--ink-faint);
+}
+.step[data-state="now"] .step-marker { background: var(--accent); color: var(--accent-ink); }
+.step[data-state="done"] .step-marker { background: var(--ok-bg); color: var(--ok-ink); }
+.step[data-state="next"] .step-marker { background: var(--surface-raised); color: var(--ink-faint); }
+.step[data-marker-class="ok"] .step-marker { background: var(--ok-bg); color: var(--ok-ink); }
+.step[data-marker-class="pending"] .step-marker { background: var(--pending-bg); color: var(--pending-ink); }
+.step[data-marker-class="alert"] .step-marker { background: var(--alert-bg); color: var(--alert-ink); }
+.step-main { flex: 1 1 auto; min-width: 0; }
+.step-title { font-size: var(--t-title); font-weight: var(--w-semi); line-height: var(--lh-tight); color: var(--ink); }
+.step[data-state="next"] .step-title { color: var(--ink-faint); }
+.step[data-state="done"] .step-title { color: var(--ink-dim); }
+.step-context { font-size: var(--t-sm); color: var(--ink-dim); margin-top: var(--s-1); }
+.step-body { margin-top: var(--s-4); }
+.step-body > * + * { margin-top: var(--s-3); }
+.step[data-state="next"] .step-body { display: none; }
+
+/* ---- buttons ---- */
+.btn-primary, .btn-quiet {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 44px; padding: var(--s-3) var(--s-6); border-radius: var(--radius);
+  font-size: var(--t-body); font-weight: var(--w-semi); text-decoration: none;
+  cursor: pointer; border: 1px solid transparent; background: none; font-family: inherit;
+}
+.btn-primary { background: var(--accent); color: var(--accent-ink); }
+.btn-quiet { background: transparent; color: var(--ink); border-color: var(--border); }
+.btn-quiet:disabled { opacity: 0.6; cursor: default; }
+
+/* ---- note block (alert / caution only) ---- */
+.note { border-radius: var(--radius); border-left: 3px solid; padding: var(--s-3) var(--s-4); font-size: var(--t-sm); }
+.note-alert { background: var(--alert-bg); color: var(--alert-ink); border-left-color: var(--alert-line); }
+.note-caution { background: var(--caution-bg); color: var(--caution-ink); border-left-color: var(--caution-line); }
+
+/* ---- disclosure ---- */
+details.disclosure { margin-top: var(--s-3); }
+details.disclosure > summary { font-size: var(--t-sm); color: var(--ink-dim); cursor: pointer; }
+details.disclosure .disclosure-body { margin-top: var(--s-3); font-size: var(--t-sm); color: var(--ink-dim); }
+details.disclosure label { display: block; font-weight: var(--w-semi); margin-top: var(--s-3); font-size: var(--t-sm); color: var(--ink); }
+details.disclosure input[type="text"], details.disclosure input[type="password"] {
+  width: 100%; box-sizing: border-box; padding: var(--s-2); font-family: var(--font-mono);
+  margin-top: var(--s-1); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink);
+}
+
+/* ---- code ---- */
+code { font-family: var(--font-mono); background: var(--surface-raised); border-radius: var(--radius-sm); padding: 0.1em 0.4em; word-break: break-all; }
+
+ul.bullets { padding-left: var(--s-6); margin: 0; }
+ul.bullets li { margin: var(--s-1) 0; }
+.emph { font-weight: var(--w-semi); }
+#toggle-token { cursor: pointer; font-size: var(--t-sm); margin-left: var(--s-2); color: var(--ink-dim); }
+#pair-error, #error { color: var(--alert-ink); font-size: var(--t-sm); margin-top: var(--s-2); min-height: 1.2em; }
 </style>
 </head>
 <body>
-  <h1>Amplifier Browser Bridge</h1>
-  <p>Connects this browser to a hub on your tailnet so an agent can use it.</p>
+<main>
+  <h1 class="page-title">Amplifier Browser Bridge</h1>
 
-  <div id="provenance" class="hint"></div>
-
-  <h2>Pair with a hub</h2>
-  <p id="pair-auto-status" class="hint">Looking for a pairing code...</p>
-  <button id="pair-retry" type="button" style="display: none;">Check again</button>
-
-  <details id="manual-pair">
-    <summary>Enter a code by hand</summary>
-    <p class="hint">From <code>amplifier-browser-bridge pair</code>, run on your hub.</p>
-    <label for="pair-code">Pairing code</label>
-    <input type="text" id="pair-code" placeholder="7F3K9-QXTM2@100.x.y.z:8900" autocomplete="off" />
-    <div id="pair-error"></div>
-    <button id="pair" type="button">Pair</button>
-  </details>
-
-  <details id="manual-config">
-    <summary>Manual configuration (advanced)</summary>
-    <p class="hint">
-      For scripting or a hub with no pairing session. Save always takes ownership, same as pairing.
-    </p>
-
-    <label for="hub-url">Hub URL</label>
-    <input type="text" id="hub-url" placeholder="ws://100.x.y.z:8900/device" autocomplete="off" />
-    <div class="hint">
-      Use a tailnet IP literal, not a MagicDNS name (MagicDNS resolution is unreliable
-      per-device -- see docs/designs/browser-bridge.md section 4). The path defaults to
-      "/device" if you leave it off.
+  <!-- Step 1: always done -- this page running proves the extension installed. -->
+  <section class="step" data-state="done" id="step-1">
+    <span class="step-marker">&#10003;</span>
+    <div class="step-main">
+      <div class="step-title">Extension installed</div>
     </div>
+  </section>
 
-    <label for="hub-token">Hub Token</label>
-    <div class="row">
-      <input type="password" id="hub-token" placeholder="(leave blank only if the hub has auth disabled)" autocomplete="off" />
-      <span id="toggle-token">show</span>
+  <!-- Step 2: "next" (placeholder) until this device has ever been paired, then
+       collapses to a single "done" line -- see docs/designs/onboarding-ux.md
+       section 6.1. Once done, an optional line reports whether pairing found
+       its own code (rendered ONLY when auto-discovery actually won -- see
+       options.js's renderLadder). -->
+  <section class="step" data-state="next" id="step-2">
+    <span class="step-marker">2</span>
+    <div class="step-main">
+      <div class="step-title" id="step-2-title">Connect it</div>
+      <div class="step-context" id="step-2-auto-line" style="display:none;">Paired automatically -- nothing to copy.</div>
     </div>
-    <div class="hint">
-      Get this from <code>amplifier-browser-bridge init</code> (it prints the token and writes it to the hub's
-      token file) or from whoever runs your hub.
+  </section>
+
+  <!-- Step 3: the dynamic slot -- status line's four-class vocabulary
+       (docs/designs/onboarding-ux.md section 6.3) expressed as this step's
+       marker/title/context, with the pairing controls (6.4) or the
+       post-pairing payload (6.2) as its body. -->
+  <section class="step" data-state="now" id="step-3">
+    <span class="step-marker" id="step-3-marker">3</span>
+    <div class="step-main">
+      <div class="step-title" id="step-3-title">Checking status&hellip;</div>
+      <div class="step-context" id="step-3-line"></div>
+      <div class="step-body" id="step-3-body"></div>
     </div>
+  </section>
 
-    <div id="error"></div>
+  <!-- Templates for step-3-body's two possible contents -- cloned into place
+       by options.js, never shown directly (kept out-of-flow with `hidden`). -->
+  <template id="tpl-pairing-controls">
+    <div>
+      <p id="pair-auto-status" class="step-context">Looking for a pairing code&hellip;</p>
+      <button id="pair-retry" type="button" class="btn-quiet" style="display: none;">Check again</button>
 
-    <button id="save">Save</button>
-  </details>
+      <details id="manual-pair" class="disclosure">
+        <summary>Enter a code by hand</summary>
+        <div class="disclosure-body">
+          <p>From <code>amplifier-browser-bridge pair</code>, run on your hub.</p>
+          <label for="pair-code">Pairing code</label>
+          <input type="text" id="pair-code" placeholder="7F3K9-QXTM2@100.x.y.z:8900" autocomplete="off" />
+          <div id="pair-error"></div>
+          <button id="pair" type="button" class="btn-quiet">Pair</button>
+        </div>
+      </details>
 
-  <div id="status" class="unknown">Checking status...</div>
+      <details id="manual-config" class="disclosure">
+        <summary>Manual setup</summary>
+        <div class="disclosure-body">
+          <p>For scripting or a hub with no pairing session. Save always takes ownership, same as pairing.</p>
+
+          <label for="hub-url">Hub URL</label>
+          <input type="text" id="hub-url" placeholder="ws://100.x.y.z:8900/device" autocomplete="off" />
+          <details class="disclosure">
+            <summary>Which address?</summary>
+            <div class="disclosure-body">
+              Use a tailnet IP literal, not a MagicDNS name (MagicDNS resolution is unreliable
+              per-device -- see docs/designs/browser-bridge.md section 4). The path defaults to
+              "/device" if you leave it off.
+            </div>
+          </details>
+
+          <label for="hub-token">Hub Token</label>
+          <input type="password" id="hub-token" placeholder="(leave blank only if the hub has auth disabled)" autocomplete="off" />
+          <span id="toggle-token">show</span>
+          <div class="disclosure-body">
+            Get this from <code>amplifier-browser-bridge init</code> (it prints the token and writes it to the hub's
+            token file) or from whoever runs your hub.
+          </div>
+
+          <div id="error"></div>
+          <button id="save" type="button" class="btn-quiet">Save</button>
+        </div>
+      </details>
+    </div>
+  </template>
+
+  <template id="tpl-ready-payload">
+    <div>
+      <p>Your agent can use this browser now.</p>
+      <ul class="bullets">
+        <li>Sees pages you're signed in to</li>
+        <li>Clicks, types, opens and closes tabs</li>
+        <li>Only while this browser is running</li>
+      </ul>
+      <p class="emph">You can close this tab.</p>
+
+      <button id="disconnect" type="button" class="btn-quiet">Disconnect</button>
+      <div class="step-context">Pin the toolbar icon to see when it's active.</div>
+
+      <details class="disclosure">
+        <summary>Connection details</summary>
+        <div class="disclosure-body" id="connection-details-body"></div>
+      </details>
+    </div>
+  </template>
 
   <script src="options.js" type="module"></script>
+</main>
 </body>
 </html>

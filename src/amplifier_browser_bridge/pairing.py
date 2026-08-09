@@ -91,6 +91,14 @@ MAX_REDEEM_ATTEMPTS = 20  # burn the ticket after this many FAILED attempts, reg
 # of remaining TTL -- bounds a live guessing attack's attempt budget, not just its time
 # budget. See module docstring's "Attempt bounding" paragraph.
 
+# How long a REDEEMED ticket's tombstone record is kept before being purged -- see
+# `status()` below. This only needs to outlive the `/setup` page's own polling
+# cadence (~1s, see onboarding.py) by a comfortable margin, so the tab that showed
+# the code gets to observe "redeemed" at least once before the record is gone.
+# Deliberately unrelated to DEFAULT_TICKET_TTL_SECONDS above (a different lifetime:
+# how long an UNREDEEMED ticket stays valid).
+REDEEMED_TOMBSTONE_SECONDS = 120.0
+
 
 class PairingError(Exception):
     """Raised by `PairingStore.redeem` on any ticket that cannot be redeemed right
@@ -127,9 +135,22 @@ class PairingTicket:
     created_at: float
     expires_at: float
     attempts: int = 0
+    # Set the moment `redeem()` succeeds; `None` for a still-pending ticket. A
+    # tombstone (see `status()`/`REDEEMED_TOMBSTONE_SECONDS`), not a deletion --
+    # this is what lets a *different*, side-effect-free caller (the `/setup`
+    # page's own redemption poll, see hub.py's `_handle_pair_status`) observe
+    # "this ticket was just redeemed" instead of the same "unknown" response an
+    # expired-and-purged or never-valid ticket produces.
+    redeemed_at: float | None = None
 
     def is_expired(self, *, now: float) -> bool:
         return now >= self.expires_at
+
+    def is_tombstone_expired(self, *, now: float) -> bool:
+        """True once a *redeemed* ticket's grace window has elapsed and it is
+        safe to purge from the store entirely. A never-redeemed ticket is never
+        tombstone-expired by this check (see `is_expired` for that lifetime)."""
+        return self.redeemed_at is not None and now - self.redeemed_at >= REDEEMED_TOMBSTONE_SECONDS
 
 
 @dataclass
@@ -143,7 +164,16 @@ class PairingStore:
     _tickets: dict[str, PairingTicket] = field(default_factory=dict)
 
     def _purge_expired(self, *, now: float) -> None:
-        expired = [t for t, rec in self._tickets.items() if rec.is_expired(now=now)]
+        """Purge tickets that are either (a) never-redeemed and past their
+        normal TTL, or (b) redeemed and past their tombstone grace window
+        (`REDEEMED_TOMBSTONE_SECONDS`) -- see `PairingTicket.is_tombstone_expired`.
+        A redeemed-but-still-within-grace ticket is deliberately kept so
+        `status()` can still report "redeemed" for it."""
+        expired = [
+            t
+            for t, rec in self._tickets.items()
+            if rec.is_tombstone_expired(now=now) or (rec.redeemed_at is None and rec.is_expired(now=now))
+        ]
         for t in expired:
             del self._tickets[t]
 
@@ -169,15 +199,24 @@ class PairingStore:
     def redeem(self, raw_ticket: str, *, now: float | None = None) -> PairingTicket:
         """Consume a ticket exactly once. Raises `PairingError` (never returns a
         falsy sentinel -- see this project's fail-loud convention) on any ticket
-        that is not currently valid. On success, the ticket is deleted from the
-        store immediately -- a second redemption attempt with the same value
-        always raises "unknown or already-used ticket", indistinguishable (by
-        design) from a value that was never valid at all, so a caller learns
-        nothing about WHY a specific ticket failed beyond what this message says."""
+        that is not currently valid. On success, the ticket is NOT deleted --
+        it is marked redeemed (tombstoned; see `PairingTicket.redeemed_at` and
+        `status()` below) so a separate, side-effect-free caller can learn the
+        redemption happened, then purged automatically after
+        `REDEEMED_TOMBSTONE_SECONDS`. Redemption is still exactly single-use: a
+        second `redeem()` call against an already-redeemed ticket always raises
+        "unknown or already-used ticket", indistinguishable (by design) from a
+        value that was never valid at all, so a caller learns nothing about WHY
+        a specific ticket failed beyond what this message says."""
         effective_now = now if now is not None else time.time()
+        # Deliberately NOT calling _purge_expired() here (unlike create()/status()):
+        # an expired-but-not-yet-purged ticket must still reach the `is_expired`
+        # branch below so the caller gets the specific "pairing code expired"
+        # message, not the generic "unknown or already-used" one a pre-emptive
+        # purge would produce instead.
         ticket = normalize_ticket(raw_ticket)
         record = self._tickets.get(ticket)
-        if record is None:
+        if record is None or record.redeemed_at is not None:
             raise PairingError("unknown or already-used pairing code")
         if record.is_expired(now=effective_now):
             del self._tickets[ticket]
@@ -191,8 +230,39 @@ class PairingStore:
                 "pairing code invalidated after too many failed attempts -- "
                 "run `amplifier-browser-bridge pair` again for a new one"
             )
-        del self._tickets[ticket]  # single-use: gone the moment redemption succeeds
+        record.redeemed_at = effective_now  # tombstoned, not deleted -- see docstring above
         return record
+
+    def status(self, raw_ticket: str, *, now: float | None = None) -> str:
+        """Read-only, side-effect-free status check for a ticket: one of
+        `"pending"` (valid, not yet redeemed), `"redeemed"` (successfully
+        redeemed within the last `REDEEMED_TOMBSTONE_SECONDS`), or `"unknown"`
+        (never existed, already fully purged, or expired without ever being
+        redeemed).
+
+        This is the mechanism the `/setup` page's own redemption poll uses
+        (see hub.py's `_handle_pair_status` and onboarding.py's polling
+        script) to learn that ITS OWN code was redeemed elsewhere, so the tab
+        can flip from a live countdown to "Connected" instead of continuing to
+        count down a code that has already been used -- see onboarding.py's
+        module docstring for the bug this closes.
+
+        Deliberately does NOT increment `attempts` or otherwise mutate
+        anything but expired-ticket housekeeping -- unlike `redeem()`, calling
+        this repeatedly (as a ~1s poll does) must never burn down a ticket's
+        own attempt budget or otherwise affect whether it can still be
+        redeemed."""
+        effective_now = now if now is not None else time.time()
+        self._purge_expired(now=effective_now)
+        ticket = normalize_ticket(raw_ticket)
+        record = self._tickets.get(ticket)
+        if record is None:
+            return "unknown"
+        if record.redeemed_at is not None:
+            return "redeemed"
+        if record.is_expired(now=effective_now):
+            return "unknown"  # not purged here (read-only); next _purge_expired call will
+        return "pending"
 
     def __len__(self) -> int:
         return len(self._tickets)
@@ -201,6 +271,7 @@ class PairingStore:
 __all__ = [
     "DEFAULT_TICKET_TTL_SECONDS",
     "MAX_REDEEM_ATTEMPTS",
+    "REDEEMED_TOMBSTONE_SECONDS",
     "TICKET_ALPHABET",
     "TICKET_LENGTH",
     "PairingError",
