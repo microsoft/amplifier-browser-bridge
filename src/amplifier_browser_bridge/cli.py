@@ -21,7 +21,13 @@ import click
 
 from .addressing import TargetError, parse_target
 from .audit import AuditLog
-from .auth import extract_token_value, find_sibling_token_files, load_token_store, mask_token
+from .auth import (
+    extract_token_value,
+    find_sibling_token_files,
+    load_token_store,
+    mask_token,
+    resolve_token_file,
+)
 from .client import HubClient, HubError
 from .doctor import run_doctor
 from .extension_integrity import ExtensionIntegrityError
@@ -29,6 +35,18 @@ from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve
 from .netinfo import detect_tailscale_ip, is_wildcard_bind, wildcard_bind_warning
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
+from .service import (
+    SERVICE_NAME,
+    ServiceUnsupportedError,
+    describe_service,
+    service_install,
+    service_logs,
+    service_restart,
+    service_start,
+    service_status,
+    service_stop,
+    service_uninstall,
+)
 from .setup import DEFAULT_STAGE_DIR, ExtensionSourceNotFoundError, ensure_token_file, stage_extension
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
@@ -1064,6 +1082,46 @@ def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -
     )
 
 
+_HUB_HOST_HELP = (
+    "Host to bind/print for the hub. Default: auto-detect this machine's Tailscale IP "
+    "(`tailscale ip -4`) -- reachable from the tailnet, reachable from nowhere else. Falls "
+    "back to 127.0.0.1 (loopback only -- NOT reachable from another device) if Tailscale "
+    "isn't detected. Passing a wildcard address (0.0.0.0, ::) binds every network interface "
+    "this machine has, not just the tailnet -- printed with a loud, specific warning if you "
+    "do (security review finding: this used to be the silent default)."
+)
+
+
+def _resolve_hub_host(explicit_host: str | None) -> tuple[str, str | None]:
+    """Resolve the host to bind/print for the hub, and an optional human-readable note
+    explaining how it was resolved.
+
+    Shared by `init` and `service install` so the two can never silently disagree on
+    what "the safe, still cross-device-reachable default" means (A1 fix, security
+    review finding -- see `init`'s original comment for the incident this replaced):
+
+    \b
+    1. an explicit host always wins (loudly warned by the caller if it's a wildcard)
+    2. else, auto-detect this machine's own Tailscale IP (netinfo.py) -- reachable
+       from the tailnet, reachable from nowhere else
+    3. else, fall back to 127.0.0.1 (safe, but NOT cross-device -- say so loudly,
+       since cross-device operation is this project's whole point)
+    """
+    if explicit_host is not None:
+        return explicit_host, None
+    tailnet_ip = detect_tailscale_ip()
+    if tailnet_ip is not None:
+        return tailnet_ip, f"(auto-detected this machine's Tailscale IP via `tailscale ip -4`: {tailnet_ip})"
+    return (
+        "127.0.0.1",
+        (
+            "(could not detect a Tailscale IP -- `tailscale ip -4` is unavailable or failed -- "
+            "defaulting to 127.0.0.1, which is NOT reachable from another device; for cross-device "
+            "use, re-run with --host <this machine's tailnet IP>)"
+        ),
+    )
+
+
 @main.command()
 @click.option(
     "--dest",
@@ -1081,23 +1139,12 @@ def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -
     help="Regenerate the token even if one already exists at --token-file. Rotating a token "
     "requires re-pasting it into the extension's options page afterward.",
 )
-@click.option(
-    "--hub-host",
-    default=None,
-    help=(
-        "Host to print in the printed `amplifier-browser-bridge hub` command and the extension's Hub URL. "
-        "Default: auto-detect this machine's Tailscale IP (`tailscale ip -4`) -- reachable from the "
-        "tailnet, reachable from nowhere else. Falls back to 127.0.0.1 (loopback only -- NOT reachable "
-        "from another device) if Tailscale isn't detected. Passing a wildcard address (0.0.0.0, ::) "
-        "binds every network interface this machine has, not just the tailnet -- printed with a loud, "
-        "specific warning if you do (security review finding: this used to be the silent default)."
-    ),
-)
+@click.option("--hub-host", default=None, help=_HUB_HOST_HELP)
 @click.option(
     "--hub-port",
     default=DEFAULT_PORT,
     show_default=True,
-    help="Port to print in the printed `amplifier-browser-bridge hub` command.",
+    help="Port to print in the printed `amplifier-browser-bridge hub`/`service install` commands.",
 )
 def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | None, hub_port: int) -> None:
     """First-run setup: generate a hub token, stage the extension, print next steps.
@@ -1131,30 +1178,7 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
 
     _warn_divergent_token_siblings(token_result.token_file, token_result.token)
 
-    # A1 fix (security review finding): this command used to default
-    # --hub-host to "0.0.0.0" and print that back as the recommended `amplifier-browser-bridge hub`
-    # invocation -- silently recommending every user bind every network interface
-    # on their machine, not just their Tailscale tailnet. Resolve a SAFE, still
-    # cross-device-reachable default instead of a silent wildcard:
-    #   1. an explicit --hub-host always wins (loudly warned if it's a wildcard)
-    #   2. else, auto-detect this machine's own Tailscale IP (netinfo.py) --
-    #      reachable from the tailnet, reachable from nowhere else
-    #   3. else, fall back to 127.0.0.1 (safe, but NOT cross-device -- say so
-    #      loudly, since cross-device operation is this project's whole point)
-    detected_note: str | None = None
-    resolved_host = hub_host
-    if resolved_host is None:
-        tailnet_ip = detect_tailscale_ip()
-        if tailnet_ip is not None:
-            resolved_host = tailnet_ip
-            detected_note = f"(auto-detected this machine's Tailscale IP via `tailscale ip -4`: {tailnet_ip})"
-        else:
-            resolved_host = "127.0.0.1"
-            detected_note = (
-                "(could not detect a Tailscale IP -- `tailscale ip -4` is unavailable or failed -- "
-                "defaulting to 127.0.0.1, which is NOT reachable from another device; for cross-device "
-                "use, re-run with --hub-host <this machine's tailnet IP>)"
-            )
+    resolved_host, detected_note = _resolve_hub_host(hub_host)
     if is_wildcard_bind(resolved_host):
         click.echo("")
         click.echo(wildcard_bind_warning(resolved_host, hub_port))
@@ -1162,12 +1186,15 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
     click.echo("")
     click.echo("Remaining steps (manual -- Edge has no CLI for these):")
     click.echo("")
-    click.echo("  1. Start the hub:")
+    click.echo("  1. Start the hub as a background service (recommended -- survives logout and reboot):")
+    click.echo(f"       amplifier-browser-bridge service install --host {resolved_host} --port {hub_port}")
+    if detected_note:
+        click.echo(f"       {detected_note}")
+    click.echo("")
+    click.echo("     Or run it directly in this terminal instead (stops when the terminal closes):")
     click.echo(
         f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge hub --host {resolved_host} --port {hub_port}"
     )
-    if detected_note:
-        click.echo(f"       {detected_note}")
     click.echo("")
     click.echo("  2. Load the extension:")
     click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
@@ -1184,6 +1211,159 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
         f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
         f"--hub-url ws://{resolved_host}:{hub_port}/agent"
     )
+
+
+@main.group(name="service")
+def service_group() -> None:
+    """Run the hub as a background OS service (systemd --user on Linux, launchd on
+    macOS) so it survives logout and reboot instead of living in a terminal you have
+    to keep open.
+
+    Not implemented on Windows in this release -- see INSTALL.md's Windows section;
+    run `amplifier-browser-bridge hub ...` directly there, or wrap it in your own
+    Task Scheduler entry / NSSM service.
+    """
+
+
+@service_group.command(name="install")
+@click.option("--host", default=None, help=_HUB_HOST_HELP)
+@click.option("--port", default=DEFAULT_PORT, show_default=True, help="Port for the hub to bind.")
+@click.option(
+    "--token-file",
+    default=None,
+    help="Path to the hub token file (see auth.py docstring). Default: $AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE "
+    "or the standard location `amplifier-browser-bridge init` writes to. If it doesn't exist yet, one is "
+    "generated here (same as `init` would) so a service never starts with auth silently disabled just "
+    "because `init` was skipped.",
+)
+@click.option(
+    "--audit-log",
+    default=None,
+    help="Path to the JSONL audit log. Default: ~/.local/share/amplifier-browser-bridge/hub-audit.jsonl -- "
+    "NOT the foreground hub's cwd-relative default, since a service has no meaningful current directory.",
+)
+@click.option(
+    "--command-timeout",
+    type=float,
+    default=None,
+    help="Default device-round-trip wait, in seconds (see `hub --command-timeout`).",
+)
+def service_install_cmd(
+    host: str | None, port: int, token_file: str | None, audit_log: str | None, command_timeout: float | None
+) -> None:
+    """Install (or re-install) the hub as a background service and start it.
+
+    Safe to re-run -- e.g. after this machine's Tailscale IP changes, re-run this
+    (omit --host to auto-detect the new one, or pass it explicitly) to rebake and
+    restart the service under the new address. Rotating the token's CONTENTS
+    (`amplifier-browser-bridge init --force`) does NOT need this re-run -- `service
+    restart` alone is enough, since only the token FILE PATH is baked in here, not
+    its contents.
+    """
+    resolved_host, detected_note = _resolve_hub_host(host)
+    if is_wildcard_bind(resolved_host):
+        click.echo(wildcard_bind_warning(resolved_host, port), err=True)
+
+    resolved_token_file = resolve_token_file(token_file)
+    if not resolved_token_file.is_file():
+        try:
+            token_result = ensure_token_file(resolved_token_file)
+        except OSError as e:
+            raise click.ClickException(f"could not write token file: {e}") from e
+        click.echo(f"Generated new hub token (stored in {token_result.token_file}).")
+
+    try:
+        info = service_install(
+            resolved_host,
+            port,
+            resolved_token_file,
+            audit_log=audit_log,
+            command_timeout=command_timeout,
+        )
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
+
+    click.echo(f"Installed and started the {SERVICE_NAME} service ({info.platform}).")
+    if detected_note:
+        click.echo(f"  {detected_note}")
+    click.echo(f"  Unit: {info.unit_path}")
+    click.echo(f"  Hub URL for the extension: ws://{resolved_host}:{port}/device")
+    click.echo(f"  Token file: {resolved_token_file}")
+    click.echo("")
+    click.echo("Check it: amplifier-browser-bridge service status")
+    click.echo(
+        f"Confirm it worked: amplifier-browser-bridge doctor --hub-url ws://{resolved_host}:{port}/agent"
+    )
+
+
+@service_group.command(name="uninstall")
+def service_uninstall_cmd() -> None:
+    """Stop and remove the hub service for this user."""
+    try:
+        service_uninstall()
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"Removed the {SERVICE_NAME} service.")
+
+
+@service_group.command(name="start")
+def service_start_cmd() -> None:
+    """Start the installed hub service."""
+    try:
+        service_start()
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"Started the {SERVICE_NAME} service.")
+
+
+@service_group.command(name="stop")
+def service_stop_cmd() -> None:
+    """Stop the hub service without uninstalling it."""
+    try:
+        service_stop()
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"Stopped the {SERVICE_NAME} service.")
+
+
+@service_group.command(name="restart")
+def service_restart_cmd() -> None:
+    """Restart the hub service -- e.g. after rotating the token file's contents."""
+    try:
+        service_restart()
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(f"Restarted the {SERVICE_NAME} service.")
+
+
+@service_group.command(name="status")
+def service_status_cmd() -> None:
+    """Show whether the hub service is installed and running.
+
+    Prints the service manager's own raw status output (`systemctl --user status` /
+    `launchctl print`) so nothing is lost relative to running that command by hand.
+    """
+    info = describe_service()
+    click.echo(f"platform: {info.platform}")
+    click.echo(f"installed: {info.installed}")
+    click.echo(f"active: {info.active}")
+    click.echo(f"detail: {info.detail}")
+    if not info.installed:
+        return
+    click.echo("")
+    try:
+        service_status()
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
+
+
+@service_group.command(name="logs")
+def service_logs_cmd() -> None:
+    """Stream or print the hub service's logs."""
+    try:
+        service_logs()
+    except ServiceUnsupportedError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @main.command()
