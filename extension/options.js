@@ -36,6 +36,19 @@
 // `renderStatus` below now branches on `response.lastError.code` (background.js,
 // connection_error.mjs) so "hub unreachable", "token rejected", and "connected and
 // working" are each their own distinct, actionable message.
+//
+// Pre-pair state authorship (real-run bug report + craft-inspector/emotion-reader
+// review, 2026-08): "not configured yet" is the FIRST thing a brand-new user sees --
+// and until this fix it rendered with the identical red `.warn` styling as a genuine
+// error (hub unreachable, token rejected). A user who has done nothing wrong yet saw
+// what looks like a failure. The fix is a THIRD authored state, `.pending` (calm,
+// neutral blue, options.html) -- for "expected, not done yet" rather than "something
+// is wrong". It is used here for the fresh-install case and for "configured but no
+// lastError yet" (the first moment after Save/Pair, before the hub round trip has had
+// time to succeed OR fail -- also expected, also not an error). `.warn` remains
+// reserved for states that name an actual, confirmed problem: a stale pre-rename
+// config (legacyConfigDetected -- something really did break), and every branch that
+// carries a concrete `lastError` code.
 
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
 import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
@@ -150,14 +163,17 @@ function renderStatus(response) {
     if (response.legacyConfigDetected) {
       // Distinct from the generic "never configured" message: this install HAD a working
       // config under the old (pre-rename) storage keys, which are no longer read. See
-      // background.js's loadConfig()/legacyConfigDetected and MIGRATION.md.
+      // background.js's loadConfig()/legacyConfigDetected and MIGRATION.md. This IS a real
+      // problem (something that used to work no longer does) -- .warn is correct here.
       statusEl.className = "warn";
       statusEl.textContent =
         "Configuration key names changed in this version -- your previous Hub URL/token are " +
         "no longer read. Re-enter them below and click Save.";
     } else {
-      statusEl.className = "warn";
-      statusEl.textContent = "Not configured -- pair with a hub, or enter a Hub URL below and click Save.";
+      // Brand-new install, nothing pasted in yet -- expected, not an error. `.pending`
+      // (calm/neutral), never `.warn` (red) -- see this file's module docstring.
+      statusEl.className = "pending";
+      statusEl.textContent = "Not paired yet -- pair with a hub below, or enter a Hub URL and click Save.";
     }
     return;
   }
@@ -184,10 +200,14 @@ function renderStatus(response) {
     return;
   }
 
-  statusEl.className = "warn";
+  // Configured, not yet connected, and no concrete error reported yet -- this is the
+  // window right after Save/Pair while the first connection attempt is still in
+  // flight. Expected and transient, not a confirmed problem -- `.pending`, not `.warn`.
+  // (A REAL problem lands in one of the three lastError branches above instead.)
+  statusEl.className = "pending";
   statusEl.textContent =
-    `Configured for ${response.hubUrl}, but not currently connected -- ` +
-    "is the hub running and reachable? Run `amplifier-browser-bridge doctor` from the CLI for a full check.";
+    `Configured for ${response.hubUrl}, connecting... if this doesn't clear, is the hub ` +
+    "running and reachable? Run `amplifier-browser-bridge doctor` from the CLI for a full check.";
 }
 
 // The honest "we tried, and we still don't know" terminal state -- what a caller lands

@@ -1,7 +1,18 @@
 """Tests for `amplifier-browser-bridge init`'s guided, interactive flow -- the
-one-command onboarding path (service install -> load extension -> pair ->
-confirm) that replaces having to know and run `init`, `service install`,
-`pair`, and `doctor` yourself, in order.
+one-command onboarding path (service install -> add browser via a code-carrying
+link -> auto-detect the connection -> confirm) that replaces having to know and
+run `init`, `service install`, `pair`, and `doctor` yourself, in order.
+
+Onboarding-v2 (real-run bug report + two independent council reviews, 2026-08):
+the flow used to ask TWO separate `[Y/n]` prompts after the service-install
+decision -- "Loaded, and its Settings page is open?" and "Entered the code and
+clicked Pair?" -- and only minted the pairing code lazily, after the first of
+those. Both are gone: the code is minted right after the hub is confirmed
+reachable (so the ONE link handed to the user already carries it), and the flow
+now WATCHES `list_devices()` for the browser to actually connect, continuing on
+its own the moment it does. Tests below cover both the auto-advance path (a live
+device appears within the watch window) and the honest timeout-fallback path (it
+doesn't, so the flow degrades to one manual confirm rather than hanging forever).
 
 `click.testing.CliRunner` never gives the process a real tty, so every test
 that wants to exercise the guided flow monkeypatches
@@ -15,6 +26,7 @@ documented.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -36,15 +48,26 @@ def _fake_service_info(*, supported: bool = True, detail: str = "ok") -> Service
     )
 
 
-def _mock_hub_client(*, ticket_ok: bool = True, list_devices_raises: bool = False) -> MagicMock:
-    """A stand-in for `cli.HubClient` used by both `_wait_for_hub_reachable`
-    (`list_devices`) and `init`'s lazy pairing mint (`create_pairing`)."""
+_LIVE_DEVICE = {"device_id": "dev-1", "label": "edge-macos", "platform": "Darwin", "tier": "live"}
+
+
+def _mock_hub_client(
+    *, ticket_ok: bool = True, list_devices_raises: bool = False, devices: list[dict] | None = None
+) -> MagicMock:
+    """A stand-in for `cli.HubClient` used by `_wait_for_hub_reachable`,
+    `_watch_for_device_connection` (both call `list_devices`), and `init`'s
+    pairing mint (`create_pairing`).
+
+    `devices` is returned verbatim from every `list_devices()` call -- pass
+    `[_LIVE_DEVICE]` to make the watch loop auto-advance immediately, or leave
+    it as `[]` (the default) to exercise the timeout-fallback path.
+    """
     client_cls = MagicMock()
     instance = client_cls.return_value
     if list_devices_raises:
         instance.list_devices = AsyncMock(side_effect=cli.HubError("hub unreachable"))
     else:
-        instance.list_devices = AsyncMock(return_value=[])
+        instance.list_devices = AsyncMock(return_value=devices if devices is not None else [])
     if ticket_ok:
         instance.create_pairing = AsyncMock(
             return_value={"ok": True, "ticket": "ABCDE-FGHIJ", "expires_in": 600, "persisted": True}
@@ -52,6 +75,19 @@ def _mock_hub_client(*, ticket_ok: bool = True, list_devices_raises: bool = Fals
     else:
         instance.create_pairing = AsyncMock(return_value={"ok": False, "error": "no token file"})
     return client_cls
+
+
+def _patch_watch_fast(**overrides):
+    """Patch the device-watch loop's timing constants down to test-speed values.
+    Individual tests override `timeout`/`poll`/`heartbeat` via kwargs when they
+    need to force the timeout-fallback branch instead of the instant-match one.
+    """
+    values = {
+        "amplifier_browser_bridge.cli._DEVICE_WATCH_TIMEOUT_S": overrides.get("timeout", 5.0),
+        "amplifier_browser_bridge.cli._DEVICE_WATCH_POLL_S": overrides.get("poll", 0.01),
+        "amplifier_browser_bridge.cli._DEVICE_WATCH_HEARTBEAT_S": overrides.get("heartbeat", 100.0),
+    }
+    return [patch(target, value) for target, value in values.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +221,7 @@ def test_guided_flow_skips_the_prompt_entirely_when_service_is_unsupported(tmp_p
 
 
 # ---------------------------------------------------------------------------
-# Guided flow: --yes automates the service but never blocks on the browser step
+# Guided flow: --yes automates the service but never blocks on anything past it
 # ---------------------------------------------------------------------------
 
 
@@ -224,27 +260,31 @@ def test_yes_flag_installs_service_then_prints_manual_pair_step_without_minting(
 
 
 # ---------------------------------------------------------------------------
-# Guided flow: full happy path, including the lazy-mint TTL fix
+# Guided flow: full happy path -- mints eagerly, leads with the link, then
+# AUTO-ADVANCES the moment the hub observes a live device (no manual confirm).
 # ---------------------------------------------------------------------------
 
 
-def test_guided_flow_full_happy_path_mints_ticket_lazily_and_confirms_via_doctor(
+def test_guided_flow_full_happy_path_auto_advances_via_device_watch_and_confirms_via_doctor(
     tmp_path: Path,
 ) -> None:
     runner = CliRunner()
     fake_info = _fake_service_info()
-    mock_client_cls = _mock_hub_client()
+    mock_client_cls = _mock_hub_client(devices=[_LIVE_DEVICE])
     all_ok_checks = [DoctorCheck("hub_reachable", "ok", "hub reachable")]
-    with (
+    patches = [
         patch("amplifier_browser_bridge.cli._stdin_is_interactive", return_value=True),
         patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.1.2.3"),
         patch("amplifier_browser_bridge.cli.describe_service", return_value=fake_info),
         patch("amplifier_browser_bridge.cli.service_install", return_value=fake_info),
         patch("amplifier_browser_bridge.cli.HubClient", mock_client_cls),
         patch("amplifier_browser_bridge.cli.run_doctor", new=AsyncMock(return_value=all_ok_checks)),
-    ):
-        # Three confirms, in order: install the service? / extension loaded? /
-        # entered the code and paired? -- empty lines accept each default (Y).
+        *_patch_watch_fast(),
+    ]
+    with _apply(patches):
+        # Exactly ONE confirm now: the service-install offer. Empty line accepts
+        # the default (Y). Nothing else should prompt -- a live device is
+        # observed on the very first poll.
         result = runner.invoke(
             cli.main,
             [
@@ -254,17 +294,18 @@ def test_guided_flow_full_happy_path_mints_ticket_lazily_and_confirms_via_doctor
                 "--token-file",
                 str(tmp_path / "tokens.json"),
             ],
-            input="\n\n\n",
+            input="\n",
         )
     assert result.exit_code == 0, result.output
     assert "Installed and started" in result.output
     assert "Confirmed: hub reachable" in result.output
-    assert "Loaded, and its Settings page is open?" in result.output
-    # The minted code, its TTL, and the re-mint command all shown together.
-    assert "ABCDE-FGHIJ@100.1.2.3:8900" in result.output
-    assert "valid 600s" in result.output
-    assert "amplifier-browser-bridge pair" in result.output
-    assert "Entered the code and clicked Pair?" in result.output
+    # The pairing link leads -- carries the code AND an expiry in the fragment.
+    assert "#pair=ABCDE-FGHIJ@100.1.2.3:8900&exp=" in result.output
+    assert "Waiting for the browser to connect" in result.output
+    assert "Connected: device dev-1 (edge-macos, Darwin) -- continuing automatically." in result.output
+    # The two old prompts are GONE.
+    assert "Loaded, and its Settings page is open?" not in result.output
+    assert "Entered the code and clicked Pair?" not in result.output
     assert "[ok]" in result.output
     assert "All checks passed" in result.output
     mock_client_cls.return_value.create_pairing.assert_awaited_once()
@@ -276,19 +317,21 @@ def test_guided_flow_final_doctor_failure_exits_nonzero(tmp_path: Path) -> None:
     reports it -- non-zero exit, not swallowed into a cheerful success."""
     runner = CliRunner()
     fake_info = _fake_service_info()
-    mock_client_cls = _mock_hub_client()
+    mock_client_cls = _mock_hub_client(devices=[_LIVE_DEVICE])
     failing_checks = [
         DoctorCheck("hub_reachable", "ok", "hub reachable"),
         DoctorCheck("device_connected", "fail", "no browser device has ever connected to this hub"),
     ]
-    with (
+    patches = [
         patch("amplifier_browser_bridge.cli._stdin_is_interactive", return_value=True),
         patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.1.2.3"),
         patch("amplifier_browser_bridge.cli.describe_service", return_value=fake_info),
         patch("amplifier_browser_bridge.cli.service_install", return_value=fake_info),
         patch("amplifier_browser_bridge.cli.HubClient", mock_client_cls),
         patch("amplifier_browser_bridge.cli.run_doctor", new=AsyncMock(return_value=failing_checks)),
-    ):
+        *_patch_watch_fast(),
+    ]
+    with _apply(patches):
         result = runner.invoke(
             cli.main,
             [
@@ -298,27 +341,73 @@ def test_guided_flow_final_doctor_failure_exits_nonzero(tmp_path: Path) -> None:
                 "--token-file",
                 str(tmp_path / "tokens.json"),
             ],
-            input="\n\n\n",
+            input="\n",
         )
     assert result.exit_code != 0
     assert "[FAIL]" in result.output
     assert "one or more checks failed" in result.output
 
 
-def test_guided_flow_declining_after_loading_never_mints_a_ticket(tmp_path: Path) -> None:
-    """Proves the TTL fix structurally: if the user isn't ready yet, no ticket
-    is minted at all -- there is nothing to expire."""
+# ---------------------------------------------------------------------------
+# Guided flow: no device connects within the watch window -> honest timeout,
+# then ONE manual fallback confirmation (never a silent hang, never a silent
+# jump-cut past the user).
+# ---------------------------------------------------------------------------
+
+
+def test_guided_flow_watch_timeout_falls_back_to_one_manual_confirm_and_then_runs_doctor(
+    tmp_path: Path,
+) -> None:
     runner = CliRunner()
     fake_info = _fake_service_info()
-    mock_client_cls = _mock_hub_client()
-    with (
+    mock_client_cls = _mock_hub_client(devices=[])  # never live -- forces the timeout branch
+    all_ok_checks = [DoctorCheck("hub_reachable", "ok", "hub reachable")]
+    patches = [
         patch("amplifier_browser_bridge.cli._stdin_is_interactive", return_value=True),
         patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.1.2.3"),
         patch("amplifier_browser_bridge.cli.describe_service", return_value=fake_info),
         patch("amplifier_browser_bridge.cli.service_install", return_value=fake_info),
         patch("amplifier_browser_bridge.cli.HubClient", mock_client_cls),
-    ):
-        # install? yes (default) / loaded? no
+        patch("amplifier_browser_bridge.cli.run_doctor", new=AsyncMock(return_value=all_ok_checks)),
+        *_patch_watch_fast(timeout=0.03, poll=0.01),
+    ]
+    with _apply(patches):
+        # install? yes (default) / fallback "still there?" -> yes (default)
+        result = runner.invoke(
+            cli.main,
+            [
+                "init",
+                "--dest",
+                str(tmp_path / "extension"),
+                "--token-file",
+                str(tmp_path / "tokens.json"),
+            ],
+            input="\n\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "Waiting for the browser to connect" in result.output
+    assert "Connected: device" not in result.output  # no device ever showed up live
+    assert "Still there? Finished loading the extension and pairing it?" in result.output
+    assert "All checks passed" in result.output
+
+
+def test_guided_flow_declining_the_timeout_fallback_confirm_skips_doctor(tmp_path: Path) -> None:
+    runner = CliRunner()
+    fake_info = _fake_service_info()
+    mock_client_cls = _mock_hub_client(devices=[])
+    with ExitStack() as stack:
+        stack.enter_context(patch("amplifier_browser_bridge.cli._stdin_is_interactive", return_value=True))
+        stack.enter_context(
+            patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.1.2.3")
+        )
+        stack.enter_context(patch("amplifier_browser_bridge.cli.describe_service", return_value=fake_info))
+        stack.enter_context(patch("amplifier_browser_bridge.cli.service_install", return_value=fake_info))
+        stack.enter_context(patch("amplifier_browser_bridge.cli.HubClient", mock_client_cls))
+        mock_doctor = stack.enter_context(patch("amplifier_browser_bridge.cli.run_doctor", new=AsyncMock()))
+        for p in _patch_watch_fast(timeout=0.03, poll=0.01):
+            stack.enter_context(p)
+
+        # install? yes / fallback "still there?" -> no
         result = runner.invoke(
             cli.main,
             [
@@ -331,40 +420,30 @@ def test_guided_flow_declining_after_loading_never_mints_a_ticket(tmp_path: Path
             input="\nn\n",
         )
     assert result.exit_code == 0, result.output
-    assert "No problem -- whenever you're ready" in result.output
-    assert "amplifier-browser-bridge pair" in result.output
-    mock_client_cls.return_value.create_pairing.assert_not_called()
-
-
-def test_guided_flow_declining_after_getting_code_skips_doctor(tmp_path: Path) -> None:
-    runner = CliRunner()
-    fake_info = _fake_service_info()
-    mock_client_cls = _mock_hub_client()
-    with (
-        patch("amplifier_browser_bridge.cli._stdin_is_interactive", return_value=True),
-        patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.1.2.3"),
-        patch("amplifier_browser_bridge.cli.describe_service", return_value=fake_info),
-        patch("amplifier_browser_bridge.cli.service_install", return_value=fake_info),
-        patch("amplifier_browser_bridge.cli.HubClient", mock_client_cls),
-        patch("amplifier_browser_bridge.cli.run_doctor", new=AsyncMock()) as mock_doctor,
-    ):
-        # install? yes / loaded? yes (mints ticket) / entered+paired? no
-        result = runner.invoke(
-            cli.main,
-            [
-                "init",
-                "--dest",
-                str(tmp_path / "extension"),
-                "--token-file",
-                str(tmp_path / "tokens.json"),
-            ],
-            input="\n\nn\n",
-        )
-    assert result.exit_code == 0, result.output
-    assert "Check any time with:" in result.output
+    assert "No problem -- check any time with:" in result.output
     assert "amplifier-browser-bridge doctor" in result.output
-    mock_client_cls.return_value.create_pairing.assert_awaited_once()
     mock_doctor.assert_not_called()
+
+    # The onboarding-local audit log recorded the abandonment -- see
+    # `_onboarding_audit_log`'s module-level design-decision comment in cli.py.
+    # token_file itself is tokens.json; the audit log sits beside it.
+    onboarding_log = (tmp_path / "tokens.json").parent / "onboarding-audit.jsonl"
+    assert onboarding_log.exists()
+    contents = onboarding_log.read_text(encoding="utf-8")
+    assert "onboarding_watch_started" in contents
+    assert "onboarding_watch_timeout" in contents
+    assert "onboarding_manual_fallback_declined" in contents
+
+
+def _apply(patches: list) -> ExitStack:
+    """Tiny helper: enter/exit a LIST of already-constructed `patch(...)` context
+    managers together, since `unittest.mock.patch` objects aren't directly
+    unpackable into a single `with (...)` tuple the way inline `patch(...)`
+    calls are elsewhere in this file."""
+    stack = ExitStack()
+    for p in patches:
+        stack.enter_context(p)
+    return stack
 
 
 # ---------------------------------------------------------------------------

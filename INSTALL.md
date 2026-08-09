@@ -196,24 +196,24 @@ that unzipping and "Load unpacked" go away.
 ## Step 3 -- Configure the extension
 
 If you're following `init`'s guided flow (a real terminal, no `--non-interactive`),
-it asks whether the extension is loaded and its Settings page is open, then mints
-a **pairing code** right at that moment (not earlier -- see the source
-repository's README, "Why the code is minted lazily"):
+it prints a single link -- in step 2 above -- that already has a **pairing code**
+built into it (minted right after the hub comes up, not later):
 
 ```
-  3. Pairing code (valid 600s, single use):
-
-       FS55M-H87XV@100.124.126.19:8900
-
-     Click the extension's toolbar icon, open Settings, enter this code under
-     "Pair with a hub", and click Pair.
+  2. Add this browser -- open this link ON THE BROWSER YOU WANT TO ADD (any
+     device on your tailnet, not necessarily this machine). The pairing code is
+     already included -- valid 600s, expires 12:46:34:
+       http://100.124.126.19:8900/setup#pair=FS55M-H87XV@100.124.126.19:8900&exp=1786301234
 ```
 
-Click the extension's toolbar icon, open **Settings**, paste that single code
-into **"Pair with a hub"**, and click **Pair** -- it fetches the Hub URL and a
+Opening that link (on the browser being paired) shows the same code with a live
+countdown -- click the extension's toolbar icon, open **Settings**, paste it
+into **"Pair with a hub"**, and click **Pair**. It fetches the Hub URL and a
 freshly-minted token automatically, so there is nothing else to copy by hand.
-If the code expires before you get here, `init` also prints the exact command
-to mint a fresh one.
+Once the hub sees the connection, `init` continues on its own -- there is no
+"did you finish?" prompt to answer. If nothing connects within a few minutes,
+`init` falls back to asking once; if the code expires before then, it also
+prints the exact command to mint a fresh one.
 
 **Configuring manually instead** (piped/non-interactive `init`, or you just
 prefer typing both values in yourself)? On the options page opened in Step 2,
@@ -381,7 +381,8 @@ in the source repository.
 
 | Symptom | Likely cause |
 |---|---|
-| Toolbar icon shows a red badge / "Not configured" | Hub URL or token was never saved -- open the options page (click the toolbar icon) and re-enter them. |
+| Options page shows a calm blue "Not paired yet" | Expected on a fresh install -- pair with a hub or enter a Hub URL/token and click Save. This is NOT an error state. |
+| Options page shows a red "auth rejected" / "unreachable" message | A real problem: the hub rejected this device's token, or nothing answered at the configured address -- re-pair, or check the hub is running and reachable. |
 | `doctor` fails at `hub_reachable` | The hub process isn't running, or the Hub URL/port doesn't match what you started it with. |
 | `doctor` fails at `token_match` | The token in the extension's options page doesn't match the hub's token file. Re-copy it from `init`'s output, or re-run `init --force` to rotate and re-enter the new one. |
 | `doctor` fails at `device_connected` | The extension is running but has never reached this specific hub -- check the Hub URL is correct and, for cross-device setups, that both devices are actually on the same tailnet (`tailscale status` on both). |

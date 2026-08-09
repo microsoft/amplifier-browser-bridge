@@ -1097,20 +1097,29 @@ def pair(ttl: int) -> None:
     host_port = urlsplit(DEFAULT_HUB_URL).netloc  # same host:port this command just talked to over /agent
     host, _, port_str = host_port.rpartition(":")
     code = f"{ticket}@{host_port}"
+    expires_at = time.time() + ttl
 
-    click.echo(f"Pairing code (valid {ttl}s, single use):")
+    # Lead with the LINK, not the bare code (originality-critic / coherence-guardian
+    # review finding): the fragment-carrying link is the one idea that could not have
+    # come from a template -- it already carries this code, so following it never
+    # sends anyone back to a terminal for anything. It works whether or not the
+    # extension is installed yet. The bare code below remains for the one case the
+    # link can't cover on its own: pasting directly into an ALREADY-OPEN Settings page.
+    if host and port_str.isdigit():
+        click.echo(
+            f"Pairing link (valid {ttl}s, single use, expires {time.strftime('%H:%M:%S', time.localtime(expires_at))}):"
+        )
+        click.echo("")
+        click.echo(f"    {_setup_pair_url(host, int(port_str), code, expires_at=expires_at)}")
+        click.echo("")
+        click.echo("Open it ON THE BROWSER BEING PAIRED -- it downloads the extension if needed and")
+        click.echo('has this code ready to paste into Settings -> "Pair with a hub" -> Pair.')
+        click.echo("")
+    click.echo('Already have Settings open? Paste this code under "Pair with a hub" -> Pair:')
     click.echo("")
     click.echo(f"    {code}")
     click.echo("")
-    click.echo("On the browser being paired: click the extension's toolbar icon, open its")
-    click.echo('Settings page, enter this code under "Pair with a hub", and click Pair.')
     click.echo("No hub URL or token to copy by hand -- pairing fetches both automatically.")
-    if host and port_str.isdigit():
-        click.echo("")
-        click.echo("Or, if that browser hasn't installed the extension yet, send it this single link")
-        click.echo("instead -- it downloads the extension AND carries this code (never sent to the")
-        click.echo("hub -- see docs/PROTOCOL.md's Pairing section):")
-        click.echo(f"    {_setup_pair_url(host, int(port_str), code)}")
     if not result.get("persisted", True):
         click.echo("")
         click.echo(
@@ -1241,14 +1250,24 @@ def _setup_url(host: str, port: int) -> str:
     return f"http://{host}:{port}/setup"
 
 
-def _setup_pair_url(host: str, port: int, code: str) -> str:
+def _setup_pair_url(host: str, port: int, code: str, *, expires_at: float | None = None) -> str:
     """The onboarding page URL with a pairing code embedded in the URL
     FRAGMENT (`#pair=...`), never a query parameter -- browsers never send a
     URL fragment to a server, so this code never touches the hub's own
     access logs or a Referer header the way a query string would. See
     onboarding.py's module docstring and hub.py's "Onboarding" section for
-    the full reasoning."""
-    return f"{_setup_url(host, port)}#pair={code}"
+    the full reasoning.
+
+    `expires_at` (a Unix-epoch-seconds float, optional) is carried alongside
+    the code as `&exp=<int>` in that SAME fragment -- same never-sent-to-
+    server property applies -- so the setup page can render a live countdown
+    (human-advocate review finding: the ticket's real, short TTL had no
+    visible countdown anywhere). Omitted entirely when not given, so an older
+    caller/link shape is unaffected."""
+    url = f"{_setup_url(host, port)}#pair={code}"
+    if expires_at is not None:
+        url += f"&exp={int(expires_at)}"
+    return url
 
 
 def _print_remaining_steps(
@@ -1348,7 +1367,8 @@ def _wait_for_hub_reachable(host: str, port: int, token: str | None, *, timeout:
 
 
 def _print_doctor_checks(checks: list[DoctorCheck]) -> bool:
-    """Print each check's icon/name/message; return True iff any check failed.
+    """Print each check's icon/name/message (plus any indented `detail`); return
+    True iff any check failed.
 
     Shared by the standalone `doctor` command and `init`'s guided flow's final
     confirmation step, so the two can never print doctor output in two
@@ -1358,9 +1378,126 @@ def _print_doctor_checks(checks: list[DoctorCheck]) -> bool:
     for check in checks:
         icon = {"ok": "[ok]  ", "fail": "[FAIL]", "skipped": "[skip]"}[check.status]
         click.echo(f"{icon} {check.name}: {check.message}")
+        if check.detail:
+            # Indented, on its own line(s) -- see DoctorCheck's docstring: this is
+            # the same real information as before, laid out so the headline above
+            # stays a single skimmable clause instead of a 700-character wall.
+            for line in check.detail.splitlines():
+                click.echo(f"         {line}")
         if check.status == "fail":
             any_failed = True
     return any_failed
+
+
+# ---------------------------------------------------------------------------
+# Onboarding audit log -- local-only instrumentation for `init`'s auto-advance
+# watch (see `_watch_for_device_connection` below).
+#
+# Judgment call, stated plainly: the councils asked for confirmation/abandonment
+# counters "wired at ship, not deferred." This project is a privacy-focused local
+# tool with zero telemetry and an existing local, human-readable JSONL audit log
+# (audit.py) as its one established observability mechanism. Recording onboarding
+# outcomes (auto-detected vs. timed-out-and-fell-back vs. abandoned) to THAT SAME
+# kind of local, append-only file satisfies the councils' intent -- these numbers
+# exist somewhere, inspectable, the moment this ships -- without adding anything
+# that leaves the machine. A phone-home metrics pipeline would contradict this
+# project's entire premise (own network, no third-party relay -- see README's
+# "Why the setup is this long"); a local file does not. If this project ever
+# wants aggregate cross-user numbers, that is a deliberate, separately-reviewed
+# decision to make later -- not something to back into via onboarding
+# instrumentation.
+# ---------------------------------------------------------------------------
+
+
+def _onboarding_audit_log(token_file: Path) -> AuditLog:
+    """The onboarding-specific audit log, sitting beside the token file (the one
+    path `init` always knows, regardless of whether the user chose a background
+    service or a foreground hub, or hasn't started the hub's OWN audit log yet).
+    Deliberately a separate file from the hub's own `hub-audit.jsonl`/
+    `amplifier-browser-bridge-audit.jsonl` -- `init` runs as its own short-lived CLI
+    process, never as (or alongside) a running `Hub` instance, so there is no
+    single shared `AuditLog` object to reuse here."""
+    return AuditLog(token_file.parent / "onboarding-audit.jsonl")
+
+
+# How long `init`'s guided flow watches for the paired browser to actually
+# connect before giving up on auto-detection and falling back to a manual
+# confirm (see `_watch_for_device_connection`). 4 minutes is comfortably inside
+# the pairing ticket's own 10-minute TTL (pairing.py's DEFAULT_TICKET_TTL_SECONDS)
+# while still being an honest, bounded wait rather than an unbounded hang -- see
+# this function's docstring for the "visible waiting state, timeout fallback"
+# requirement this exists to satisfy.
+_DEVICE_WATCH_TIMEOUT_S = 240.0
+_DEVICE_WATCH_POLL_S = 2.0
+_DEVICE_WATCH_HEARTBEAT_S = 15.0  # how often to print a "still waiting" line
+
+
+def _watch_for_device_connection(
+    host: str,
+    port: int,
+    token: str | None,
+    *,
+    ttl_seconds: float,
+    timeout: float | None = None,
+    poll: float | None = None,
+    heartbeat: float | None = None,
+) -> dict[str, Any] | None:
+    """Replace a manual "did you finish pairing? [Y/n]" prompt with the hub's own
+    observation of the event it's actually waiting on: the browser connecting.
+
+    Maintainer finding this fixes: "init should complete automatically after the
+    server install decision is made ... if you want to have it hold off on some
+    actions until a browser is connected, then it should watch for that and then
+    automatically continue and resolve w/o user interaction." Product/design
+    council condition on this fix: a VISIBLE waiting state (never a silent hang)
+    and a TIMEOUT FALLBACK to manual confirmation if the event never arrives
+    (never a silent jump-cut) -- both are implemented here, not left implicit.
+
+    Polls `list_devices()` (same mechanism `_wait_for_hub_reachable` already uses
+    for the service-install step, and `doctor`'s own `device_connected` check) --
+    never a bare `sleep()` hoping something changed (this project's own
+    "poll, don't sleep" convention, CONTRIBUTING.md).
+
+    Returns the first LIVE device's dict (registry.py's `DeviceRecord.to_dict()`
+    shape) the moment one appears, or `None` if `timeout` elapses first with none
+    live -- `None` is the honest "nothing arrived," never confused with an
+    exception or a crash.
+    """
+    timeout_s = timeout if timeout is not None else _DEVICE_WATCH_TIMEOUT_S
+    poll_s = poll if poll is not None else _DEVICE_WATCH_POLL_S
+    heartbeat_s = heartbeat if heartbeat is not None else _DEVICE_WATCH_HEARTBEAT_S
+
+    start = time.monotonic()
+    deadline = start + timeout_s
+    last_heartbeat = start
+    client = HubClient(f"ws://{host}:{port}/agent", token=token)
+
+    remaining_ttl = max(0, int(ttl_seconds))
+    click.echo(
+        f"  Waiting for the browser to connect... (checking every {poll_s:.0f}s; code "
+        f"expires in ~{remaining_ttl // 60}m{remaining_ttl % 60:02d}s; will ask after "
+        f"{int(timeout_s // 60)}m{int(timeout_s % 60):02d}s if nothing connects)"
+    )
+    while True:
+        try:
+            devices = asyncio.run(client.list_devices())
+        except (HubError, OSError, TimeoutError):
+            devices = []
+        live = [d for d in devices if d.get("tier") == "live"]
+        if live:
+            return live[-1]  # most-recently-registered live device -- the one just paired
+
+        now = time.monotonic()
+        if now >= deadline:
+            return None
+        if now - last_heartbeat >= heartbeat_s:
+            elapsed = int(now - start)
+            remaining_wait = int(deadline - now)
+            click.echo(
+                f"    ...still waiting ({elapsed}s elapsed; auto-detect gives up in {remaining_wait}s)"
+            )
+            last_heartbeat = now
+        time.sleep(poll_s)
 
 
 def _offer_service_install(
@@ -1499,10 +1636,13 @@ def init(
     From a real terminal (or with --yes), it then walks you through the rest: offers
     to install and start the hub as a background service (declining leaves you the
     exact foreground command instead -- nothing is silently skipped), confirms the
-    hub actually came up, and once you say the extension is loaded, mints a pairing
-    code right then -- not earlier -- so the code's 10-minute lifetime is spent
-    waiting on you to finish pairing, not waiting on you to find "Load unpacked" in
-    edge://extensions. If it expires anyway, `amplifier-browser-bridge pair` mints a
+    hub actually came up, mints a pairing code, and hands you ONE link that already
+    carries it -- open it on the browser you're adding and it downloads the
+    extension, walks through "Load unpacked", and has the code ready to paste. From
+    there it WATCHES for that browser to actually connect and continues on its own
+    the moment it does -- no "did you finish yet?" prompt to answer. If nothing
+    connects within a few minutes it falls back to asking, rather than waiting
+    forever; if the code expires anyway, `amplifier-browser-bridge pair` mints a
     fresh one any time.
 
     Piped, scripted, or run without a terminal attached (CI, a digital twin, --non-
@@ -1562,15 +1702,21 @@ def init(
         )
         return
 
-    click.echo("")
-    click.echo("  2. Load the extension:")
-    click.echo("     On the browser being paired (open this URL THERE -- any device on your")
-    click.echo("     tailnet, not necessarily this machine):")
-    click.echo(f"       {_setup_url(resolved_host, hub_port)}")
-    click.echo("     Same machine as this hub? Skip the download and use the staged copy directly:")
-    click.echo(f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}")
-
     if yes:
+        # --yes automates the service install but never blocks on anything past
+        # it (documented behavior, unchanged by this fix -- see the flag's own
+        # help text): a script that asked for --yes gets the exact manual steps
+        # printed instead of a live wait, since there's nothing here to watch
+        # FOR in an unattended run.
+        click.echo("")
+        click.echo("  2. Load the extension:")
+        click.echo("     On the browser being paired (open this URL THERE -- any device on your")
+        click.echo("     tailnet, not necessarily this machine):")
+        click.echo(f"       {_setup_url(resolved_host, hub_port)}")
+        click.echo("     Same machine as this hub? Skip the download and use the staged copy directly:")
+        click.echo(
+            f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}"
+        )
         click.echo("")
         click.echo("  3. Once it's loaded, get a pairing code whenever you're ready (minted fresh")
         click.echo("     right when you ask, so it can't expire waiting on you):")
@@ -1579,8 +1725,6 @@ def init(
             f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
         )
         click.echo('       Click the extension\'s toolbar icon -> Settings -> "Pair with a hub".')
-        click.echo("       (Or send whoever's browser this is the setup URL with the code embedded --")
-        click.echo("       see `amplifier-browser-bridge pair`'s own output for that link.)")
         click.echo("")
         click.echo("  4. Confirm it worked:")
         click.echo(
@@ -1589,31 +1733,16 @@ def init(
         )
         return
 
-    if not click.confirm("\n     Loaded, and its Settings page is open?", default=True):
-        click.echo("")
-        click.echo("No problem -- whenever you're ready:")
-        click.echo(
-            f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
-            f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
-        )
-        click.echo(
-            f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
-            f"--hub-url ws://{resolved_host}:{hub_port}/agent"
-        )
-        return
-
-    # Mint LAZILY -- right now, at the moment the user says they're ready, not
-    # back when the hub was started. This is the fix for the TTL trap: a
-    # first-time user finding Developer mode and Load unpacked in
-    # edge://extensions can easily take longer than the ticket's 10-minute
-    # lifetime (pairing.py's DEFAULT_TICKET_TTL_SECONDS), and a code minted
-    # eagerly (e.g. right after the service comes up) would spend most of that
-    # window waiting on a step that hasn't happened yet. Waiting for this
-    # confirmation before minting means the 10 minutes are spent on the two
-    # things actually left to do (paste the code, click Pair), which take
-    # seconds -- and the ticket is still shown with its TTL and the exact
-    # re-mint command in the same breath, so an expired code is never a silent
-    # dead end even if the user steps away mid-pairing.
+    # Real interactive terminal from here on. Mint the pairing code NOW -- not
+    # lazily after a "loaded?" confirm -- so the ONE link handed to the user in
+    # step 2 below already carries it. Real-run finding this fixes: sending the
+    # user to a bare, code-less setup URL first, and only producing the code-
+    # carrying link later (in a terminal they've already left to go load the
+    # extension), is what made getting a pairing code "a hassle" -- it forced a
+    # trip back to this terminal for something the page could have shown them
+    # from the start. 4 minutes of watch-loop headroom below (well inside the
+    # ticket's 10-minute TTL) means the code is almost never sitting idle for
+    # long even though it's minted a little earlier than strictly necessary.
     try:
         pairing_result = asyncio.run(
             HubClient(f"ws://{resolved_host}:{hub_port}/agent", token=token_result.token).create_pairing(
@@ -1626,33 +1755,59 @@ def init(
         raise click.ClickException(pairing_result.get("error") or "pairing request failed")
 
     code = f"{pairing_result['ticket']}@{resolved_host}:{hub_port}"
+    expires_at = time.time() + DEFAULT_TICKET_TTL_SECONDS
+    ttl_i = int(DEFAULT_TICKET_TTL_SECONDS)
+
     click.echo("")
-    click.echo(f"  3. Pairing code (valid {int(DEFAULT_TICKET_TTL_SECONDS)}s, single use):")
-    click.echo("")
-    click.echo(f"       {code}")
-    click.echo("")
-    click.echo("     Click the extension's toolbar icon, open Settings, enter this code under")
-    click.echo('     "Pair with a hub", and click Pair. If it expires before you get there, get a')
+    click.echo("  2. Add this browser -- open this link ON THE BROWSER YOU WANT TO ADD (any")
+    click.echo("     device on your tailnet, not necessarily this machine). The pairing code is")
     click.echo(
-        f"     fresh one: AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
-        f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
+        f"     already included -- valid {ttl_i}s, expires {time.strftime('%H:%M:%S', time.localtime(expires_at))}:"
     )
-    click.echo("")
-    click.echo("     Or send whoever's browser this is a single link -- it carries this code in the")
-    click.echo("     URL fragment, which is never sent to the hub, so it never touches server logs:")
-    click.echo(f"       {_setup_pair_url(resolved_host, hub_port, code)}")
+    click.echo(f"       {_setup_pair_url(resolved_host, hub_port, code, expires_at=expires_at)}")
+    click.echo("     It downloads the extension, walks through 'Load unpacked', then Settings -> Pair")
+    click.echo("     (code pre-filled). Same machine as this hub? Skip straight to Settings -> Pair:")
+    click.echo(f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}")
+    click.echo("     Code expired, or pairing a different browser? amplifier-browser-bridge pair")
 
-    if not click.confirm("\n     Entered the code and clicked Pair?", default=True):
-        click.echo("")
-        click.echo("Check any time with:")
-        click.echo(
-            f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
-            f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+    # Replaces TWO separate [Y/n] prompts ("Loaded, and its Settings page is
+    # open?" / "Entered the code and clicked Pair?") with observation of the
+    # event those prompts existed to ask about: the hub sees the device
+    # connect. See `_watch_for_device_connection`'s docstring for the visible-
+    # waiting-state and timeout-fallback requirements this satisfies.
+    audit = _onboarding_audit_log(token_result.token_file)
+    audit.record("onboarding_watch_started", ttl_seconds=DEFAULT_TICKET_TTL_SECONDS)
+    click.echo("")
+    watch_start = time.monotonic()
+    device = _watch_for_device_connection(
+        resolved_host, hub_port, token_result.token, ttl_seconds=DEFAULT_TICKET_TTL_SECONDS
+    )
+    elapsed_s = round(time.monotonic() - watch_start, 1)
+
+    if device is not None:
+        audit.record(
+            "onboarding_watch_device_observed", device_id=device.get("device_id"), elapsed_s=elapsed_s
         )
-        return
+        click.echo(
+            f"  Connected: device {device.get('device_id')} ({device.get('label', '?')}, "
+            f"{device.get('platform', '?')}) -- continuing automatically."
+        )
+    else:
+        audit.record("onboarding_watch_timeout", elapsed_s=elapsed_s)
+        click.echo("")
+        if not click.confirm("  Still there? Finished loading the extension and pairing it?", default=True):
+            audit.record("onboarding_manual_fallback_declined")
+            click.echo("")
+            click.echo("No problem -- check any time with:")
+            click.echo(
+                f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+                f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+            )
+            return
+        audit.record("onboarding_manual_fallback_confirmed")
 
     click.echo("")
-    click.echo("  4. Confirming...")
+    click.echo("  3. Confirming...")
     checks = asyncio.run(
         run_doctor(f"ws://{resolved_host}:{hub_port}/agent", token_result.token, token_result.token_file)
     )

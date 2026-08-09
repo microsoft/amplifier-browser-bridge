@@ -142,6 +142,11 @@ _STYLE = """
     word-break: break-all; color: #7ee787;
   }
   .pair-hint { color: #8B949E; font-size: 0.85rem; margin-top: 8px; }
+  .pair-countdown { color: #7ee787; font-size: 0.85rem; margin-top: 4px; opacity: 0.85; }
+  .pair-expired {
+    background: #241318; border: 1px solid #b4402a; border-radius: 6px;
+    padding: 10px; margin-top: 10px; font-size: 0.88rem; color: #ffb3a3;
+  }
   .muted { color: #8B949E; font-size: 0.9rem; }
   #pair-section-none, #pair-section-found { display: none; }
 """
@@ -248,11 +253,38 @@ _PAIR_SCRIPT = """
   var hash = (window.location.hash || "").replace(/^#/, "");
   var params = new URLSearchParams(hash);
   var code = params.get("pair");
+  var exp = params.get("exp");
   var found = document.getElementById("pair-section-found");
   var none = document.getElementById("pair-section-none");
+  var countdownEl = document.getElementById("pair-countdown");
+  var expiredEl = document.getElementById("pair-expired");
   if (code) {
     document.getElementById("pair-code-value").textContent = code;
     found.style.display = "block";
+    // Countdown (human-advocate review finding: the ticket's real, short TTL had
+    // NO visible countdown anywhere -- a code could silently die mid-read with no
+    // warning). `exp` is a Unix-epoch-seconds expiry, carried in the URL FRAGMENT
+    // like the code itself -- never sent to the server, never logged (see this
+    // module's docstring). Absent `exp` (e.g. an older printed link), the box just
+    // never shows a countdown -- never a fake/guessed one.
+    var expiresAtMs = exp ? parseInt(exp, 10) * 1000 : null;
+    if (expiresAtMs && countdownEl) {
+      var tick = function () {
+        var remainingMs = expiresAtMs - Date.now();
+        if (remainingMs <= 0) {
+          clearInterval(timer);
+          countdownEl.textContent = "";
+          if (expiredEl) expiredEl.style.display = "block";
+          found.style.opacity = "0.5";
+          return;
+        }
+        var s = Math.floor(remainingMs / 1000);
+        var m = Math.floor(s / 60);
+        countdownEl.textContent = "Expires in " + m + ":" + String(s % 60).padStart(2, "0");
+      };
+      tick();
+      var timer = setInterval(tick, 1000);
+    }
   } else {
     none.style.display = "block";
   }
@@ -299,13 +331,19 @@ def render_setup_page(*, platform: str, host: str, port: int, android_artifact_a
 <body>
 <main>
 <h1>Amplifier Browser Bridge</h1>
-<p class="subtitle">Add this browser to the hub at {host}:{port}.</p>
+<p class="subtitle">Lets an agent drive this browser -- your own login, your own network, no third-party relay. Adding this browser to the hub at {host}:{port}.</p>
 
 <div class="honesty">
-This is a <b>sideload</b>, not a store install. Downloading the extension here
-saves you finding a path on the hub's own filesystem -- you still unzip it and
-still pick the folder yourself in Edge. See "Why isn't this page locked down?"
-near the bottom before you wonder about it.
+This is a <b>sideload</b>, not a store install -- you'll unzip the download and
+pick the folder yourself in step 1. <details style="display:inline;"><summary style="display:inline;font-weight:normal;color:#8B949E;">Why isn't this locked down with a token?</summary><br>A browser that has never been configured holds
+no hub token yet -- it cannot authenticate to fetch the thing that would give
+it one. This page hands out only this project's own source code (already
+public on GitHub, not a secret) and generic install instructions -- never the
+long-lived hub token, never the connected-device list. Reachable only by
+whatever is already on your tailnet, same as every other hub route. The
+pairing code below, when present, is a short-lived, single-use ticket whose
+only power is bootstrapping one new device -- see <code>pairing.py</code>.
+</details>
 </div>
 
 <h2>1 &mdash; Get the extension</h2>
@@ -315,39 +353,19 @@ near the bottom before you wonder about it.
 <h2>2 &mdash; Pair with this hub</h2>
 <div id="pair-section-found" class="pair-box">
   <div class="pair-code" id="pair-code-value"></div>
+  <div class="pair-countdown" id="pair-countdown"></div>
   <div class="pair-hint">Open the extension's toolbar icon &rarr; Settings &rarr;
-  paste this under "Pair with a hub" &rarr; click Pair. Single-use, short-lived --
-  if it stops working, ask whoever sent you this link for a fresh one.</div>
+  paste this under "Pair with a hub" &rarr; click Pair.</div>
+  <div class="pair-expired" id="pair-expired" style="display:none;">This code has
+  expired. Get a fresh one: <code>amplifier-browser-bridge pair</code></div>
 </div>
 <div id="pair-section-none" class="pair-box" style="border-color:#30363D;background:#161B22;">
   <div class="muted">No pairing code was included in this link.</div>
   <div class="pair-hint">On the hub machine, run:<br><code>{pair_cmd}</code><br>
   then paste the printed code into the extension's Settings &rarr;
-  "Pair with a hub", or ask for a link that already has one embedded
-  (<code>#pair=&lt;code&gt;</code>).</div>
+  "Pair with a hub".</div>
 </div>
 {_PAIR_SCRIPT}
-
-<details>
-<summary>Why isn't this page (or the extension download) locked down with a token?</summary>
-<div class="muted">
-<p>A browser that has never been configured holds no hub token yet -- it cannot
-authenticate to fetch the thing that would give it one. Gating this page behind
-the same token everything else uses would make it unreachable by the one
-browser that needs it.</p>
-<p>What this page actually exposes to anyone who can reach this address (i.e.
-anyone already on your tailnet, the same boundary every other hub route relies
-on): this project's own source code -- already public on GitHub, not a secret --
-and generic install instructions. It never exposes the long-lived hub token,
-never lists connected devices, and never lets a visitor run a command. The
-pairing code above, when present, is a short-lived (minutes), single-use ticket
-whose only power is bootstrapping one new device's connection -- see
-<code>pairing.py</code>'s documented ticket design. The Android download (when
-available) does carry a live credential by design -- see the warning in that
-section -- under the identical tailnet-only exposure the old standalone
-Android server always had; nothing here widens that.</p>
-</div>
-</details>
 </main>
 </body>
 </html>

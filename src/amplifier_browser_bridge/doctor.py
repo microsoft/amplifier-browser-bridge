@@ -40,14 +40,10 @@ CheckStatus = Literal["ok", "fail", "skipped"]
 # real gate. See docs/tailscale-acl-example.json for a starting-point
 # restrictive policy, and SECURITY.md's rewritten threat-model section.
 _ACL_DISCLOSURE = (
-    "Tailscale's DEFAULT policy allows every device on your tailnet to reach every other "
-    "device on every port -- this is Tailscale's own default, not something this project "
-    "configures. Unless you have written a restrictive ACL in your tailnet's admin console "
-    "(https://login.tailscale.com/admin/acls), any device on your tailnet -- not just the "
-    "ones you intend to use with this hub -- can reach it. A starting-point restrictive ACL "
-    "is shipped at docs/tailscale-acl-example.hujson (scopes reachability of the hub's port to "
-    "a tag you assign to your own devices). Until you apply something like it, the per-device "
-    "token is the real gate, not the tailnet."
+    "Tailscale's default ACL allows every device on your tailnet to reach every port on "
+    "every other device -- unless you've written a restrictive ACL of your own "
+    "(https://login.tailscale.com/admin/acls), the per-device token is your real security "
+    "boundary, not the tailnet. Starting-point ACL: docs/tailscale-acl-example.hujson."
 )
 
 
@@ -56,6 +52,13 @@ class DoctorCheck:
     name: str
     status: CheckStatus
     message: str
+    # Optional expanded explanation, printed indented below `message` (see cli.py's
+    # `_print_doctor_checks`). Split out (rather than folded into one long `message`
+    # string) so the headline stays a single skimmable clause and the full honest
+    # detail -- which some checks (network_exposure) have a real amount of --
+    # doesn't force every check's line to wrap into a paragraph. Both fields are
+    # always real information; nothing here is truncated or hidden, only laid out.
+    detail: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -115,43 +118,49 @@ def _check_network_exposure(hub_url: str, auth_enabled: bool) -> DoctorCheck:
     """
     host = urlsplit(hub_url).hostname or ""
     detected_tailscale_ip = detect_tailscale_ip()
-    lines: list[str] = []
 
+    # `message`: one skimmable clause -- what a glance at the checklist needs.
+    # `detail`: the full honest explanation, printed indented below it (see
+    # cli.py's `_print_doctor_checks`) -- nothing here is cut, only laid out so
+    # "is this fine" and "here's exactly why, and what to double-check" don't
+    # have to compete for the same line. See DoctorCheck's docstring.
     if is_wildcard_bind(host):
-        lines.append(
-            f"this doctor invocation targets a WILDCARD host ({host!r}) -- if the running hub "
-            "was actually started with --host matching this, it is reachable from EVERY network "
-            "interface this machine has, not just the tailnet."
+        message = f"targets a WILDCARD host ({host!r}) -- reachable from every interface if the hub matches."
+    elif is_loopback(host):
+        message = f"targets loopback ({host!r}) -- cannot prove the hub isn't ALSO bound wider."
+    else:
+        message = f"targets {host!r} -- confirm this is your tailnet IP, not something wider."
+
+    detail_lines: list[str] = []
+    if is_wildcard_bind(host):
+        detail_lines.append(
+            "if the running hub was actually started with --host matching this, it is reachable "
+            "from EVERY network interface this machine has, not just the tailnet."
         )
     elif is_loopback(host):
-        lines.append(
-            f"this doctor invocation targets a loopback host ({host!r}). Note: this check can "
-            "only see what host YOU pointed doctor at -- it cannot prove the running hub process "
-            "isn't ALSO bound to a wider address (e.g. started with --host 0.0.0.0). Confirm "
-            "separately how the hub you're diagnosing was actually started."
-        )
-    else:
-        lines.append(
-            f"this doctor invocation targets host {host!r} -- not a wildcard bind, but confirm "
-            "this is the address you intend (your machine's own tailnet IP, not something wider)."
+        detail_lines.append(
+            "this check can only see what host YOU pointed doctor at -- it cannot prove the "
+            "running hub process isn't ALSO bound to a wider address (e.g. started with "
+            "--host 0.0.0.0). Confirm separately how the hub you're diagnosing was actually started."
         )
 
     if detected_tailscale_ip:
-        lines.append(f"this machine's own Tailscale IP: {detected_tailscale_ip}.")
+        detail_lines.append(f"this machine's own Tailscale IP: {detected_tailscale_ip}.")
     else:
-        lines.append(
+        detail_lines.append(
             "could not detect a Tailscale IP on this machine (`tailscale ip -4` unavailable or failed)."
         )
 
     if not auth_enabled:
-        lines.append(
-            "CRITICAL COMBINATION: auth is DISABLED (see token_store above). If this hub is "
-            "reachable from anywhere beyond this machine, ANY device that can reach the port "
-            "controls every connected browser, with no token check at all."
+        message = "CRITICAL COMBINATION: auth is DISABLED and doctor " + message
+        detail_lines.append(
+            "auth is DISABLED (see token_store above). If this hub is reachable from anywhere "
+            "beyond this machine, ANY device that can reach the port controls every connected "
+            "browser, with no token check at all."
         )
 
-    lines.append(_ACL_DISCLOSURE)
-    return DoctorCheck("network_exposure", "ok", " ".join(lines))
+    detail_lines.append(_ACL_DISCLOSURE)
+    return DoctorCheck("network_exposure", "ok", message, detail="\n".join(detail_lines))
 
 
 def _check_service_status(hub_url: str) -> DoctorCheck:

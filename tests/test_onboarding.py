@@ -71,3 +71,23 @@ def test_render_setup_page_explains_auth_reasoning() -> None:
     html = render_setup_page(platform="desktop", host="h", port=1, android_artifact_available=False)
     assert "locked down" in html
     assert "long-lived hub token" in html
+
+
+def test_render_setup_page_leads_with_purpose_not_defensive_copy() -> None:
+    """purpose-keeper review finding: the product's actual differentiator -- your
+    own already-logged-in browser, your own network, no third-party relay --
+    appeared NOWHERE the user reads during onboarding. It must be readable
+    up-front, not buried in a security disclosure delivered after pairing."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_artifact_available=False)
+    assert "your own network" in html
+    assert "no third-party relay" in html
+
+
+def test_render_setup_page_countdown_script_present() -> None:
+    """human-advocate review finding: the ticket's real, short TTL had no visible
+    countdown anywhere. The setup page now ticks one down from an `exp` fragment
+    param (never sent to the server -- see this module's docstring)."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_artifact_available=False)
+    assert "pair-countdown" in html
+    assert "pair-expired" in html
+    assert 'params.get("exp")' in html

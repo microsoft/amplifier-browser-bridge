@@ -131,14 +131,17 @@ function renderStatus(response) {
     if (response.legacyConfigDetected) {
       // This install HAD a working config under the old (pre-rename) storage
       // keys, which are no longer read. See background.js's loadConfig() and
-      // MIGRATION.md.
+      // MIGRATION.md. This IS a real problem -- "warn" (red) is correct.
       setStatus(
         "warn",
         "Configuration key names changed in this version -- your previous Hub URL and token " +
           "are no longer read. Open Settings and re-enter them.",
       );
     } else {
-      setStatus("warn", "Not configured -- open Settings to enter a Hub URL and token.");
+      // Brand-new install, nothing configured yet -- expected, not an error.
+      // "pending" (calm/neutral), never "warn" (red) -- mirrors options.js's
+      // renderStatus; see that file's module docstring for the full reasoning.
+      setStatus("pending", "Not paired yet -- open Settings to pair with a hub.");
     }
     return;
   }
@@ -146,9 +149,13 @@ function renderStatus(response) {
   if (response.connected) {
     setStatus("ok", "Connected.");
   } else {
+    // Configured but not (yet) connected, with no further detail available here
+    // (this panel is read-only status -- see this file's module docstring for
+    // exactly which fields background.js supplies). Calm/neutral, not red: a
+    // fresh pair/reconnect attempt in flight looks identical to this panel.
     setStatus(
-      "warn",
-      "Configured, but not currently connected -- is the hub running and reachable?",
+      "pending",
+      "Configured, connecting... if this doesn't clear, is the hub running and reachable?",
     );
   }
 }

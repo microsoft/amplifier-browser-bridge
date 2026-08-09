@@ -175,7 +175,11 @@ test("renderStatus shows the unreachable message verbatim when nothing answered 
   assert.match(elements.status.textContent, /Could not reach the hub/);
 });
 
-test("renderStatus falls back to the generic message when lastError is null (attempt still in flight)", async () => {
+test("renderStatus falls back to a calm PENDING message (not warn/red) when lastError is null (attempt still in flight)", async () => {
+  // craft-inspector/emotion-reader fix: the window right after Save/Pair, before the
+  // hub round trip has had time to succeed or fail, is expected and transient -- not a
+  // confirmed problem. Must render `.pending`, never `.warn` (which is reserved for a
+  // real, named lastError).
   const elements = installFakeDom();
   globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
   globalThis.chrome = { storage: { local: { get: async () => ({}), set: async () => {} } }, runtime: {} };
@@ -188,8 +192,35 @@ test("renderStatus falls back to the generic message when lastError is null (att
     lastError: null,
   });
 
+  assert.equal(elements.status.className, "pending");
+  assert.match(elements.status.textContent, /connecting/i);
+});
+
+test("renderStatus shows a calm PENDING message (not warn/red) for a brand-new, never-configured install", async () => {
+  // The bug report this fixes: the pre-pair state -- the FIRST thing a new user sees --
+  // rendered with the same red styling as a genuine hub-unreachable/token-rejected
+  // error, even though nothing has gone wrong yet.
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = { storage: { local: { get: async () => ({}), set: async () => {} } }, runtime: {} };
+  const mod = await importOptionsFresh();
+
+  mod.renderStatus({ configured: false, connected: false, legacyConfigDetected: false });
+
+  assert.equal(elements.status.className, "pending");
+  assert.match(elements.status.textContent, /not paired yet/i);
+});
+
+test("renderStatus keeps the red WARN style for the legacy-config case -- that IS a real, actionable problem", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = { storage: { local: { get: async () => ({}), set: async () => {} } }, runtime: {} };
+  const mod = await importOptionsFresh();
+
+  mod.renderStatus({ configured: false, connected: false, legacyConfigDetected: true });
+
   assert.equal(elements.status.className, "warn");
-  assert.match(elements.status.textContent, /not currently connected/);
+  assert.match(elements.status.textContent, /configuration key names changed/i);
 });
 
 test("renderStatus still shows the connected message when connected is true, regardless of any stale lastError", async () => {

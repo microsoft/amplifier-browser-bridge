@@ -38,6 +38,10 @@ h1 {
 #status.ok { background: #e6f4ea; color: #1e4620; }
 #status.warn { background: #fdecea; color: #611a15; }
 #status.unknown { background: #f1f1f1; color: #333; }
+/* "pending" mirrors options.html's authored pre-pair/connecting state -- calm and
+ * neutral, deliberately not the same red as .warn (reserved for a confirmed
+ * problem). See options.js's module docstring for the full reasoning. */
+#status.pending { background: #eaf1fb; color: #1c3d5f; }
 
 dl {
   margin: 0.75rem 0 0;

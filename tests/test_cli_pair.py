@@ -98,7 +98,11 @@ def test_pair_prints_a_single_code_with_no_raw_url_or_token(running_hub, monkeyp
     result = runner.invoke(cli.main, ["pair"])
 
     assert result.exit_code == 0, result.output
-    assert "Pairing code" in result.output
+    # The link leads (originality-critic/coherence-guardian fix: the fragment
+    # link that already carries the code is the primary path now); the bare
+    # `<ticket>@host:port` code remains as the fallback for pasting directly
+    # into an already-open Settings page.
+    assert "Pairing link" in result.output
     assert f"@127.0.0.1:{port}" in result.output
     # The whole point: no raw ws:// URL printed directly -- only the compact
     # `<ticket>@host:port` code (host/port alone, not a dialable URL).

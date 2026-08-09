@@ -225,13 +225,20 @@ def test_doctor_network_exposure_notes_loopback_cannot_prove_wider_bind_absent(
 
 
 def test_doctor_network_exposure_includes_tailscale_acl_disclosure(tmp_path: Path, token_file: Path) -> None:
+    """The full ACL disclosure + detected IP live in `detail` (printed indented below
+    the short `message` headline -- see DoctorCheck's docstring), not `message`
+    itself -- keeps the checklist line skimmable while the honest detail stays
+    complete and present, just laid out on its own line(s)."""
     with patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value="100.124.126.19"):
         checks = asyncio.run(run_doctor("ws://127.0.0.1:8900/agent", "secret-123", token_file))
 
     check = _by_name(checks, "network_exposure")
-    assert "allows every device on your tailnet" in check.message
-    assert "docs/tailscale-acl-example.hujson" in check.message
-    assert "100.124.126.19" in check.message  # detected IP surfaced to the user
+    assert check.detail is not None
+    assert "allows every device on your tailnet" in check.detail
+    assert "docs/tailscale-acl-example.hujson" in check.detail
+    assert "100.124.126.19" in check.detail  # detected IP surfaced to the user
+    # The headline itself stays short -- no giant paragraph crammed into `message`.
+    assert len(check.message) < 120
 
 
 def test_doctor_network_exposure_flags_critical_combo_when_auth_disabled(tmp_path: Path) -> None:

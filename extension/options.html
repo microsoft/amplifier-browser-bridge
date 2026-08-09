@@ -38,6 +38,13 @@
   #status.ok { background: #e6f4ea; color: #1e4620; }
   #status.warn { background: #fdecea; color: #611a15; }
   #status.unknown { background: #f1f1f1; color: #333; }
+  /* "pending" is a calm, neutral state -- expected-and-not-done-yet (fresh
+     install, mid-pairing) -- deliberately NOT the same red as .warn, which is
+     reserved for a confirmed problem (auth rejected, hub unreachable, a real
+     hub-side error). A brand-new user landing on red before they've done
+     anything reads as "you broke it"; this does not. See options.js's
+     renderStatus for exactly which branches use which class. */
+  #status.pending { background: #eaf1fb; color: #1c3d5f; }
   #pair-error, #error { color: #b00020; font-size: 0.9rem; margin-top: 0.5rem; min-height: 1.2em; }
   #toggle-token { cursor: pointer; font-size: 0.85rem; margin-left: 0.5rem; }
   details {
