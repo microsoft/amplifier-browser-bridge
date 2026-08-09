@@ -61,6 +61,17 @@ _EXTENSION_FILES = (
     # note in options.js/background.js for the full failure chain this caused.
     "effects_collector.mjs",
     "manifest.json",
+    # Toolbar/store icons. Referenced by manifest.json's `icons` and
+    # `action.default_icon`, so `verify_extension_integrity` (which reads those
+    # fields via collect_manifest_file_refs) fails the staged directory if they
+    # are omitted here -- the same whitelist-omission failure mode as
+    # effects_collector.mjs above, caught at staging time rather than on load.
+    # These are the only entries with a subdirectory component; the copy loop
+    # creates parent directories for exactly that reason.
+    "icons/icon-16.png",
+    "icons/icon-32.png",
+    "icons/icon-48.png",
+    "icons/icon-128.png",
 )
 
 
@@ -137,7 +148,9 @@ def stage_extension(dest: str | Path | None = None, source: str | Path | None = 
         src_file = source_path / name
         if not src_file.is_file():
             raise ExtensionSourceNotFoundError(f"expected extension file missing from source: {src_file}")
-        shutil.copy2(src_file, dest_path / name)
+        dest_file = dest_path / name
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dest_file)
 
     # Fail loud rather than silently hand back a directory whose background.js (or
     # any other shipped file) imports something `_EXTENSION_FILES` forgot to include --

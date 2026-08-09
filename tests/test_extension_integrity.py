@@ -116,13 +116,25 @@ def test_skips_glob_patterns_in_web_accessible_resources() -> None:
     assert collect_manifest_file_refs(manifest) == ["fixed.json"]
 
 
-def test_real_manifest_json_yields_exactly_the_two_files_it_references() -> None:
+def test_real_manifest_json_yields_exactly_the_files_it_references() -> None:
     """Cross-check against the actual shipped manifest.json (not a synthetic fixture)
     so this test breaks loudly if the real manifest grows a field this function
-    doesn't yet know how to read."""
+    doesn't yet know how to read.
+
+    The icon entries arrived with the toolbar icon; they are listed here (rather
+    than globbed) so that adding a manifest field without teaching
+    `collect_manifest_file_refs` about it still fails, which is the whole point
+    of pinning the exact set."""
     repo_root = Path(__file__).resolve().parents[1]
     manifest = json.loads((repo_root / "extension" / "manifest.json").read_text(encoding="utf-8"))
-    assert set(collect_manifest_file_refs(manifest)) == {"background.js", "options.html"}
+    assert set(collect_manifest_file_refs(manifest)) == {
+        "background.js",
+        "options.html",
+        "icons/icon-16.png",
+        "icons/icon-32.png",
+        "icons/icon-48.png",
+        "icons/icon-128.png",
+    }
 
 
 # ---------------------------------------------------------------------------

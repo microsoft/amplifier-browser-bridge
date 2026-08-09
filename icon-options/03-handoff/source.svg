@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6ea8fe"/>
+      <stop offset="1" stop-color="#3a7bfd"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#g3)"/>
+  <!-- desktop window, right -->
+  <rect x="54" y="40" width="58" height="48" rx="8" fill="#FFFFFF"/>
+  <rect x="54" y="40" width="58" height="13" rx="8" fill="#0b2545"/>
+  <rect x="54" y="47" width="58" height="6" fill="#0b2545"/>
+  <!-- phone, left -->
+  <rect x="18" y="52" width="26" height="44" rx="7" fill="#FFFFFF"/>
+  <rect x="18" y="52" width="26" height="9" rx="7" fill="#0b2545"/>
+  <rect x="18" y="56" width="26" height="5" fill="#0b2545"/>
+  <!-- handoff arc, phone -> window -->
+  <path d="M 26 44 Q 64 12 100 30" fill="none" stroke="#FFFFFF"
+        stroke-width="8" stroke-linecap="round"/>
+  <path d="M 100 30 L 86 26 L 94 40 Z" fill="#FFFFFF"/>
+</svg>
