@@ -164,11 +164,18 @@ ZIP="$DIST_DIR/${NAME}-v${VERSION}.zip"
 rm -rf "$STAGE" "$ZIP"
 mkdir -p "$STAGE"
 
+# Entries in _EXTENSION_FILES may carry a subdirectory component (icons/*.png).
+# Copy to the full relative destination and create its parent first -- a flat
+# `cp "$src" "$STAGE/"` silently flattens `icons/icon-16.png` to `icon-16.png`,
+# which the manifest then references at a path that does not exist. setup.py's
+# stage_extension() creates parents for the same reason; these two copy loops
+# must agree, because each independently decides what actually ships.
 for f in "${REQUIRED[@]}"; do
+    mkdir -p "$STAGE/$(dirname "$f")"
     if [ "$f" = "INSTALL.md" ]; then
-        cp "$REPO_ROOT/INSTALL.md" "$STAGE/"
+        cp "$REPO_ROOT/INSTALL.md" "$STAGE/$f"
     else
-        cp "$EXTENSION_SRC/$f" "$STAGE/"
+        cp "$EXTENSION_SRC/$f" "$STAGE/$f"
     fi
 done
 
