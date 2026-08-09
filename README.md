@@ -82,25 +82,33 @@ deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brie
 repo's own source -- see CONTRIBUTING.md's "Dev setup" if that's what you're doing instead.
 
 You need [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and Python 3.12 or
-newer. **This package is not on PyPI yet** (see "Status" above -- no packaged release), so the
-only install path that works today is from a local clone.
+newer. **This package is not on PyPI yet** (see "Status" above -- no packaged release), but the
+repo is public, so `uv tool install` can install straight from GitHub -- no local clone
+required. (An explicit local-clone path is also shown further below for anyone who wants to
+inspect the source first, or who needs an editable checkout -- see CONTRIBUTING.md's "Dev
+setup" for that.)
 
 Every command below was run verbatim on a clean machine with no prior configuration -- see
 "Verified clean-room install" below for the full transcript, captured from a real run.
 
 ```bash
-# 1. Clone. The repo is public; no credentials needed.
+# 1. Install straight from GitHub (public repo, no credentials needed, no local clone
+#    required). Verified working 2026-08-08 -- see "Verified clean-room install" below.
+#    Once this package is published to PyPI, `uv tool install amplifier-browser-bridge`
+#    (no `git+`, no URL) will work too and this collapses to that one command.
+uv tool install git+https://github.com/bkrabach/amplifier-browser-bridge@main
+
+# 2. First-run setup: generates a hub token, stages the extension into a stable directory,
+#    and prints the exact remaining manual steps.
+amplifier-browser-bridge init
+```
+
+Prefer a local clone (e.g. to read the source, or to pin a specific commit)?
+
+```bash
 git clone https://github.com/bkrabach/amplifier-browser-bridge.git
 cd amplifier-browser-bridge
-
-# 2. Install (a real, non-editable install -- NOT `uv pip install -e .`).
-#    Once this package is published to PyPI, `uv tool install amplifier-browser-bridge`
-#    will work from anywhere and steps 1-2 collapse into that one command. It does not
-#    work yet.
-uv tool install .
-
-# 3. First-run setup: generates a hub token, stages the extension into a stable directory,
-#    and prints the exact remaining manual steps.
+uv tool install .        # a real, non-editable install -- NOT `uv pip install -e .`
 amplifier-browser-bridge init
 ```
 
@@ -112,9 +120,12 @@ Staged extension -> ~/.local/share/amplifier-browser-bridge/extension
 
 Remaining steps (manual -- Edge has no CLI for these):
 
-  1. Start the hub:
-       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 100.x.y.z --port 8900
+  1. Start the hub as a background service (recommended -- survives logout and reboot):
+       amplifier-browser-bridge service install --host 100.x.y.z --port 8900
        (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.x.y.z)
+
+     Or run it directly in this terminal instead (stops when the terminal closes):
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 100.x.y.z --port 8900
 
   2. Load the extension:
        edge://extensions -> enable Developer mode -> Load unpacked ->
@@ -140,6 +151,14 @@ detected, `init` falls back to `127.0.0.1` and says so explicitly -- cross-devic
 requires passing `--hub-host <your tailnet IP>` yourself. Passing (or auto-falling to) a
 wildcard host anywhere prints a specific, named warning listing exactly what it exposes. See
 [SECURITY.md](SECURITY.md) for the full accounting.
+
+**Running the hub as a service (recommended).** Step 1's `service install` is what makes the
+hub survive logout and reboot instead of dying with the terminal it was started in -- see
+"Running the hub as a service" below for the full command surface (`start`/`stop`/`restart`/
+`status`/`logs`/`uninstall`), what gets baked into the unit, how token rotation and Tailscale
+IP changes are handled, and the real install-to-uninstall transcript this was verified against.
+The foreground `hub` command shown as a fallback above still works exactly as before, for quick
+local testing or when a service manager isn't available (see that section's platform table).
 
 Follow those four steps -- step 2 (loading an unpacked extension) is a genuinely manual step;
 Edge has no CLI or API for it. Then issue a command:
@@ -210,6 +229,119 @@ Auth is disabled by default in dev and this is loudly logged by the hub. `amplif
 real token and writes it to the hub's token file; pass `AMPLIFIER_BROWSER_BRIDGE_TOKEN` (matching what's on the
 extension's options page) to the CLI, MCP server, or `amplifier-browser-bridge doctor`. See `docs/PROTOCOL.md`
 ("Authentication") for the full resolution order.
+
+### Running the hub as a service
+
+`amplifier-browser-bridge service` runs the hub as a **systemd --user** unit on Linux, or a
+**launchd** user agent on macOS, so it survives logout and reboot instead of living in a
+terminal you have to keep open -- while never running as root or needing sudo (a browser
+remote-control hub running as root would be indefensible).
+
+```bash
+amplifier-browser-bridge service install --host <host> --port 8900   # install + start (as init prints)
+amplifier-browser-bridge service status                              # installed? active? raw status too
+amplifier-browser-bridge service stop                                 # stop without uninstalling
+amplifier-browser-bridge service start                                # start it again
+amplifier-browser-bridge service restart                              # e.g. after rotating the token
+amplifier-browser-bridge service uninstall                             # stop + remove the unit entirely
+amplifier-browser-bridge service logs                                  # tail the service's own logs
+```
+
+**What gets baked into the unit, and why.** Host, port, and the token file's PATH are baked in
+as explicit `hub --host/--port/--token-file` **command-line arguments**, never environment
+variables -- systemd --user and launchd services do **not** inherit the installer's shell
+environment, so anything ambient (an exported env var) silently vanishes for a service-mode
+process. Passing these as arguments instead of relying on inherited env sidesteps that class of
+bug entirely, rather than working around it. The audit log defaults to
+`~/.local/share/amplifier-browser-bridge/hub-audit.jsonl` when running as a service (not the
+foreground hub's `./amplifier-browser-bridge-audit.jsonl`, which is meaningless for a process with no
+particular working directory).
+
+**Token rotation vs. host/port changes -- these need different responses:**
+
+- **Rotating the token's contents** (`amplifier-browser-bridge init --force`) needs only
+  `amplifier-browser-bridge service restart`. The token FILE PATH is what's baked into the unit,
+  not its contents, so a restart alone picks up the new value -- no reinstall.
+- **This machine's Tailscale IP changing** (or wanting a different port) needs
+  `amplifier-browser-bridge service install` to be re-run (safe -- it's idempotent). A stale IP
+  baked into an old unit does not fail silently: if the address is no longer assigned to any
+  interface on this machine, the bind itself fails and `Restart=on-failure` keeps retrying,
+  loudly, rather than pretending to be up -- `amplifier-browser-bridge service status` /
+  `amplifier-browser-bridge doctor` both surface this.
+
+**`doctor` knows about the service.** A hub that's installed as a service but currently stopped
+is reported as exactly that -- `[FAIL] service_status: ... the hub is NOT running. Start it
+with amplifier-browser-bridge service start` -- with the network checks below it marked
+`skipped`, instead of a bare, unexplained connection failure. This check only asserts a failure
+for the service on the SAME machine `--hub-url` targets (loopback, or this machine's own
+detected Tailscale IP) -- pointed at a different host, it says so and stays informational.
+
+**Platform support:**
+
+| Platform | Mechanism | Status |
+|---|---|---|
+| Linux | `systemd --user` | Implemented, verified end-to-end on this repo's own dev machine (see below) |
+| macOS | `launchd` (`~/Library/LaunchAgents`) | Implemented; the shape of every unit/plist write and every `launchctl` call is unit-tested, but **launchd itself cannot be exercised from this Linux-only development environment -- BLOCKED, not asserted working, until verified on a real Mac** |
+| Windows | -- | **Not implemented in this release.** There is no systemd/launchd equivalent this module drives on Windows yet. Run `amplifier-browser-bridge hub ...` directly, or wrap it yourself as a real Windows service (Task Scheduler set to run at log on, or NSSM/WinSW) -- see [INSTALL.md](INSTALL.md)'s Windows section. `amplifier-browser-bridge service ...` fails loud and names this explicitly rather than silently doing nothing. |
+
+**Verified end-to-end on Linux, 2026-08-08** (real `systemd --user`, no mocks, on this repo's
+own development machine -- not a container, since the point was to prove real systemd
+integration, which containers frequently can't provide):
+
+```console
+$ amplifier-browser-bridge service install --host 100.124.126.19 --port 8900
+Created symlink /home/.../.config/systemd/user/default.target.wants/amplifier-browser-bridge.service → /home/.../.config/systemd/user/amplifier-browser-bridge.service.
+Installed and started the amplifier-browser-bridge service (linux).
+  Unit: /home/.../.config/systemd/user/amplifier-browser-bridge.service
+  Hub URL for the extension: ws://100.124.126.19:8900/device
+  Token file: /home/.../.config/amplifier-browser-bridge/tokens.json
+
+Check it: amplifier-browser-bridge service status
+Confirm it worked: amplifier-browser-bridge doctor --hub-url ws://100.124.126.19:8900/agent
+
+$ systemctl --user status amplifier-browser-bridge --no-pager
+● amplifier-browser-bridge.service - Amplifier Browser Bridge hub
+     Loaded: loaded (.../amplifier-browser-bridge.service; enabled; preset: enabled)
+     Active: active (running) since Sat 2026-08-08 18:32:16 PDT; 4s ago
+   Main PID: 1093765 (amplifier-brows)
+             └─1093765 .../bin/python .../bin/amplifier-browser-bridge hub --host 100.124.126.19 --port 8900 --token-file /home/.../tokens.json --audit-log /home/.../hub-audit.jsonl
+Aug 08 18:32:17 spark-1 amplifier-browser-bridge[1093765]: amplifier-browser-bridge hub listening on ws://100.124.126.19:8900/device (extensions) and ws://100.124.126.19:8900/agent (agents); audit log -> /home/.../hub-audit.jsonl
+
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://100.124.126.19:8900/agent
+[ok]   service_status: service installed and active (unit: .../amplifier-browser-bridge.service).
+[ok]   hub_reachable: hub reachable at ws://100.124.126.19:8900/agent
+[ok]   token_match: token accepted by hub
+[FAIL] device_connected: no browser device has ever connected to this hub. [...]
+# (expected -- no browser was attached in this test; every prior check passed)
+
+$ amplifier-browser-bridge service stop
+Stopped the amplifier-browser-bridge service.
+$ ss -tln | grep 8900   # nothing -- port released
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://100.124.126.19:8900/agent
+[FAIL] service_status: service is installed but NOT active (...) -- the hub is NOT running. Start it with `amplifier-browser-bridge service start` [...]
+[skip] hub_reachable: skipped (service not running)
+[skip] token_match: skipped (service not running)
+[skip] device_connected: skipped (service not running)
+
+$ amplifier-browser-bridge service start
+Started the amplifier-browser-bridge service.
+$ ss -tln | grep 8900   # LISTEN 100.124.126.19:8900 -- back up
+
+$ amplifier-browser-bridge service uninstall
+Removed "/home/.../.config/systemd/user/default.target.wants/amplifier-browser-bridge.service".
+Removed the amplifier-browser-bridge service.
+$ systemctl --user status amplifier-browser-bridge
+Unit amplifier-browser-bridge.service could not be found.
+```
+
+Also confirmed: the running hub process's own environment (`/proc/<pid>/environ`) contains
+**zero** `AMPLIFIER_BROWSER_BRIDGE_*` variables -- host, port, token file, and audit log all
+arrived purely via the unit's explicit command-line arguments, exactly as designed, with no
+dependence on anything that happened to be exported in the installer's shell. This is the
+concrete proof that the service survives a fresh login (or a reboot with
+[`loginctl enable-linger`](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html)
+enabled for this user, so the user's systemd instance -- and this unit under it -- starts even
+with nobody logged in) rather than merely "working while my shell happens to still be open."
 
 ### Verified clean-room install
 

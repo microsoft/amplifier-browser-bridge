@@ -50,29 +50,38 @@ does not.
 
 ## Step 1 -- Install and start the hub
 
-The hub is not inside this zip -- it is a separate Python package, and it is
-**not published to PyPI yet**, so you install it from source. On the machine
-that will run it:
+The hub is not inside this zip -- it is a separate Python package. It is
+**not published to PyPI yet**, but the repo is public, so `uv` can install it
+straight from GitHub -- no local clone required. On the machine that will run
+it:
 
 ```bash
-git clone https://github.com/bkrabach/amplifier-browser-bridge.git
-cd amplifier-browser-bridge
-uv tool install .
+uv tool install git+https://github.com/bkrabach/amplifier-browser-bridge@main
 amplifier-browser-bridge init
 ```
 
-The repo is public -- the clone needs no GitHub account, token, or SSH key.
+No GitHub account, token, or SSH key is needed -- the repo is public. (If you
+prefer a local clone -- e.g. to inspect the source first -- that also works:
+`git clone` the repo, `cd` into it, then `uv tool install .` instead of the
+`git+https://...` line above.)
 
 > **Do not use `uv tool install amplifier-browser-bridge` or
 > `pip install amplifier-browser-bridge`.** Neither works today; the name is
 > not on PyPI, and both fail with a package-not-found error. When a release is
-> published, that one-liner will replace the clone and both commands above
-> collapse into it.
+> published, that one-liner will replace the `git+https://...` command above.
 
 `init` generates a token, prints the exact remaining commands (including
 which host/port to bind), and tells you whether it auto-detected a Tailscale
-IP. Follow its printed instructions to actually start the hub -- something
-like:
+IP. Follow its printed instructions to actually start the hub -- the
+**recommended** path installs it as a background service (survives logout
+and reboot):
+
+```bash
+amplifier-browser-bridge service install --host <the address init printed> --port 8900
+```
+
+Or, for quick local testing, run it directly in the current terminal instead
+(it stops the moment you close that terminal or press Ctrl-C):
 
 ```bash
 AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json \
@@ -86,7 +95,51 @@ AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.js
 - The **token** (a long random string).
 
 Leave the hub running. If it stops, the extension will show a disconnected
-state and nothing will work until you restart it.
+state and nothing will work until you restart it -- this is exactly what the
+service path above avoids having to think about. See "Running the hub as a
+service" below for the full `service` command surface, what platforms it
+supports, and how it handles a rotated token or a changed Tailscale IP.
+
+### Running the hub as a service
+
+`amplifier-browser-bridge service` manages a **systemd --user** unit (Linux)
+or a **launchd** user agent (macOS) for the hub -- never a system-wide
+service, never root/sudo.
+
+```bash
+amplifier-browser-bridge service install --host <host> --port 8900   # install + start
+amplifier-browser-bridge service status                              # installed? running?
+amplifier-browser-bridge service stop                                 # stop without uninstalling
+amplifier-browser-bridge service start                                # start it again
+amplifier-browser-bridge service restart                              # e.g. after rotating the token
+amplifier-browser-bridge service uninstall                             # stop + remove entirely
+amplifier-browser-bridge service logs                                  # tail its logs
+```
+
+- **Rotating the token** (`amplifier-browser-bridge init --force`) only
+  needs `amplifier-browser-bridge service restart` -- the token FILE PATH is
+  baked into the service, not its contents, so a restart alone picks up the
+  new value.
+- **This machine's Tailscale IP changing** (or wanting a different port)
+  needs `amplifier-browser-bridge service install` re-run (safe to repeat).
+- **`amplifier-browser-bridge doctor` knows about the service**: a hub
+  installed as a service but currently stopped is reported as exactly that,
+  with the fix (`amplifier-browser-bridge service start`), instead of a bare
+  connection failure.
+- **Windows is not implemented in this release.** There is no systemd/launchd
+  equivalent this command drives on Windows yet -- run
+  `amplifier-browser-bridge hub ...` directly (see the foreground command
+  above), or wrap it yourself as a real Windows service (Task Scheduler set
+  to run at log on, or NSSM/WinSW). `amplifier-browser-bridge service ...`
+  fails loud and says exactly this on Windows rather than doing nothing
+  silently.
+- **macOS (launchd) is implemented but could not be exercised end-to-end from
+  this project's Linux-only development environment** -- every unit/plist
+  write and `launchctl` call is unit-tested, but real verification on a Mac
+  is still outstanding. The Linux (`systemd --user`) path has been verified
+  end-to-end: installed, confirmed running and reachable, stopped (`doctor`
+  correctly reported it), restarted, and uninstalled (unit file confirmed
+  gone) -- see the source repository's README.md for the full transcript.
 
 ## Step 2 -- Load this extension into Edge
 
@@ -192,8 +245,12 @@ path, and survive an update untouched.
 
 1. In `edge://extensions/`, click **Remove** on the extension.
 2. Optionally delete the unzipped folder.
-3. Stop the hub process (Ctrl-C, or however you started it) if you no longer
-   need it running.
+3. Stop the hub:
+   - If you installed it as a service (recommended path above):
+     `amplifier-browser-bridge service uninstall` -- stops it and removes the
+     systemd/launchd unit entirely.
+   - If you ran it directly in a terminal: Ctrl-C (or however you started
+     it) if you no longer need it running.
 
 ## Android (experimental -- these instructions do not apply)
 
