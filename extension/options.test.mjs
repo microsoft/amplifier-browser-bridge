@@ -38,6 +38,21 @@ function installFakeDom() {
   return elements;
 }
 
+// Node 20+ defines `globalThis.crypto` as a getter-only accessor (its lazy-loaded
+// WebCrypto implementation), so a plain `globalThis.crypto = {...}` assignment
+// throws "Cannot set property crypto of #<Object> which has only a getter" --
+// it never fails on Node 18 (no built-in global crypto getter there), so this
+// only surfaced once CI actually ran on Node 20. `Object.defineProperty` replaces
+// the accessor outright (the built-in descriptor is configurable), which works
+// on every Node version this project's matrix supports.
+function setFakeCrypto(randomUUIDValue) {
+  Object.defineProperty(globalThis, "crypto", {
+    value: { randomUUID: () => randomUUIDValue },
+    configurable: true,
+    writable: true,
+  });
+}
+
 let importCounter = 0;
 async function importOptionsFresh() {
   importCounter += 1;
@@ -202,7 +217,7 @@ test("getOrCreateDeviceId creates and persists a fresh id when none is stored", 
   installFakeDom();
   globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
   const stored = {};
-  globalThis.crypto = { randomUUID: () => "generated-uuid" };
+  setFakeCrypto("generated-uuid");
   globalThis.chrome = {
     storage: {
       local: {
@@ -242,7 +257,7 @@ test("getOrCreateDeviceId reuses an existing stored id", async () => {
 // --- Pairing flow (the "Pair" button click handler) ---
 
 function installFakeChromeForPairing(stored = {}) {
-  globalThis.crypto = { randomUUID: () => "device-uuid" };
+  setFakeCrypto("device-uuid");
   globalThis.chrome = {
     storage: {
       local: {

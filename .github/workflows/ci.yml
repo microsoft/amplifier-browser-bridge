@@ -21,14 +21,22 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Create venv
-        run: uv venv --python ${{ matrix.python-version }}
+        # setup-uv already creates and activates a `.venv` for `python-version` (sets
+        # VIRTUAL_ENV, "Activating python venv..." in its own log) -- a separate
+        # `uv venv` step here collides with it ("A virtual environment already exists
+        # at: .venv") on every single run. Do not add one back.
 
       - name: Install project (with mcp extra) and dev tools
+        # pytest-asyncio is required -- README.md's "Testing" section documents this
+        # exactly (Verified 2026-08-08 from a fresh clone): omitting it doesn't error,
+        # it silently produces "32 failed... async def functions are not natively
+        # supported" for every `async def` test. It has no home in pyproject.toml
+        # (no [dev] extra exists, by design -- see README's "Two traps" note), so it
+        # must be installed explicitly here, same as a contributor following
+        # CONTRIBUTING.md/README.md would.
         run: |
           uv pip install -e ".[mcp]"
-          uv pip install ruff pyright pytest
+          uv pip install ruff pyright pytest pytest-asyncio
 
       - name: ruff format --check
         run: uv run ruff format --check .
@@ -37,13 +45,25 @@ jobs:
         run: uv run ruff check .
 
       - name: pyright
-        run: uv run pyright
+        # Mirror the local gate exactly (CONTRIBUTING.md / PR template: `pyright --venvpath . src tests`)
+        # rather than relying on `uv run pyright` bare + pyproject.toml's [tool.pyright] defaults to
+        # happen to agree -- an explicit, identical invocation is the only way to guarantee CI checks
+        # the same surface a contributor's local run checks.
+        run: uv run pyright --venvpath . src tests
 
       - name: pytest (root package)
         run: uv run pytest tests/ -v
 
-      - name: Install tool-browser-bridge module (no deps -- sibling package already installed)
-        run: uv pip install -e modules/tool-browser-bridge --no-deps
+      - name: Install tool-browser-bridge module (+ amplifier-core, its peer dependency)
+        # amplifier-core is a PEER dependency the module deliberately does not declare
+        # (see modules/tool-browser-bridge/pyproject.toml and the creating-amplifier-modules
+        # skill) -- README.md's own Testing section documents installing it explicitly for
+        # exactly this reason. Omitting it doesn't fail the install step; it fails test
+        # collection instead: "ModuleNotFoundError: No module named 'amplifier_core'"
+        # (confirmed live in this PR's own CI run). `--no-deps` would also skip it, so this
+        # installs the module normally (its one real dependency, amplifier-browser-bridge, is
+        # already satisfied by the sibling install above) plus amplifier-core alongside it.
+        run: uv pip install -e modules/tool-browser-bridge amplifier-core
 
       - name: pytest (tool-browser-bridge module)
         run: uv run pytest modules/tool-browser-bridge/tests/ -v
@@ -69,3 +89,41 @@ jobs:
 
       - name: Run extension unit tests (pure, chrome-free modules)
         run: node --test extension/*.test.mjs
+
+  package:
+    name: package (desktop extension zip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      # Gate 4 of scripts/package.sh imports amplifier_browser_bridge.extension_integrity,
+      # which is stdlib-only itself but importing that submodule still runs the PARENT
+      # package's src/amplifier_browser_bridge/__init__.py (normal Python import
+      # semantics), which imports .client, which imports the real runtime dependency
+      # `websockets`. A bare system python3 with nothing installed hits
+      # "ModuleNotFoundError: No module named 'websockets'" here -- confirmed by
+      # running this job without this step first. Installing the base project (no
+      # `mcp` extra needed -- Gate 4 never touches mcp_server.py) covers it.
+      - name: Install project
+        run: uv pip install -e .
+
+      # scripts/package.sh is the packaging integrity gate: it refuses to build on a
+      # missing required file, a malformed manifest, a JS syntax/test failure, or a
+      # staged extension whose imports/manifest references don't actually resolve
+      # (Gate 4 -- see the script's own header comment for the icons-flattened bug
+      # this caught). It was previously only ever run by hand; running it here means
+      # a broken build is caught in CI, not discovered at release time. `uv run`
+      # keeps the venv's python3 (with the dependency above) on PATH for the whole
+      # script, including its own nested `python3 -c` invocations.
+      - name: Build and verify desktop extension package
+        run: uv run scripts/package.sh

@@ -34,7 +34,15 @@ dependencies = [
 [project.optional-dependencies]
 # Optional so the core lib/CLI stay lean (design doc \u00a73.3: MCP server is one of
 # four agent-surface adapters, not a required dependency of the lib itself).
-mcp = ["mcp>=1.6"]
+#
+# Upper-bounded at <2: mcp 2.0.0 renamed FastMCP -> MCPServer and relocated it out of
+# `mcp.server.fastmcp` entirely (removed, not deprecated -- see the SDK's own v1->v2
+# migration guide). src/amplifier_browser_bridge/mcp_server.py imports the v1 path, so
+# an unbounded `mcp>=1.6` silently resolves to 2.0.0 today and breaks that import for
+# every fresh install -- confirmed via a real ModuleNotFoundError, not just a
+# pyright finding. Bump this bound (and migrate mcp_server.py to the v2 API) as a
+# deliberate, tested upgrade -- not as a side effect of an unrelated `pip install`.
+mcp = ["mcp>=1.6,<2"]
 
 [project.scripts]
 amplifier-browser-bridge = "amplifier_browser_bridge.cli:main"
