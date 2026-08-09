@@ -30,7 +30,7 @@ full positioning against `browser-relay`, Playwright MCP, and every vendor tool 
 | 3. Tier model + queue | Non-blocking dispatch to intermittently-connected devices | Done |
 | 4. Agent surfaces | Python lib, CLI, MCP server, Amplifier tool module | Done |
 | 5. Policy engine | Denylist, confirmation gates, audit log | Done |
-| 6. CDP escalation | Trusted input events, background-tab screenshots, soft-detach | Not started |
+| 6. CDP escalation | Trusted input events, background-tab screenshots, soft-detach | Built, never run against a real Edge browser |
 
 What that means concretely:
 
@@ -42,10 +42,16 @@ What that means concretely:
   constraint in the design doc -- MV3 service worker lifetime, Android Doze behavior, background
   tab screenshot support, MagicDNS reliability -- was measured against real Edge installs on
   macOS and Android, not taken from documentation (`docs/designs/browser-bridge.md` section 2).
-- **Not yet built**: `chrome.debugger` (CDP) escalation for trusted input events and any-tab
-  screenshot capture on desktop. Today's injection-only implementation covers the full command
-  vocabulary, but synthetic input is not `isTrusted`, and `screenshot` only works on the tab
-  that is already active.
+- **Built but never exercised on a real browser**: `chrome.debugger` (CDP) escalation for
+  trusted input events and any-tab screenshot capture on desktop. The full path exists and is
+  unit-tested (`cdp.py`, `hub.py`'s `_ensure_cdp_attached`, `background.js`'s `cdpAttach`,
+  `tests/test_cdp.py`): a `trusted` or `capture_hidden` arg escalates that one tab on demand,
+  and the hub soft-detaches after 20s idle so the debugger banner clears. What has *not*
+  happened is a run of it against a real Edge install -- so the banner behavior in
+  [docs/DEBUGGER_BANNER.md](docs/DEBUGGER_BANNER.md) is derived from Chromium source, not
+  observed here. Without either arg, dispatch stays injection-only: synthetic input is not
+  `isTrusted`, and `screenshot` only reaches the tab that is already active. CDP network
+  interception is not implemented at all.
 - **Not yet published**: this repository has no packaged release, no CI history, and has not
   been submitted to the Edge Add-ons store. Everything above is verified in-repo, not in
   production use.
@@ -76,6 +82,21 @@ deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brie
   an honest list of known gaps.
 
 ## Quickstart
+
+### Why the setup is this long
+
+Three of the steps below -- run your own hub, hold your own token, address it by your own
+Tailscale IP -- exist for exactly one reason: the connection between the agent and your browser
+runs over **your own network, with nothing in the path but your own devices**. The nearest
+alternative you could pick instead, [`browser-relay`](https://github.com/reliefeai/browser-relay)
+(MIT), is genuinely faster to start: it routes through a public Cloudflare Worker relay and
+authenticates with a bearer Device ID its own README calls *"a capability -- anyone with it can
+control this browser."* That is the whole trade -- a longer setup, in exchange for no
+third-party relay in the path, no long-lived bearer capability crossing the public internet, and
+device-level ACLs instead of one shared string that travels.
+
+If that trade is not one you want to make, `browser-relay` is the honest recommendation. This
+setup is not going to get shorter, because the length *is* the property.
 
 **This is the USER install path.** `uv tool install` is what you run to use this project.
 `uv pip install -e .` (an *editable* install) is the CONTRIBUTOR path for iterating on this
@@ -169,6 +190,30 @@ amplifier-browser-bridge tabs <device_id>
 amplifier-browser-bridge snapshot <device_id>/<tab_id>
 amplifier-browser-bridge click <device_id>/<tab_id> <ref>
 ```
+
+### The "started debugging this browser" banner is the system working
+
+At some point Edge will put a bar across the top of your browser reading *"Amplifier Browser
+Bridge started debugging this browser"* with a **Cancel** button. **That is expected -- it is
+the browser announcing, in a place no extension can fake or hide, that the agent just escalated
+to a level of control that deserves announcing.** This project does not suppress it, though a
+mechanism exists to.
+
+- It appears **only** when a command genuinely needs CDP: `trusted` input (an `isTrusted: true`
+  click/type/key) or `capture_hidden` (screenshotting a tab that is not in the foreground).
+  Ordinary `snapshot`/`read`/`click`/`navigate` raise nothing.
+- It covers **every tab in every window** of that profile, not just the tab being driven -- so
+  an agent working in a background tab puts a bar on the tab you are personally reading.
+- It clears on its own roughly **25 seconds** after the agent stops: this hub soft-detaches CDP
+  after 20s idle, and Chromium removes the banner 5s after the last detach.
+- **Cancel** detaches every CDP session this extension holds. It is a real kill switch for CDP
+  that nothing in this project can intercept.
+
+Scope and lifetime above are read out of current Chromium source and are **not documented by
+Google or Microsoft anywhere**; this project has also never observed its own banner on a real
+Edge install. [docs/DEBUGGER_BANNER.md](docs/DEBUGGER_BANNER.md) names the exact source file
+for each claim and lists, plainly, everything about it that remains unverified -- including one
+in-repo field note that contradicts the source reading.
 
 **`amplifier-browser-bridge doctor` diagnoses a stuck setup.** It runs six checks in dependency
 order -- the token file, other token-like files sitting next to it, this machine's network
@@ -566,6 +611,14 @@ to get this extension onto it.
 >   be served as `.bin` and renamed to `.crx` on the phone, because Chromium intercepts `.crx`
 >   downloads and Edge Android silently discards the file. A battery-optimization exemption is
 >   an onboarding *requirement*, not a tip.
+> - **The Android artifact is a live credential to your browser, and it does not rotate.** To
+>   work around Edge Android having no reachable options page, the build bakes the hub URL and
+>   token *inside* the `.crx`. Anyone who obtains that file can install it and connect to your
+>   hub. There is no way to revoke one artifact -- the only lever is rotating the hub token
+>   (`init --force`), which invalidates every phone **and** every desktop you configured, each
+>   of which then has to be redone. Tell anyone you hand the file to, including a tester:
+>   **if it leaves your control, treat it as compromised.** See [SECURITY.md](SECURITY.md)'s
+>   "One credential, two trust models" and "Where a live credential ends up after install".
 > - **This extension's own code has never been confirmed running on a real Android device.** The
 >   Android platform behaviors below were measured on real hardware with a *separate throwaway
 >   probe extension*, not with this project's code. See
@@ -582,7 +635,8 @@ to get this extension onto it.
 | Screenshot a background/minimized tab | Yes (measured on macOS; Windows untested) | No -- active tab only |
 | `chrome.windows`, `chrome.tabs` | Yes | Yes (Microsoft's own docs incorrectly say no -- see design doc section 2) |
 | `chrome.tabGroups` | Yes | No |
-| `chrome.debugger` (CDP): trusted input events, network interception | Not yet implemented (Phase 6) | Not available on this platform at all |
+| `chrome.debugger` (CDP): trusted input events, hidden-tab capture | Built, never run against a real Edge browser (raises a [browser-wide banner](docs/DEBUGGER_BANNER.md) while attached) | Not available on this platform at all |
+| `chrome.debugger` (CDP): network interception | Not implemented | Not available on this platform at all |
 
 Non-goals, by explicit design decision: browsers other than Microsoft Edge, and iOS (Microsoft
 documents no extension API surface for it today). See `docs/designs/browser-bridge.md`

@@ -419,7 +419,14 @@ the other's internals.
 
 - Occlusion behavior on **Windows** — different code path (`CalculateNativeWinOcclusion`) than
   macOS, untested.
-- Whether policy-force-installed extensions skip the debugger banner. Single secondary source.
+- ~~Whether policy-force-installed extensions skip the debugger banner. Single secondary
+  source.~~ **Resolved: they do.** Chromium's `debugger_api.cc` sets `suppress_warning` when
+  `Manifest::IsPolicyLocation(extension_->location())` is true, i.e. a force-installed extension
+  raises no banner at all. Primary source (Chromium `main`), not a secondary report. Also
+  resolved along the way: the banner is browser-wide (`GlobalConfirmInfoBar` -- every tab in
+  every window), one per extension, and is removed 5s after the last detach. See
+  `docs/DEBUGGER_BANNER.md` for the per-claim file references and the residual unknowns
+  (nothing about it is documented by Google or Microsoft; none of it is measured on Edge).
 - Whether CRX sideload works on Edge Android **stable**, or Canary/Beta only.
 - `document.hasFocus()` returned `true` even minimized and occluded — unexplained. Do not
   build focus-dependent logic on it.

@@ -18,6 +18,22 @@ If you skip any of the three, nothing will work, and the failure will look
 like "the extension does nothing" rather than a clear error -- so follow the
 steps in order.
 
+## Why this install is longer than a normal extension
+
+Those three pieces are not incidental complexity -- they are the product.
+Running your own hub, holding your own token, and reaching it over your own
+Tailscale network is what makes the agent reach your browser across **your own
+devices, with nothing else in the path**. The nearest alternative you could
+pick instead, [`browser-relay`](https://github.com/reliefeai/browser-relay)
+(MIT), is genuinely easier to start: it routes through a public relay server
+and authenticates with a bearer token its own README describes as *"a
+capability -- anyone with it can control this browser."* You are trading a
+longer setup for no third party in the path and no long-lived bearer
+credential crossing the public internet.
+
+If that is not a trade you want, that project is the honest alternative. This
+install will not get shorter, because the length is the property.
+
 ## Who should install this
 
 This software lets an AI agent read and act inside your **real, logged-in**
@@ -205,6 +221,31 @@ amplifier-browser-bridge devices
 amplifier-browser-bridge tabs <device_id>
 ```
 
+## The "started debugging this browser" banner is expected
+
+At some point Edge will put a bar across the top of your browser reading
+*"Amplifier Browser Bridge started debugging this browser"*, with a **Cancel**
+button. **Nothing is wrong.** That is the browser announcing -- in a place no
+extension can fake or hide -- that the agent just escalated to a level of
+control that deserves announcing. This project deliberately does not suppress
+it.
+
+What to expect:
+
+- It appears **only** for the two commands that genuinely need it: a
+  `trusted` (real, non-synthetic) click/type/key, or a screenshot of a tab
+  that is not in the foreground. Ordinary reading, clicking, and navigating
+  raise nothing.
+- It appears on **every tab in every window**, not just the tab the agent is
+  working in -- so a bar can show up on the page you are personally reading.
+- It goes away on its own, roughly **25 seconds** after the agent stops.
+- **Cancel** cuts off that level of access immediately, across all tabs. It
+  always works, and nothing in this software can intercept it.
+
+Where those numbers come from -- and the parts of this that are *not*
+confirmed for Edge specifically -- is written out in
+[`docs/DEBUGGER_BANNER.md`](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/docs/DEBUGGER_BANNER.md).
+
 ## What this extension can do (permissions)
 
 This is not a narrow, single-purpose extension -- it is a general remote-control
@@ -276,6 +317,14 @@ hoping to put this on a phone, read this section before spending time on it:
   requires a **local file path**, not a URL.
 - **A battery-optimization exemption is a requirement, not a tip.** Without
   it, the phone goes unreachable whenever the screen is off.
+- **The Android file is a live credential to your browser, and it does not
+  rotate.** Because Edge Android has no reachable options page, the hub URL
+  and token are baked *inside* the `.crx`. Anyone who obtains that file can
+  install it and connect to your hub. Delete it from the phone once the
+  extension is connected, never forward it (not even to troubleshoot), and if
+  it leaves your control, **treat it as compromised**. Revocation is
+  all-or-nothing: rotating the hub token invalidates every phone *and* every
+  desktop you have configured, and each must be redone by hand.
 - **This extension's own code has never been confirmed running on a real
   Android device.** The platform behaviors were measured on real hardware with
   a separate throwaway probe extension, not with this project's code.

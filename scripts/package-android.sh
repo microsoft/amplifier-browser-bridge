@@ -252,10 +252,20 @@ echo "" >&2
 echo "Built: $OUT_CRX" >&2
 echo "" >&2
 echo "SECURITY: this artifact embeds a live hub credential (bundled_config.json, baked" >&2
-echo "above). Anyone who obtains this file can connect to the hub as this device." >&2
-echo "Treat it the same way you would treat the hub's own token file. See SECURITY.md's" >&2
-echo "'The Android build now embeds a live hub credential in the artifact itself'" >&2
-echo "section and docs/ANDROID.md's 'Zero-configuration builds' section." >&2
+echo "above), and that credential DOES NOT ROTATE. Anyone who obtains this file can" >&2
+echo "connect to the hub as this device. Treat it the same way you would treat the" >&2
+echo "hub's own token file -- if it leaves your control, treat it as compromised." >&2
+echo "" >&2
+echo "  - Tell whoever you hand it to (including a tester) exactly that." >&2
+echo "  - Have them delete it from the device once the extension is connected; it" >&2
+echo "    otherwise sits in Downloads and gets swept into cloud backups." >&2
+echo "  - Never share it to troubleshoot -- share this build command instead." >&2
+echo "  - Revocation is all-or-nothing: 'init --force' invalidates EVERY artifact" >&2
+echo "    and every configured desktop too, and each must then be redone." >&2
+echo "" >&2
+echo "See SECURITY.md's 'The Android build now embeds a live hub credential in the" >&2
+echo "artifact itself', 'One credential, two trust models -- and the rotation story" >&2
+echo "that spans them', and 'Where a live credential ends up after install'." >&2
 echo "" >&2
 
 # --------------------------------------------------------------------------

@@ -134,11 +134,32 @@ tell the *phone* to connect to itself, so the build refuses loudly instead
 (`BUILD REFUSED -- Could not auto-detect...`) rather than shipping something silently
 wrong.
 
-**Security disclosure.** The built artifact now carries a live credential -- see
-`SECURITY.md`'s "The Android build now embeds a live hub credential in the artifact
-itself" section before distributing a build made this way. The build script itself
-prints this disclosure at the end of a successful run; do not strip that output from
-CI logs or a build wrapper.
+**Security disclosure.** The built artifact carries a live credential, and **that
+credential does not rotate.** Anyone handed the file -- including a tester, including
+you six months from now finding it in a Downloads folder -- must be told plainly:
+**if the file leaves your control, treat it as compromised.**
+
+Read all three of these in `SECURITY.md` before building or distributing one:
+
+- *"The Android build now embeds a live hub credential in the artifact itself"* --
+  what is in the file and why.
+- *"One credential, two trust models -- and the rotation story that spans them"* --
+  why the desktop's visible/pasted token and this baked/silent one are the **same
+  secret**, and the full sequence `init --force` forces you through on every device.
+  The sharp edge to know before you rotate: a baked value is a first-run DEFAULT
+  only, so reinstalling a rebuilt artifact **over an install that already completed
+  setup keeps the OLD token** and the phone goes dark, with no reachable options page
+  on Android to fix it by hand. Uninstall first, then install the fresh build.
+- *"Where a live credential ends up after install"* -- backup, resale, loss, and the
+  "let me send you the `.bin` so you can reproduce it" reflex, which hands over your
+  browser.
+
+The build script prints an abbreviated form of this at the end of a successful run;
+do not strip that output from CI logs or a build wrapper.
+
+**Delete the artifact from the phone once the extension is connected.** It has no
+further purpose there, and a Downloads folder is exactly the kind of place a cloud
+backup picks up.
 
 ### What `web_accessible_resources` does and does not give you
 

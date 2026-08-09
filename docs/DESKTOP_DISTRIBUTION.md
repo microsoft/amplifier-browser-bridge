@@ -156,6 +156,32 @@ carries the most administrative weight: it bypasses every review process
 (Chrome Web Store, Edge Add-ons) that would otherwise have looked at this
 extension's permissions before it reached an end user's machine.
 
+### What force-installing costs the user: the debugger banner disappears
+
+**Verified in Chromium source, and rarely stated anywhere:** a force-installed
+extension is exempted from the browser's *"started debugging this browser"*
+warning entirely. `chrome/browser/extensions/api/debugger/debugger_api.cc`
+sets `suppress_warning` when
+`Manifest::IsPolicyLocation(extension_->location())` is true -- the same
+exemption as the `--silent-debugger-extension-api` switch.
+
+For this extension specifically, that means: a copy deployed by
+`ExtensionInstallForcelist` can escalate to CDP (`trusted` input,
+`capture_hidden` screenshots) on a user's real, logged-in browser **with no
+visible indication whatsoever**. On a manually-installed copy, that banner is
+the user's one free, unfakeable signal that escalation happened, and their one
+always-available way to cut it off (its Cancel button detaches every session
+the extension holds).
+
+This is Chromium's behavior, not a choice this project makes, and it is not an
+argument against force-install -- an organization deploying agent software to
+managed devices has other, better controls (`ExtensionSettings`'
+`runtime_blocked_hosts`, below; the hub's own audit log and kill switch). It
+*is* something to decide deliberately rather than discover later: choosing this
+channel means choosing to give up that disclosure, so whatever replaces it
+should be named in the deployment plan. See
+[DEBUGGER_BANNER.md](DEBUGGER_BANNER.md) for the full behavior and its sources.
+
 ### Companion policy worth knowing about: `ExtensionSettings`
 
 Microsoft's own documentation for `ExtensionInstallForcelist` notes that its

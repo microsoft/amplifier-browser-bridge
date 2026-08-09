@@ -153,6 +153,86 @@ artifact file itself (e.g. logged in cleartext somewhere it shouldn't be, readab
 by another local user despite the permission hardening above), treat that as a
 finding under this document's existing reporting instructions.
 
+**The one sentence anyone handed that file must be told, including a tester:**
+
+> The Android artifact contains a live hub credential, and that credential **does not
+> rotate**. If the file leaves your control, treat it as compromised.
+
+### One credential, two trust models -- and the rotation story that spans them
+
+The desktop token and the Android token are **the same secret**, governed two completely
+different ways, and until this section nobody stated the relationship. Fixing either side in
+isolation is not the fix; the relationship is the thing that needed narrating.
+
+| | Desktop | Android |
+|---|---|---|
+| How it reaches the browser | Printed by `init`, **pasted by a human** into the options page | **Baked into the artifact** at build time, adopted silently on first run |
+| Is it ever displayed? | Yes -- you saw it, you typed it | No -- it is never shown to the person installing |
+| Can it be replaced in place? | Yes -- re-paste on the options page | Not reliably: `chrome.runtime.openOptionsPage()` does nothing usable on Edge Android (see `docs/ANDROID.md`) |
+| What it lives inside | `chrome.storage.local` only | `chrome.storage.local` **and** a copyable file that keeps working |
+| Blast radius if it leaks | The token | The token, plus a ready-to-install extension configured to use it |
+
+The second column is the one that changes the security character: on desktop the credential is
+visible and revisable by the person who owns it; on Android it is invisible, and it exists in a
+second place -- a file -- that can be copied, backed up, forwarded, or left in a Downloads
+folder. An unrotatable token baked into a shareable file is not a friendlier onboarding step; it
+is the same bearer-capability shape this project's whole transport design exists to avoid,
+wearing a friendlier hat.
+
+**Rotation, end to end.** `amplifier-browser-bridge init --force` regenerates the hub's
+`default` token. It is the **only** revocation mechanism this system has, and it is
+all-or-nothing -- there is no way to revoke one artifact, one phone, or one desktop. Rotating to
+kill a leaked file kills every device you have configured. In full, what you must then redo:
+
+1. **The hub** -- `amplifier-browser-bridge service restart` (the unit bakes the token file's
+   *path*, not its contents, so a restart is enough). A foreground `hub` must be stopped and
+   restarted.
+2. **Every desktop browser** -- open the options page (toolbar icon), paste the new token, Save.
+   Until you do, that device fails `doctor`'s `token_match` and stops connecting.
+3. **Every Android install** -- rebuild (`scripts/package-android.sh`, which reads the *new*
+   token) and reinstall. **The sharp edge:** a baked value is a first-run DEFAULT and is never
+   applied over an existing config (`extension/bundled_config.mjs`'s stated invariant), so
+   reinstalling over an install that already completed setup leaves the **old** token in place
+   and the device silently goes dark -- with no reachable options page on Android to correct it
+   by hand. The reliable path is **uninstall the extension first, then install the freshly-baked
+   artifact**, so it is genuinely a first run.
+4. **Every previously-distributed `.crx`/`.bin`** is now dead. That is the point, and it is also
+   the cost: you cannot invalidate the one that leaked without invalidating the ones that
+   didn't.
+
+Until step 3 completes, a rotated hub and a stale phone look exactly like a broken install.
+Budget for that before rotating, rather than discovering it with a phone in your hand.
+
+### Where a live credential ends up after install (artifact lifecycle)
+
+The disclosures above cover the artifact in transit. They did **not** cover what happens to it
+afterward, which is where a bearer credential actually spends most of its life. This section
+exists because that gap was named and not previously written down:
+
+| Situation | What is actually true | What to do |
+|---|---|---|
+| **After a successful install** | The `.crx`/`.bin` stays in the phone's Downloads folder, with a live token, indefinitely | Delete it from the device once the extension appears in `amplifier-browser-bridge devices` |
+| **Cloud / OEM backup** | Downloads folders are commonly included in device backups (Samsung Cloud, Google One, and equivalents) -- a live hub credential then exists inside a third-party account, entirely outside your tailnet and outside every boundary this project's design reasons about | Delete the artifact before the next backup runs, or treat a compromise of that account as a hub-token compromise and rotate |
+| **Device sale, return, repair, or trade-in** | A factory reset removes both the file and the installed extension's storage. An **un-reset** device does not: the installed extension still holds a working token in `chrome.storage.local`, and the artifact may still be in Downloads | Uninstall the extension **and** factory reset before the device leaves your hands. If it already left un-reset, rotate |
+| **Device lost or stolen** | Locking or remotely wiping is not revocation from this hub's point of view, and this system cannot revoke one device | Rotate (`init --force`) and redo the full sequence above. There is no smaller lever |
+| **Sharing a `.bin` to help someone troubleshoot** | That file is a working key to your browser. Attaching it to an issue, a chat, or a support thread hands over the hub | **Never share the artifact.** Share the build command (`scripts/package-android.sh`) and let them bake their own token |
+| **The build host's `dist/android/`** | `chmod 600`/`700` is applied, but the artifact persists across rebuilds, and an explicit `--hub-url` may also sit in shell history | Treat `dist/android/` as secret material; prune old versioned artifacts rather than accumulating them |
+
+**Known gaps in this model, stated rather than closed:**
+
+- **No per-artifact credential.** One `default` token serves every device. `auth.py`'s
+  `TokenStore` supports a per-device `devices` map, but nothing provisions it automatically, so
+  in practice a leaked artifact is a leak of every device's credential.
+- **No expiry.** A baked token is valid until the hub's token file changes -- forever, otherwise.
+- **No per-artifact revocation.** See "all-or-nothing" above.
+- **The hub cannot tell two holders of the same token apart** at authentication time, so a
+  stolen artifact connecting alongside the real phone is not distinguishable as such by auth.
+  It *is* visible after the fact: every command and result is audited (`audit.py`), and a second
+  device appearing in `amplifier-browser-bridge devices` is observable.
+- **The artifact carries no build identity.** `bundled_config.json` holds exactly `hubUrl` and
+  `hubToken` (`android_bake.py`'s `write_bundled_config`) -- no build timestamp, no version, no
+  identifier -- so a recovered leaked file cannot be traced to which build it came from or when.
+
 ### The classifier's label-extraction gap is bounded, not closed -- read this before relying on the confirmation gate
 
 **This is the single most important paragraph in this document.** The confirmation-gate
@@ -267,10 +347,39 @@ This is the compensating control for a system that is broad-access by default: n
 does is invisible after the fact. If you find a code path that bypasses the audit log for any
 action that reaches a real browser, treat that as a security finding, not a logging bug.
 
-### CDP escalation (when present)
+### CDP escalation, and the banner that is its only user-visible disclosure
 
-Where this project attaches `chrome.debugger` (CDP) to a tab, that grants trusted input
-dispatch and full page instrumentation for the duration of the attachment, and Edge will show an
-unsuppressable "being debugged" banner while attached. Any code path that attaches CDP silently,
+Where this project attaches `chrome.debugger` (CDP) to a tab, that grants trusted input dispatch
+and full page instrumentation for the duration of the attachment. Escalation is per-tab and on
+demand -- only a `trusted` or `capture_hidden` arg triggers it (`cdp.py`'s `requires_cdp`,
+`hub.py`'s `_ensure_cdp_attached`) -- and the hub soft-detaches after 20s idle so the browser's
+warning clears rather than becoming permanent scenery. Any code path that attaches CDP silently,
 fails to detach on idle, or fails to surface the banner state honestly to the user is a security
 concern worth reporting.
+
+**The browser's "started debugging this browser" banner is the only signal a user gets that this
+escalation happened, and it has three properties worth stating plainly.** All three are read out
+of current Chromium source; each file is named in
+[docs/DEBUGGER_BANNER.md](docs/DEBUGGER_BANNER.md), which also lists everything about it that is
+*not* verified:
+
+- **It is browser-wide, not tab-scoped.** One banner per extension, shown on every tab in every
+  window of the profile (`GlobalConfirmInfoBar`) -- so it is a disclosure that the extension is
+  debugging *this browser*, never an indication of *which tab* is being driven. It is not a
+  targeting signal and should not be read as one.
+- **It is bounded, not session-long.** Chromium removes it 5 seconds after the last detach, so
+  with this project's 20s soft-detach it clears roughly 25s after the agent stops. The
+  corollary: **an idle-detach that fails leaves both the capability and its warning up
+  indefinitely**, which is precisely why a failure to soft-detach is listed above as reportable.
+- **Enterprise-policy installation suppresses it entirely.** Chromium exempts extensions whose
+  install location is a policy location (`Manifest::IsPolicyLocation`, `debugger_api.cc`) from
+  the warning. A copy of this extension deployed via `ExtensionInstallForcelist` (see
+  [docs/DESKTOP_DISTRIBUTION.md](docs/DESKTOP_DISTRIBUTION.md)) can therefore use CDP on a
+  user's real browser **with no visible indication at all**. That is Chromium's behavior, not
+  this project's choice, but anyone evaluating the policy-install path should treat it as a
+  disclosure control they are giving up, not one they still have.
+
+This project does not use `--silent-debugger-extension-api` and does not ask users to. Any
+future change that suppresses the banner by default -- by that switch, by policy install
+presented as the recommended path, or by any other means -- should be treated as a security
+change requiring disclosure, not a UX improvement.

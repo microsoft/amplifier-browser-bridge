@@ -58,11 +58,19 @@ border-radius:0 8px 8px 0;margin:18px 0;font-size:13px;color:#d8c2c2}}
 .exp{{background:#241a13;border-left:3px solid #d2691e;padding:13px 15px;
 border-radius:0 8px 8px 0;margin:0 0 20px;font-size:14px}}
 .exp b{{color:#ffb066}}
+.why{{background:#131a24;border-left:3px solid #2f6feb;padding:11px 13px;
+border-radius:0 8px 8px 0;margin:0 0 20px;font-size:14px;color:#c8d3e2}}
 .exp ul{{padding-left:20px;margin:8px 0 0}} .exp li{{margin:6px 0}}
 .step{{color:#9aa4b2;font-size:13px;margin-top:2px}}
 </style></head><body>
 <h1>Amplifier Browser Bridge</h1>
 <p class=sub>Add this browser to the hub.</p>
+
+<div class=why><b>Why your own network.</b> This phone connects straight to a hub you run, over
+your own Tailscale network &mdash; no relay server in between, no account, no third party in the
+path. That is what the hub and the token buy you, and it is why this is a sideload rather than a
+one-tap store install. The easier alternatives route your browser through someone else&rsquo;s
+server on a bearer token.</div>
 
 <div class=exp><b>&#9888; Android support is EXPERIMENTAL.</b> Edge on the desktop is the
 supported platform. This install is a sideload with sharp edges.
@@ -108,10 +116,20 @@ Without this the phone is unreachable whenever the screen is off &mdash; measure
 tell the agent and it will confirm the device appeared. If it never appears, that is a
 known-unproven path &mdash; see docs/ANDROID.md, &ldquo;What remains unproven&rdquo;.</p>
 
-<div class=sec><b>Note:</b> the downloaded file contains a live hub credential. Anyone who
-gets it can connect to your hub as a device. Treat it like the token file itself &mdash;
-don&rsquo;t forward it or leave it in shared storage. If it leaks, rotate with
-<code>amplifier-browser-bridge init --force</code> and rebuild.</div>
+<div class=sec><b>&#9888; The file you just downloaded is a live credential to this browser
+&mdash; and it does not rotate.</b> Anyone who gets it can install it and connect to the hub as
+this device. Treat it exactly like the hub&rsquo;s own token file.
+<ul>
+<li><b>Delete it from Downloads once the extension is installed and connected.</b> It has no
+further use on this phone, and it will otherwise sit there indefinitely &mdash; and get swept
+into whatever cloud backup this device does.</li>
+<li><b>Never forward it</b> &mdash; not to a colleague, not into a bug report, not to
+troubleshoot. Send the build command instead, so they bake their own.</li>
+<li><b>If it leaves your control, treat it as compromised</b> and rotate:
+<code>amplifier-browser-bridge init --force</code>, then rebuild and reinstall. There is no way
+to revoke just this one file &mdash; rotating invalidates every device, desktop and phone, and
+each has to be redone. See SECURITY.md, &ldquo;One credential, two trust models&rdquo;.</li>
+</ul></div>
 </body></html>"""
 
 
