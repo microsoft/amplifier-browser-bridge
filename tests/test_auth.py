@@ -22,6 +22,7 @@ from amplifier_browser_bridge.auth import (
     extract_token_value,
     find_sibling_token_files,
     mask_token,
+    resolve_default_token,
     resolve_token_file,
 )
 
@@ -143,3 +144,30 @@ def test_token_store_validate_uses_constant_time_comparison_for_default_and_devi
         assert store.validate("device-secret", device_id="dev-1") is True
         assert store.validate("wrong", device_id="dev-1") is False
     assert spy.called
+
+
+# --- resolve_default_token: the same "persisted, read back automatically" -------
+# --- fix as hub_location.py's resolve_hub_url, applied to auth -----------------
+
+
+def test_resolve_default_token_falls_back_to_the_token_files_default(tmp_path: Path, monkeypatch) -> None:
+    """A hub with auth enabled and a token file already on this machine must
+    not ALSO require exporting AMPLIFIER_BROWSER_BRIDGE_TOKEN by hand for
+    every command -- the same class of fix as hub_location.py's
+    resolve_hub_url, applied to the other half of "reach the hub"."""
+    monkeypatch.delenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN", raising=False)
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text(json.dumps({"default": "secret-abc", "devices": {}}), encoding="utf-8")
+    assert resolve_default_token(token_file) == "secret-abc"
+
+
+def test_resolve_default_token_env_var_always_wins(tmp_path: Path, monkeypatch) -> None:
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text(json.dumps({"default": "secret-abc", "devices": {}}), encoding="utf-8")
+    monkeypatch.setenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN", "env-wins")
+    assert resolve_default_token(token_file) == "env-wins"
+
+
+def test_resolve_default_token_returns_none_when_nothing_configured(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AMPLIFIER_BROWSER_BRIDGE_TOKEN", raising=False)
+    assert resolve_default_token(tmp_path / "does-not-exist.json") is None

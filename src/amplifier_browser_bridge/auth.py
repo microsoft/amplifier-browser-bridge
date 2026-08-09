@@ -104,6 +104,29 @@ def resolve_token_file(path: str | Path | None = None) -> Path:
     ).expanduser()
 
 
+def resolve_default_token(path: str | Path | None = None) -> str | None:
+    """The default token every CLI/MCP-server/tool-module consumer sends when
+    `AMPLIFIER_BROWSER_BRIDGE_TOKEN` isn't set -- the SAME token file's `default`
+    entry that `init`/`doctor`/pairing already read from, so a hub with auth
+    enabled and a token file already on this machine doesn't ALSO require
+    exporting the token by hand for every single command. Mirrors
+    `hub_location.resolve_hub_url`'s "persisted locally, read back
+    automatically" fix, applied to the other half of "reach the hub":
+    knowing WHERE it is (hub_location.py) is not useful without also being
+    able to authenticate to it.
+
+    Resolution order: `AMPLIFIER_BROWSER_BRIDGE_TOKEN` env var (always wins) >
+    the token file's `default` token > `None` (auth disabled on this hub, or
+    this token file has only per-device tokens and no shared default --
+    either way, the caller sends no token and the hub decides what that
+    means, same as before this function existed).
+    """
+    env = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
+    if env:
+        return env
+    return load_token_store(path).default_token
+
+
 def find_sibling_token_files(active_path: str | Path) -> list[Path]:
     """Other files in the same directory as the active token file whose name
     suggests they might ALSO be a token store (contains "token", case-insensitive).

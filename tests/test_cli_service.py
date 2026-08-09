@@ -77,6 +77,42 @@ def test_service_install_cmd_generates_token_if_missing_and_calls_service_instal
     assert Path(args[2]) == token_file.resolve()
 
 
+def test_service_install_cmd_persists_the_resolved_hub_location(tmp_path: Path) -> None:
+    """`service install` shares `_resolve_hub_host` with `init` and must
+    persist the decision too -- e.g. a user who skipped `init`'s guided flow
+    and ran `service install` directly still gets a working default for
+    other commands (a bare `devices`, the MCP server, the tool module)."""
+    from amplifier_browser_bridge.hub_location import read_hub_location
+
+    runner = CliRunner()
+    token_file = tmp_path / "tokens.json"
+    location_file = tmp_path / "hub_location.json"
+    fake_info = ServiceInfo(
+        platform="linux",
+        supported=True,
+        installed=True,
+        active=True,
+        unit_path=tmp_path / "unit",
+        detail="ok",
+    )
+
+    with (
+        patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.5.5.5"),
+        patch("amplifier_browser_bridge.cli.service_install", return_value=fake_info),
+        patch("amplifier_browser_bridge.hub_location.resolve_hub_location_file", return_value=location_file),
+    ):
+        result = runner.invoke(
+            cli.main,
+            ["service", "install", "--token-file", str(token_file), "--port", "8901"],
+        )
+
+    assert result.exit_code == 0, result.output
+    location = read_hub_location(location_file)
+    assert location is not None
+    assert location.host == "100.5.5.5"
+    assert location.port == 8901
+
+
 def test_service_install_cmd_reuses_existing_token_file(tmp_path: Path) -> None:
     runner = CliRunner()
     token_file = tmp_path / "tokens.json"

@@ -72,6 +72,7 @@ from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .effects import EffectsReport
 from .extension_integrity import ExtensionIntegrityError
 from .extension_zip import build_extension_zip_bytes
+from .hub_location import DEFAULT_PORT
 from .onboarding import detect_platform, render_android_setup_page, render_setup_page
 from .pairing import DEFAULT_TICKET_TTL_SECONDS, PairingError, PairingStore, format_ticket
 from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
@@ -85,7 +86,9 @@ from .tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
 
-DEFAULT_PORT = 8900
+# DEFAULT_PORT re-exported from hub_location.py (its canonical home now -- see
+# that module's docstring) so `from .hub import DEFAULT_PORT` keeps working
+# unchanged for every existing importer (cli.py, __init__.py).
 # Real-world finding (real Edge profile, 532 open tabs): `read` on a heavy SPA
 # (repos.opensource.microsoft.com's Open Source Management Portal) timed out
 # at the prior default of 30.0s even though the tab was awake and

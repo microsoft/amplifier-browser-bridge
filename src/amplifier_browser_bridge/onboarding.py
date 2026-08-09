@@ -458,15 +458,17 @@ function execCommandCopy(text) {
 
   function showPaired() {
     clearInterval(timer);
-    countdownEl.style.display = "none";
-    waitingLine.style.display = "none";
-    if (manualDisclosure) manualDisclosure.style.display = "none";
-    if (copyBtn) copyBtn.style.display = "none";
-    document.getElementById("pair-code-value").style.display = "none";
-    if (step2) step2.setAttribute("data-state", "done");
-    resultLine.textContent = "Connected. Finish in the extension's tab.";
-    resultLine.style.display = "block";
-    if (!userCopied) nothingToCopyLine.style.display = "block";
+    // Collapse the WHOLE page to its final, shortest state -- not just step 2's
+    // own marker (docs/designs/onboarding-ux.md: "the page gets shorter as the
+    // user progresses"). Real bug this closes: step 1's full body (download
+    // button, unzip steps, edge://extensions instructions, the manual `pair`
+    // fallback) used to stay on the page forever, because the CSS rule that
+    // hides a step's body only fires for data-state="next", never "done". The
+    // Android link is the one thing kept -- see _setup_done_html()'s docstring.
+    var ladder = document.getElementById("setup-ladder");
+    var done = document.getElementById("setup-done");
+    if (ladder) ladder.style.display = "none";
+    if (done) done.style.display = "flex";
   }
 
   var everConfirmedPending = false;
@@ -509,6 +511,36 @@ function execCommandCopy(text) {
 })();
 </script>
 """
+
+
+def _setup_done_html() -> str:
+    """The final, collapsed state of `/setup` once pairing completes --
+    `_PAIR_SCRIPT`'s `showPaired()` swaps `#setup-ladder` out for this.
+
+    Real bug this closes (maintainer finding): before this, `showPaired()`
+    only flipped step 2's OWN `data-state` to `done` -- step 1's full body
+    (download button, unzip steps, `edge://extensions` instructions, the
+    manual `pair` fallback) stayed on the page forever, because the CSS rule
+    that hides a step's body only fires for `data-state="next"`, never
+    `"done"`. The whole point of this design (docs/designs/onboarding-ux.md:
+    "the page gets shorter as the user progresses") applies to `/setup`'s
+    OWN final state too, not just to individual steps within it -- this is
+    that state, brief by the same rule the rest of the ladder follows.
+
+    The Android link is the one thing kept on purpose: a visitor who just
+    paired a desktop browser may still want `/setup/android` for a second
+    device, and nothing else on this page is still actionable once paired.
+    """
+    return """<section class="step" data-state="done" id="setup-done" style="display:none;">
+  <span class="step-marker">&#10003;</span>
+  <div class="step-main">
+    <div class="step-title">You're connected</div>
+    <div class="step-context">Finish in the extension's tab &mdash; you can close this one.</div>
+    <div class="step-body">
+      <p><a class="back-link" href="/setup/android">Add another device (Android) &rarr;</a></p>
+    </div>
+  </div>
+</section>"""
 
 
 def render_setup_page(*, platform: str, host: str, port: int, android_available: bool) -> str:
@@ -558,11 +590,14 @@ def render_setup_page(*, platform: str, host: str, port: int, android_available:
 <body>
 <main>
 <h1 class="page-title">Amplifier Browser Bridge</h1>
+<div id="setup-ladder">
 <p class="page-subtitle">Let your agent use this browser.</p>
 {_WHY_SAFE_HTML}
 
 {step1}
 {step2}
+</div>
+{_setup_done_html()}
 </main>
 {_PAIR_SCRIPT}
 </body>

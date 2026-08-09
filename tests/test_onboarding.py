@@ -187,6 +187,53 @@ def test_render_setup_page_no_code_in_link_state_unchanged_behavior() -> None:
     assert "pair-none" in html
 
 
+# --- setup-done: the page's final, collapsed state (maintainer finding) --------
+
+
+def test_render_setup_page_has_a_hidden_final_done_state() -> None:
+    """The final state exists in the markup, hidden by default -- showPaired()
+    reveals it client-side once /pair/status reports redeemed."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_available=False)
+    assert 'id="setup-done"' in html
+    # The opening tag itself must start hidden.
+    opening_tag = html[html.index('<section class="step" data-state="done" id="setup-done"') :].split(">")[0]
+    assert 'style="display:none;"' in opening_tag
+
+
+def test_render_setup_page_final_state_keeps_the_android_link() -> None:
+    """Maintainer instruction: everything about the finished install ladder
+    goes away, EXCEPT the Android link -- a paired desktop user may still
+    want to add a phone."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_available=False)
+    done_block = html.split('id="setup-done"')[1].split("</section>")[0]
+    assert 'href="/setup/android"' in done_block
+
+
+def test_render_setup_page_final_state_is_brief() -> None:
+    """Copy rule (docs/designs/onboarding-ux.md section 4): brief, no walls of
+    text -- the done block is a title + one context line + the Android link,
+    nothing else."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_available=False)
+    done_block = html.split('id="setup-done"')[1].split("</section>")[0]
+    assert done_block.count("<p>") <= 1
+    assert "<ol" not in done_block
+    assert "Download extension" not in done_block
+    assert "edge://extensions" not in done_block
+
+
+def test_pair_script_collapses_the_whole_ladder_not_just_step_2() -> None:
+    """Real bug this closes: showPaired() used to only flip step 2's own
+    data-state to "done" -- step 1's full install-ladder body (download
+    button, unzip steps, edge://extensions instructions, the manual `pair`
+    fallback) stayed on the page forever, since the CSS rule that hides a
+    step's body only fires for data-state="next", never "done"."""
+    html = render_setup_page(platform="desktop", host="h", port=1, android_available=False)
+    show_paired_block = html.split("function showPaired() {")[1].split("\n  }")[0]
+    assert 'getElementById("setup-ladder")' in show_paired_block
+    assert 'getElementById("setup-done")' in show_paired_block
+    assert 'ladder.style.display = "none"' in show_paired_block
+
+
 # --- render_android_setup_page ---------------------------------------------------
 
 

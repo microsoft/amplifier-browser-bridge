@@ -171,6 +171,17 @@ Staged extension -> /home/user/.local/share/amplifier-browser-bridge/extension
 All checks passed. Try: amplifier-browser-bridge devices
 ```
 
+**That `devices` command works, unmodified, with no environment variables set.** `init` doesn't
+just print the resolved host (`100.124.126.19` above) -- it PERSISTS it, at the moment it's
+decided, to `~/.config/amplifier-browser-bridge/hub_location.json`. Every command that doesn't
+take its own `--hub-url` (a bare `devices`, the MCP server, the Amplifier tool module) reads that
+file back as its default, instead of each independently falling through to a hardcoded
+`ws://127.0.0.1:8900/agent` -- which is what used to make `init`'s own suggested next command
+crash with `ConnectionRefusedError` on a cross-device setup. An explicit `AMPLIFIER_BROWSER_BRIDGE_HUB_URL`
+(or `--hub-url`) always overrides the persisted value; re-running `init --hub-host <ip>` or
+`service install --host <ip>` corrects a stale one -- never by hand-editing the file. See
+`amplifier-browser-bridge doctor`'s `hub_location` check to see what's currently persisted.
+
 Answering `[Y/n]` with Enter (the default) at the ONE remaining prompt installs a real
 systemd/launchd service and confirms the hub is actually reachable. From there `init` hands you
 a single link that already carries the pairing code, then **watches for the browser to actually

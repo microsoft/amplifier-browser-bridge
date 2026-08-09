@@ -35,12 +35,20 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from .addressing import Target
+from .auth import resolve_default_token
 from .client import HubClient, HubError
+from .hub_location import resolve_hub_url
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
-DEFAULT_HUB_URL = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://127.0.0.1:8900/agent")
-DEFAULT_TOKEN = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
+# Resolution order (env var > persisted hub location from `amplifier-browser-bridge
+# init`/`service install` > loopback fallback) -- see hub_location.py's module
+# docstring. Deliberately imports only hub_location.py, not hub.py, to stay a
+# thin adapter with no dependency on the server-side (aiohttp) stack.
+DEFAULT_HUB_URL = resolve_hub_url()
+# Same fix, applied to auth: falls back to the token file's `default` entry
+# when no env var is set (auth.py's `resolve_default_token`).
+DEFAULT_TOKEN = resolve_default_token()
 
 mcp = FastMCP(
     name="amplifier-browser-bridge",

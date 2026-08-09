@@ -204,3 +204,39 @@ def test_kill_switch_command_group_is_registered() -> None:
     """A4 fix: the kill switch must be reachable from the CLI."""
     assert "kill-switch" in cli.main.commands
     assert {"engage", "disengage", "status"} <= set(cli.kill_switch.commands.keys())
+
+
+def test_init_persists_the_resolved_hub_location(tmp_path) -> None:
+    """The fix: `init` resolving a host must PERSIST it (host, port) so a
+    later, unrelated command (a bare `devices`, the MCP server, the tool
+    module) can read it back instead of falling through to a hardcoded
+    loopback default -- the exact bug reported (`init` printed a working
+    `devices` command that then crashed with ConnectionRefusedError against
+    127.0.0.1, because nothing recorded where `init` had actually put the
+    hub)."""
+    from amplifier_browser_bridge.hub_location import read_hub_location
+
+    runner = CliRunner()
+    location_file = tmp_path / "hub_location.json"
+    with (
+        patch("amplifier_browser_bridge.cli.detect_tailscale_ip", return_value="100.124.126.19"),
+        patch("amplifier_browser_bridge.hub_location.resolve_hub_location_file", return_value=location_file),
+    ):
+        result = runner.invoke(
+            cli.main,
+            [
+                "init",
+                "--dest",
+                str(tmp_path / "extension"),
+                "--token-file",
+                str(tmp_path / "tokens.json"),
+                "--hub-port",
+                "8900",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    location = read_hub_location(location_file)
+    assert location is not None
+    assert location.host == "100.124.126.19"
+    assert location.port == 8900

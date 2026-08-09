@@ -23,19 +23,28 @@ picks nothing for you; it forwards exactly what the caller asked for.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from amplifier_browser_bridge import HubClient, HubError, Target
+from amplifier_browser_bridge.auth import resolve_default_token
+from amplifier_browser_bridge.hub_location import resolve_hub_url
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 from amplifier_core import ToolResult
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HUB_URL = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://127.0.0.1:8900/agent")
-DEFAULT_TOKEN = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
+# Resolution order (env var > persisted hub location from `amplifier-browser-bridge
+# init`/`service install` > loopback fallback) -- see hub_location.py's module
+# docstring. Before this fix, this constant hardcoded the loopback fallback
+# independently of cli.py/mcp_server.py's own copies of the same literal --
+# one of the four call sites that could silently disagree with where `init`
+# actually told the user the hub was.
+DEFAULT_HUB_URL = resolve_hub_url()
+# Same fix, applied to auth: falls back to the token file's `default` entry
+# when no env var is set (auth.py's `resolve_default_token`).
+DEFAULT_TOKEN = resolve_default_token()
 
 # Repeated verbatim in every tab-acting tool's description below -- see
 # mcp_server.py's module docstring for why this is plain repeated text rather

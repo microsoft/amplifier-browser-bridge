@@ -26,6 +26,7 @@ from .auth import (
     resolve_token_file,
 )
 from .client import HubClient, HubError
+from .hub_location import read_hub_location, resolve_hub_location_file
 from .netinfo import detect_tailscale_ip, is_loopback, is_wildcard_bind
 from .service import describe_service
 
@@ -112,6 +113,38 @@ def _check_token_file_siblings(active_path: Path, store: TokenStore) -> DoctorCh
     return DoctorCheck(
         "token_file_siblings", "ok", f"no other token-like files found alongside {active_path}"
     )
+
+
+def _check_hub_location(hub_url: str) -> DoctorCheck:
+    """Report what's persisted as the default hub location (hub_location.py) --
+    visibility for the fix to the class of bug where a client fell back to a
+    hardcoded loopback default with no way to see why. Always `ok`: this is
+    informational, not a pass/fail check. `amplifier-browser-bridge init` and
+    `amplifier-browser-bridge service install` are what write this file (at
+    the moment each decides where the hub lives); re-run either one with an
+    explicit `--hub-host`/`--host` to correct a stale value -- never by
+    hand-editing the file.
+    """
+    file_path = resolve_hub_location_file()
+    location = read_hub_location(file_path)
+    if location is None:
+        return DoctorCheck(
+            "hub_location",
+            "ok",
+            f"no hub location persisted yet at {file_path} -- run `amplifier-browser-bridge init` "
+            "or `amplifier-browser-bridge service install` to record one, so other commands (a "
+            "bare `devices`, the MCP server, the Amplifier tool module) default to it too.",
+        )
+    persisted_url = location.to_agent_url()
+    if persisted_url != hub_url:
+        return DoctorCheck(
+            "hub_location",
+            "ok",
+            f"persisted hub location is {persisted_url} (from {file_path}), but this doctor run is "
+            f"checking {hub_url} -- an env var or --hub-url is overriding it, which is expected "
+            "and always takes priority over the persisted value.",
+        )
+    return DoctorCheck("hub_location", "ok", f"persisted hub location: {persisted_url} (from {file_path})")
 
 
 def _check_network_exposure(hub_url: str, auth_enabled: bool) -> DoctorCheck:
@@ -268,6 +301,7 @@ async def run_doctor(
             )
         )
     checks.append(_check_token_file_siblings(file_path, store))
+    checks.append(_check_hub_location(hub_url))
     checks.append(_check_network_exposure(hub_url, store.auth_enabled))
 
     service_check = _check_service_status(hub_url)

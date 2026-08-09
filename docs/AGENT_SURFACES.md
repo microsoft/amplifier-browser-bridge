@@ -80,9 +80,20 @@ Environment variables (same ones the CLI uses):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AMPLIFIER_BROWSER_BRIDGE_HUB_URL` | `ws://127.0.0.1:8900/agent` | Hub's agent-route WebSocket URL |
+| `AMPLIFIER_BROWSER_BRIDGE_HUB_URL` | see below | Hub's agent-route WebSocket URL |
 | `AMPLIFIER_BROWSER_BRIDGE_TOKEN` | unset | Per-device/agent shared token, if hub auth is enabled |
 | `AMPLIFIER_BROWSER_BRIDGE_MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
+
+**`AMPLIFIER_BROWSER_BRIDGE_HUB_URL`'s default is resolved, not hardcoded** (`hub_location.py`):
+1. this env var, if set -- always wins;
+2. the hub location `amplifier-browser-bridge init`/`amplifier-browser-bridge service install`
+   persisted the last time either one decided where the hub lives (`~/.config/amplifier-browser-bridge/hub_location.json`);
+3. `ws://127.0.0.1:8900/agent`, if nothing has ever been persisted.
+
+In practice: if you've already run `init` on this machine (even just to stage the extension --
+you don't need to have installed the service), the MCP server defaults to the SAME hub `init`
+told you about, with no env var required. Set the env var explicitly to point at a different hub
+than the one persisted here.
 
 ### Pointing an MCP client at it
 

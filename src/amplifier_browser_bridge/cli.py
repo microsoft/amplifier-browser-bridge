@@ -28,6 +28,7 @@ from .auth import (
     find_sibling_token_files,
     load_token_store,
     mask_token,
+    resolve_default_token,
     resolve_token_file,
 )
 from .client import HubClient, HubError
@@ -35,6 +36,7 @@ from .clipboard import copy_to_clipboard
 from .doctor import DoctorCheck, run_doctor
 from .extension_integrity import ExtensionIntegrityError
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
+from .hub_location import resolve_hub_url, write_hub_location
 from .netinfo import detect_tailscale_ip, is_wildcard_bind, wildcard_bind_warning
 from .pairing import DEFAULT_TICKET_TTL_SECONDS
 from .policy import Denylist, host_of
@@ -61,8 +63,20 @@ from .setup import (
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
-DEFAULT_HUB_URL = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_HUB_URL", "ws://127.0.0.1:8900/agent")
-DEFAULT_TOKEN = os.environ.get("AMPLIFIER_BROWSER_BRIDGE_TOKEN")
+# Resolution order (env var > persisted hub location > loopback fallback) --
+# see hub_location.py's module docstring. `init`/`service install` are the two
+# places that PERSIST a resolved host/port (at `_resolve_hub_host` call sites
+# below); every command in this file that doesn't take its own `--hub-url`
+# reads this same constant, so a plain `amplifier-browser-bridge devices` run
+# right after `init` can never fall back to loopback the way it used to.
+# Same "persisted locally, read back automatically" fix as DEFAULT_HUB_URL,
+# applied to the OTHER half of "reach the hub": knowing where it is
+# (hub_location.py) isn't useful without also being able to authenticate to
+# it. Falls back to the token file's `default` entry -- the same file
+# `init`/`doctor`/pairing already read -- when no env var is set (auth.py's
+# `resolve_default_token`).
+DEFAULT_HUB_URL = resolve_hub_url()
+DEFAULT_TOKEN = resolve_default_token()
 
 
 def _client() -> HubClient:
@@ -1080,17 +1094,12 @@ def pair(ttl: int) -> None:
     `devices`/`doctor`/etc.
     """
     try:
+        # A connection-level failure (hub unreachable, refused, timed out, ...)
+        # surfaces as HubError too -- see client.py's `_describe_connection_failure`.
+        # HubClient._request translates it there, once, for every caller.
         result = asyncio.run(_client().create_pairing(ttl_seconds=float(ttl)))
     except HubError as e:
         raise click.ClickException(str(e)) from e
-    except (OSError, TimeoutError) as e:
-        # Unlike a rejected token (HubError, above -- the hub answered, just said
-        # no), this is "nothing answered at all" -- name that distinction rather
-        # than letting a raw connection exception escape as an unhandled traceback.
-        raise click.ClickException(
-            f"could not reach hub at {DEFAULT_HUB_URL}: {e}. Is `amplifier-browser-bridge hub` "
-            "(or the service) running?"
-        ) from e
     if not result.get("ok"):
         raise click.ClickException(result.get("error") or "pairing request failed")
 
@@ -1678,6 +1687,14 @@ def init(
     _warn_divergent_token_siblings(token_result.token_file, token_result.token)
 
     resolved_host, detected_note = _resolve_hub_host(hub_host)
+    # Persist the decision NOW, at the moment it's made -- see hub_location.py's
+    # module docstring. This is the fix for the class of bug where every printed
+    # command below agreed on `resolved_host`/`hub_port`, but a later, unrelated
+    # command (a bare `amplifier-browser-bridge devices`, the MCP server, the
+    # tool module) had no way to read that decision back and fell through to a
+    # hardcoded loopback default instead. Best-effort (never raises) -- a write
+    # failure here doesn't change anything this command itself prints or does.
+    write_hub_location(resolved_host, hub_port)
     if is_wildcard_bind(resolved_host):
         click.echo("")
         click.echo(wildcard_bind_warning(resolved_host, hub_port))
@@ -1881,6 +1898,10 @@ def service_install_cmd(
     its contents.
     """
     resolved_host, detected_note = _resolve_hub_host(host)
+    # See `init`'s matching call for why this happens here too -- both commands
+    # share `_resolve_hub_host`, and both are a real "this is where the hub
+    # lives" decision point (hub_location.py's module docstring).
+    write_hub_location(resolved_host, port)
     if is_wildcard_bind(resolved_host):
         click.echo(wildcard_bind_warning(resolved_host, port), err=True)
 

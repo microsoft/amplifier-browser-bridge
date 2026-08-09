@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from typing import Any
 
 import websockets
@@ -21,6 +22,40 @@ from .protocol import PROTOCOL_VERSION, new_id
 
 class HubError(RuntimeError):
     """Raised when the hub returns an `error` message, or a request-level failure occurs."""
+
+
+def _describe_connection_failure(url: str, exc: BaseException) -> str:
+    """Turn a low-level connection failure into a message naming what was tried,
+    what happened, and what to do -- never a raw traceback.
+
+    This is THE fix for the class of bug where some commands (`pair`, `init`'s
+    internal readiness poll) had their own hand-written `except (OSError,
+    TimeoutError)` block with a decent message, while others (`devices`, every
+    `tabs`/`snapshot`/`click`/... command, the MCP server, the Amplifier tool
+    module) had no such block at all and let `ConnectionRefusedError` and
+    friends escape as a raw Python traceback. Centralizing the translation
+    here, in `_request` (the one place every one of those callers already
+    funnels through), means every existing `except HubError` call site gets
+    this improvement automatically -- fixing the mechanism, not each call
+    site individually.
+    """
+    if isinstance(exc, ConnectionRefusedError):
+        reason = "connection refused -- nothing is listening there"
+    elif isinstance(exc, socket.gaierror):
+        reason = f"could not resolve host ({exc})"
+    elif isinstance(exc, TimeoutError):
+        reason = "timed out waiting for a response"
+    elif isinstance(exc, OSError):
+        reason = str(exc) or exc.__class__.__name__
+    else:
+        # A websockets-level failure (invalid handshake, unexpected status code,
+        # connection closed mid-request, ...) -- still not a raw traceback.
+        reason = str(exc) or exc.__class__.__name__
+    return (
+        f"could not reach hub at {url}: {reason}. Is `amplifier-browser-bridge hub` (or the "
+        "service) running there? Check the host/port -- `amplifier-browser-bridge doctor` "
+        "diagnoses this exact chain."
+    )
 
 
 class HubClient:
@@ -59,10 +94,19 @@ class HubClient:
         # `effective_timeout` -- the hub was still working; the client silently
         # gave up first. `open_timeout` (connection establishment) is unaffected
         # and stays enforced.
-        async with websockets.connect(self.url, open_timeout=10, ping_interval=None) as ws:
-            await ws.send(json.dumps(req))
-            raw = await asyncio.wait_for(ws.recv(), timeout=effective_timeout)
-            resp: dict[str, Any] = json.loads(raw)
+        try:
+            async with websockets.connect(self.url, open_timeout=10, ping_interval=None) as ws:
+                await ws.send(json.dumps(req))
+                raw = await asyncio.wait_for(ws.recv(), timeout=effective_timeout)
+        except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as e:
+            # Connection-level failure -- nothing answered at all (refused,
+            # unreachable, DNS failure, timed out, ...). Distinct from the hub
+            # answering with an explicit `type: error` response (handled below,
+            # after a successful recv()) -- see `_describe_connection_failure`'s
+            # docstring for why this is centralized here rather than duplicated
+            # at every caller.
+            raise HubError(_describe_connection_failure(self.url, e)) from e
+        resp: dict[str, Any] = json.loads(raw)
         if resp.get("type") == "error":
             raise HubError(resp.get("error", "unknown hub error"))
         return resp

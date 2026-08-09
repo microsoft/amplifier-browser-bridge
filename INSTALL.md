@@ -270,6 +270,11 @@ amplifier-browser-bridge devices
 amplifier-browser-bridge tabs <device_id>
 ```
 
+**No `--hub-url`/env var needed for these** if you ran `init` (or `service install`) on this same
+machine: the host it resolved is persisted to `~/.config/amplifier-browser-bridge/hub_location.json`
+and read back as the default by `devices`, the MCP server, and the Amplifier tool module alike --
+see `docs/AGENT_SURFACES.md`. An explicit `AMPLIFIER_BROWSER_BRIDGE_HUB_URL` always overrides it.
+
 ## The "started debugging this browser" banner is expected
 
 At some point Edge will put a bar across the top of your browser reading

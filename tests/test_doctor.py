@@ -429,3 +429,88 @@ def test_doctor_reports_auth_disabled_honestly(tmp_path: Path) -> None:
     assert store.auth_enabled is False
     check = DoctorCheck("token_store", "ok", f"auth DISABLED (no token found at {missing_path})")
     assert check.ok
+
+
+# --- hub_location: visibility for the persisted-default fix ---------------------
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_no_hub_location_persisted_yet(tmp_path: Path, token_file: Path) -> None:
+    from unittest.mock import patch
+
+    hub = Hub(
+        token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
+    )
+    server = TestServer(hub.build_app())
+    await server.start_server()
+    try:
+        hub_url = f"ws://{server.host}:{server.port}/agent"
+        with patch(
+            "amplifier_browser_bridge.doctor.resolve_hub_location_file",
+            return_value=tmp_path / "no-such-hub-location.json",
+        ):
+            checks = await run_doctor(hub_url, "secret-123", token_file)
+    finally:
+        await server.close()
+
+    location_check = _by_name(checks, "hub_location")
+    assert location_check.ok
+    assert "no hub location persisted yet" in location_check.message
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_the_persisted_hub_location_when_it_matches(
+    tmp_path: Path, token_file: Path
+) -> None:
+    from unittest.mock import patch
+
+    from amplifier_browser_bridge.hub_location import write_hub_location
+
+    hub = Hub(
+        token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
+    )
+    server = TestServer(hub.build_app())
+    await server.start_server()
+    assert server.port is not None
+    location_file = tmp_path / "hub_location.json"
+    write_hub_location(server.host, server.port, path=location_file)
+    try:
+        hub_url = f"ws://{server.host}:{server.port}/agent"
+        with patch("amplifier_browser_bridge.doctor.resolve_hub_location_file", return_value=location_file):
+            checks = await run_doctor(hub_url, "secret-123", token_file)
+    finally:
+        await server.close()
+
+    location_check = _by_name(checks, "hub_location")
+    assert location_check.ok
+    assert hub_url in location_check.message
+
+
+@pytest.mark.asyncio
+async def test_doctor_notes_when_persisted_location_differs_from_what_was_checked(
+    tmp_path: Path, token_file: Path
+) -> None:
+    from unittest.mock import patch
+
+    from amplifier_browser_bridge.hub_location import write_hub_location
+
+    hub = Hub(
+        token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
+    )
+    server = TestServer(hub.build_app())
+    await server.start_server()
+    location_file = tmp_path / "hub_location.json"
+    # Persisted value points somewhere else entirely -- an env var/--hub-url
+    # override was used for this particular doctor invocation.
+    write_hub_location("100.9.9.9", 9999, path=location_file)
+    try:
+        hub_url = f"ws://{server.host}:{server.port}/agent"
+        with patch("amplifier_browser_bridge.doctor.resolve_hub_location_file", return_value=location_file):
+            checks = await run_doctor(hub_url, "secret-123", token_file)
+    finally:
+        await server.close()
+
+    location_check = _by_name(checks, "hub_location")
+    assert location_check.ok  # informational, never a failure
+    assert "ws://100.9.9.9:9999/agent" in location_check.message
+    assert "overriding it" in location_check.message
