@@ -1095,6 +1095,7 @@ def pair(ttl: int) -> None:
 
     ticket = result["ticket"]
     host_port = urlsplit(DEFAULT_HUB_URL).netloc  # same host:port this command just talked to over /agent
+    host, _, port_str = host_port.rpartition(":")
     code = f"{ticket}@{host_port}"
 
     click.echo(f"Pairing code (valid {ttl}s, single use):")
@@ -1104,6 +1105,12 @@ def pair(ttl: int) -> None:
     click.echo("On the browser being paired: click the extension's toolbar icon, open its")
     click.echo('Settings page, enter this code under "Pair with a hub", and click Pair.')
     click.echo("No hub URL or token to copy by hand -- pairing fetches both automatically.")
+    if host and port_str.isdigit():
+        click.echo("")
+        click.echo("Or, if that browser hasn't installed the extension yet, send it this single link")
+        click.echo("instead -- it downloads the extension AND carries this code (never sent to the")
+        click.echo("hub -- see docs/PROTOCOL.md's Pairing section):")
+        click.echo(f"    {_setup_pair_url(host, int(port_str), code)}")
     if not result.get("persisted", True):
         click.echo("")
         click.echo(
@@ -1225,6 +1232,25 @@ def _resolve_interactivity(*, yes: bool, non_interactive: bool) -> bool:
     return yes or _stdin_is_interactive()
 
 
+def _setup_url(host: str, port: int) -> str:
+    """The onboarding page URL -- see hub.py's `GET /setup` route
+    (onboarding.py). Single home for this string so every printed
+    instruction (`init`'s guided and non-interactive flows, `pair`) can never
+    drift apart on its shape the way three separate "select: <path>" print
+    sites already had before this fix."""
+    return f"http://{host}:{port}/setup"
+
+
+def _setup_pair_url(host: str, port: int, code: str) -> str:
+    """The onboarding page URL with a pairing code embedded in the URL
+    FRAGMENT (`#pair=...`), never a query parameter -- browsers never send a
+    URL fragment to a server, so this code never touches the hub's own
+    access logs or a Referer header the way a query string would. See
+    onboarding.py's module docstring and hub.py's "Onboarding" section for
+    the full reasoning."""
+    return f"{_setup_url(host, port)}#pair={code}"
+
+
 def _print_remaining_steps(
     *,
     token_result: TokenResult,
@@ -1257,8 +1283,15 @@ def _print_remaining_steps(
     )
     click.echo("")
     click.echo("  2. Load the extension:")
-    click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
-    click.echo(f"       select: {staged_dir}")
+    click.echo("     On the browser being paired (any device on your tailnet -- open this URL")
+    click.echo("     THERE, not necessarily on this machine), once the hub from step 1 is running:")
+    click.echo(f"       http://{resolved_host}:{hub_port}/setup")
+    click.echo("     That page downloads the extension, and walks through unzipping it and")
+    click.echo("     'Load unpacked' -- Edge has no CLI for that step, on any platform.")
+    click.echo("")
+    click.echo("     If Edge is on THIS SAME machine, you can skip the download and point")
+    click.echo("     'Load unpacked' straight at the already-unzipped staged copy instead:")
+    click.echo(f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}")
     click.echo("")
     click.echo("  3. Configure it -- once the hub from step 1 is running, PAIR it (recommended,")
     click.echo("     no hub URL or token to copy by hand):")
@@ -1531,8 +1564,11 @@ def init(
 
     click.echo("")
     click.echo("  2. Load the extension:")
-    click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
-    click.echo(f"       select: {staged_dir}")
+    click.echo("     On the browser being paired (open this URL THERE -- any device on your")
+    click.echo("     tailnet, not necessarily this machine):")
+    click.echo(f"       {_setup_url(resolved_host, hub_port)}")
+    click.echo("     Same machine as this hub? Skip the download and use the staged copy directly:")
+    click.echo(f"       edge://extensions -> enable Developer mode -> Load unpacked -> select: {staged_dir}")
 
     if yes:
         click.echo("")
@@ -1543,6 +1579,8 @@ def init(
             f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
         )
         click.echo('       Click the extension\'s toolbar icon -> Settings -> "Pair with a hub".')
+        click.echo("       (Or send whoever's browser this is the setup URL with the code embedded --")
+        click.echo("       see `amplifier-browser-bridge pair`'s own output for that link.)")
         click.echo("")
         click.echo("  4. Confirm it worked:")
         click.echo(
@@ -1599,6 +1637,10 @@ def init(
         f"     fresh one: AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
         f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
     )
+    click.echo("")
+    click.echo("     Or send whoever's browser this is a single link -- it carries this code in the")
+    click.echo("     URL fragment, which is never sent to the hub, so it never touches server logs:")
+    click.echo(f"       {_setup_pair_url(resolved_host, hub_port, code)}")
 
     if not click.confirm("\n     Entered the code and clicked Pair?", default=True):
         click.echo("")
@@ -1655,8 +1697,20 @@ def service_group() -> None:
     default=None,
     help="Default device-round-trip wait, in seconds (see `hub --command-timeout`).",
 )
+@click.option(
+    "--android-artifact",
+    default=None,
+    help="Path to a pre-built Android CRX/`.bin` to serve at GET /setup/android-extension.bin "
+    "(see `hub --android-artifact`'s help for the full reasoning). Baked into the service unit "
+    "as an explicit argument, same as --host/--port/--token-file.",
+)
 def service_install_cmd(
-    host: str | None, port: int, token_file: str | None, audit_log: str | None, command_timeout: float | None
+    host: str | None,
+    port: int,
+    token_file: str | None,
+    audit_log: str | None,
+    command_timeout: float | None,
+    android_artifact: str | None,
 ) -> None:
     """Install (or re-install) the hub as a background service and start it.
 
@@ -1686,6 +1740,7 @@ def service_install_cmd(
             resolved_token_file,
             audit_log=audit_log,
             command_timeout=command_timeout,
+            android_artifact=android_artifact,
         )
     except ServiceUnsupportedError as e:
         raise click.ClickException(str(e)) from e
@@ -1831,7 +1886,24 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
         "'Command timeout' section)."
     ),
 )
-def hub(host: str, port: int, token_file: str | None, audit_log: str | None, command_timeout: float) -> None:
+@click.option(
+    "--android-artifact",
+    default=None,
+    help="Path to a pre-built Android CRX/`.bin` (from `scripts/package-android.sh`) to serve at "
+    "GET /setup/android-extension.bin. Default: $AMPLIFIER_BROWSER_BRIDGE_ANDROID_ARTIFACT, or "
+    "unset -- that route then 404s with an actionable message, and the /setup page's Android "
+    "section shows no download link, instead of ever guessing a path. This file carries a live "
+    "hub credential baked in (android_bake.py) -- serving it is opt-in on purpose (see hub.py's "
+    "'Onboarding' section for the full reasoning).",
+)
+def hub(
+    host: str,
+    port: int,
+    token_file: str | None,
+    audit_log: str | None,
+    command_timeout: float,
+    android_artifact: str | None,
+) -> None:
     """Run the hub: device registry, per-device command queue, routing, audit log."""
     if is_wildcard_bind(host):
         # A1 fix (security review finding): --host default changed from the
@@ -1846,6 +1918,12 @@ def hub(host: str, port: int, token_file: str | None, audit_log: str | None, com
     audit_path = audit_log or os.environ.get(
         "AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG", "./amplifier-browser-bridge-audit.jsonl"
     )
+    resolved_android_artifact_raw = android_artifact or os.environ.get(
+        "AMPLIFIER_BROWSER_BRIDGE_ANDROID_ARTIFACT"
+    )
+    resolved_android_artifact = (
+        Path(resolved_android_artifact_raw).expanduser() if resolved_android_artifact_raw else None
+    )
     hub_instance = Hub(
         token_store=token_store,
         audit_log=AuditLog(audit_path),
@@ -1854,6 +1932,7 @@ def hub(host: str, port: int, token_file: str | None, audit_log: str | None, com
         # per-device token into the SAME file `token_store` above was loaded
         # from -- see Hub.__init__'s docstring and pairing.py's module docstring.
         token_file=resolved_token_file,
+        android_artifact=resolved_android_artifact,
     )
     app = hub_instance.build_app()
     banner = (

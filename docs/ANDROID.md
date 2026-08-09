@@ -257,19 +257,31 @@ device. That is a genuinely different question -- see the final section.
    # http://<this-machine's-tailnet-IP>:8765/amplifier-browser-bridge-android-v0.4.0.bin
    ```
 
-   **Preferred: serve the `/setup` page instead of a bare directory listing.**
-   `scripts/serve-android-setup.py` serves the same artifact plus a phone-sized
-   instruction page carrying the same experimental framing this document opens
-   with -- so a person handed only a URL sees the Canary/Beta requirement and the
-   stable-channel limitation before they download anything, rather than after they
-   fail:
+   **Preferred: point the hub itself at the artifact instead of running a
+   second server.** An earlier version of this project ran a separate,
+   hand-rolled ~10KB HTTP server (`scripts/serve-android-setup.py`) just for
+   this -- a second listener, on a second port, that two design/product
+   council reviews both flagged as "two unbridged mechanisms nobody
+   reconciled" against the desktop onboarding path. That script is retired.
+   The hub (already running for the desktop path -- see INSTALL.md) now
+   serves the identical bytes, plus the identical experimental framing this
+   document opens with, from its own `GET /setup` page:
    ```bash
-   python3 scripts/serve-android-setup.py \
-     --root dist/android \
-     --artifact amplifier-browser-bridge-android-v0.4.0.bin \
-     --host "$(tailscale ip -4)" --port 8686
-   # then, on the phone's browser: http://<that tailnet IP>:8686/setup
+   amplifier-browser-bridge hub --host "$(tailscale ip -4)" --port 8900 \
+     --android-artifact dist/android/amplifier-browser-bridge-android-v0.4.0.bin
+   # then, on the phone's browser: http://<that tailnet IP>:8900/setup
+   # (auto-detects it's a phone from the User-Agent and opens the Android
+   # section; the desktop section on the same page is what a laptop/desktop
+   # visiting the SAME URL sees instead)
    ```
+   Already running the hub as a service (`amplifier-browser-bridge service
+   install`)? Pass the same `--android-artifact <path>` to that command
+   instead -- it bakes into the service unit the same way `--host`/`--port`
+   already do. Without `--android-artifact`, the hub's `/setup` page still
+   shows the Android section (so the phone-side instructions/warnings are
+   visible either way) but has no working download link, and
+   `GET /setup/android-extension.bin` 404s with an actionable message rather
+   than silently serving nothing.
    It refuses to start if the named artifact is missing, and serves everything
    except `/setup` as an opaque `application/octet-stream` attachment.
 2. **On the phone**, once the `.bin` file is downloaded, use a file manager (e.g.

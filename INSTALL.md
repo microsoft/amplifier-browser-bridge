@@ -166,6 +166,17 @@ amplifier-browser-bridge service logs                                  # tail it
 
 ## Step 2 -- Load this extension into Edge
 
+**If you got here from a link, skip to step 2 below** -- you already have the
+zip. If you're reading this from inside a zip you downloaded some other way
+(e.g. a GitHub release), the hub's own `GET /setup` page is now the primary
+way to get this file: on the machine running Edge (which may or may not be
+the same machine as the hub), visit `http://<hub host>:<hub port>/setup` and
+click the desktop download button there. That page exists specifically so
+you don't need a path on the hub machine's filesystem -- it downloads the
+zip onto the SAME machine Edge is running on.
+
+Either way, from here the steps are identical:
+
 1. **Unzip** this archive somewhere stable on your machine (e.g.
    `~/Extensions/amplifier-browser-bridge/`). The folder must stay where it
    is -- Edge loads the extension from this location every time it starts,
@@ -176,6 +187,11 @@ amplifier-browser-bridge service logs                                  # tail it
 5. The extension's options page should open automatically on first install.
    If it doesn't, click the extension's toolbar icon (its only UI) -- that
    also opens the options page.
+
+**Chromium cannot install an extension directly from a zip file -- there is
+no one-click install.** The `/setup` page does not pretend otherwise; the
+win it provides is that the file arrives on the browser's own machine, not
+that unzipping and "Load unpacked" go away.
 
 ## Step 3 -- Configure the extension
 

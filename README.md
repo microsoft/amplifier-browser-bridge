@@ -154,8 +154,11 @@ Staged extension -> /home/user/.local/share/amplifier-browser-bridge/extension
      Confirmed: hub reachable at ws://100.124.126.19:8900/agent
 
   2. Load the extension:
-       edge://extensions -> enable Developer mode -> Load unpacked ->
-       select: /home/user/.local/share/amplifier-browser-bridge/extension
+     On the browser being paired (open this URL THERE -- any device on your
+     tailnet, not necessarily this machine):
+       http://100.124.126.19:8900/setup
+     Same machine as this hub? Skip the download and use the staged copy directly:
+       edge://extensions -> enable Developer mode -> Load unpacked -> select: /home/user/.local/share/amplifier-browser-bridge/extension
 
      Loaded, and its Settings page is open? [Y/n]:
 
@@ -466,8 +469,11 @@ Remaining steps (manual -- Edge has no CLI for these):
        (could not detect a Tailscale IP -- `tailscale ip -4` is unavailable or failed -- defaulting to 127.0.0.1, which is NOT reachable from another device; for cross-device use, re-run with --hub-host <this machine's tailnet IP>)
 
   2. Load the extension:
-       edge://extensions -> enable Developer mode -> Load unpacked ->
-       select: /root/.local/share/amplifier-browser-bridge/extension
+     On the browser being paired (open this URL THERE -- any device on your
+     tailnet, not necessarily this machine):
+       http://127.0.0.1:8900/setup
+     Same machine as this hub? Skip the download and use the staged copy directly:
+       edge://extensions -> enable Developer mode -> Load unpacked -> select: /root/.local/share/amplifier-browser-bridge/extension
 
   3. Configure it:
        Click the extension's toolbar icon (its only UI) to open the options page.
@@ -569,8 +575,11 @@ Created symlink /home/bkrabach/.config/systemd/user/default.target.wants/amplifi
      Confirmed: hub reachable at ws://100.124.126.19:8900/agent
 
   2. Load the extension:
-       edge://extensions -> enable Developer mode -> Load unpacked ->
-       select: /home/bkrabach/.local/share/amplifier-browser-bridge/extension
+     On the browser being paired (open this URL THERE -- any device on your
+     tailnet, not necessarily this machine):
+       http://100.124.126.19:8900/setup
+     Same machine as this hub? Skip the download and use the staged copy directly:
+       edge://extensions -> enable Developer mode -> Load unpacked -> select: /home/bkrabach/.local/share/amplifier-browser-bridge/extension
 
      Loaded, and its Settings page is open? [Y/n]:
 

@@ -59,8 +59,14 @@ packages = ["src/amplifier_browser_bridge"]
 # harmless extra bytes rather than a second hardcoded list to keep in sync with
 # setup.py's _EXTENSION_FILES. tests/test_packaging.py builds a real wheel and asserts
 # every file _EXTENSION_FILES needs is actually present in it.
+#
+# INSTALL.md ships the same way -- extension_zip.py's find_install_md() bundles it
+# into the hub's live GET /setup/extension.zip download (see that module's
+# docstring), and without this force-include a real (non-editable) install has no
+# INSTALL.md to find at all; only a dev checkout would.
 [tool.hatch.build.targets.wheel.force-include]
 "extension" = "amplifier_browser_bridge/extension"
+"INSTALL.md" = "amplifier_browser_bridge/INSTALL.md"
 
 [tool.ruff]
 line-length = 110

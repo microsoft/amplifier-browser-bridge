@@ -224,6 +224,7 @@ def _hub_argv_tail(
     token_file: Path,
     audit_log: Path | None,
     command_timeout: float | None,
+    android_artifact: Path | None = None,
 ) -> list[str]:
     """The `hub` subcommand and its arguments, explicit and absolute -- never an
     environment variable a service manager might not propagate. Shared by both the
@@ -234,6 +235,8 @@ def _hub_argv_tail(
         argv += ["--audit-log", str(audit_log)]
     if command_timeout is not None:
         argv += ["--command-timeout", str(command_timeout)]
+    if android_artifact is not None:
+        argv += ["--android-artifact", str(android_artifact)]
     return argv
 
 
@@ -257,8 +260,12 @@ def _systemd_install(
     token_file: Path,
     audit_log: Path | None,
     command_timeout: float | None,
+    android_artifact: Path | None = None,
 ) -> None:
-    exec_argv = [_resolve_hub_bin(), *_hub_argv_tail(host, port, token_file, audit_log, command_timeout)]
+    exec_argv = [
+        _resolve_hub_bin(),
+        *_hub_argv_tail(host, port, token_file, audit_log, command_timeout, android_artifact),
+    ]
     exec_start = shlex.join(exec_argv)
     safe_path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     unit_content = _SYSTEMD_UNIT_TEMPLATE.format(exec_start=exec_start, safe_path=safe_path)
@@ -420,9 +427,10 @@ def _launchd_install(
     token_file: Path,
     audit_log: Path | None,
     command_timeout: float | None,
+    android_artifact: Path | None = None,
 ) -> None:
     bin_tokens = _resolve_hub_bin_tokens()
-    argv = bin_tokens + _hub_argv_tail(host, port, token_file, audit_log, command_timeout)
+    argv = bin_tokens + _hub_argv_tail(host, port, token_file, audit_log, command_timeout, android_artifact)
     # Each argv token is its own <string> element. launchd does NOT shell-split
     # inside a <string>, so the whole command must NEVER be put into one element.
     program_arguments_xml = "\n".join(f"        <string>{_xml_escape(arg)}</string>" for arg in argv)
@@ -528,6 +536,7 @@ def service_install(
     *,
     audit_log: str | Path | None = None,
     command_timeout: float | None = None,
+    android_artifact: str | Path | None = None,
 ) -> ServiceInfo:
     """Install (or re-install) the hub service unit for the current user and start it.
 
@@ -547,14 +556,19 @@ def service_install(
     token_file_path = Path(token_file).expanduser().resolve()
     resolved_audit_log = _resolve_service_audit_log(audit_log)
     resolved_audit_log.parent.mkdir(parents=True, exist_ok=True)
+    android_artifact_path = Path(android_artifact).expanduser().resolve() if android_artifact else None
 
     if _is_windows():
         raise ServiceUnsupportedError(_WINDOWS_UNSUPPORTED_DETAIL)
     if _is_darwin():
-        _launchd_install(host, port, token_file_path, resolved_audit_log, command_timeout)
+        _launchd_install(
+            host, port, token_file_path, resolved_audit_log, command_timeout, android_artifact_path
+        )
         return _launchd_describe()
     if _have_systemctl():
-        _systemd_install(host, port, token_file_path, resolved_audit_log, command_timeout)
+        _systemd_install(
+            host, port, token_file_path, resolved_audit_log, command_timeout, android_artifact_path
+        )
         return _systemd_describe()
     raise ServiceUnsupportedError(_no_systemctl_detail())
 

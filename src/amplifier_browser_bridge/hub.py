@@ -58,6 +58,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from aiohttp import ContentTypeError, WSMsgType, web
@@ -68,12 +69,16 @@ from .audit import AuditLog
 from .auth import TokenStore, persist_device_token
 from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .effects import EffectsReport
+from .extension_integrity import ExtensionIntegrityError
+from .extension_zip import build_extension_zip_bytes
+from .onboarding import detect_platform, render_setup_page
 from .pairing import DEFAULT_TICKET_TTL_SECONDS, PairingError, PairingStore, format_ticket
 from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
 from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .scope import SCOPE_FIELDS, ScopeError, SessionScope
+from .setup import ExtensionSourceNotFoundError
 from .setup import generate_token as generate_device_token
 from .tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
@@ -228,6 +233,7 @@ class Hub:
         soft_detach_sweep_interval: float = DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS,
         keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS,
         token_file: Any = None,
+        android_artifact: Path | None = None,
     ) -> None:
         self.registry = DeviceRegistry()
         self.token_store = token_store
@@ -288,6 +294,18 @@ class Hub:
         # is the hub's one named serialization point for session-scoped state;
         # see `_session_lock` and `send_command`'s docstring.
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Onboarding (this module's "Onboarding" section below, and
+        # onboarding.py): a pre-built Android CRX/`.bin` this hub will serve at
+        # `GET /setup/android-extension.bin`, if the operator has built one
+        # (`scripts/package-android.sh`) and told this hub where it is
+        # (`hub --android-artifact <path>`). `None` means "not configured" --
+        # the route then 404s with an actionable message, and the `/setup`
+        # page's Android section shows "no build available on this hub yet"
+        # instead of a download link. Deliberately opt-in (never
+        # auto-discovered from a guessed `dist/android/` path): serving a
+        # stale or wrong artifact by accident would hand out a live
+        # credential (see android_bake.py) to the wrong build.
+        self.android_artifact = android_artifact
         if not token_store.auth_enabled:
             logger.warning(
                 "No hub token configured (AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN / token file) -- running with "
@@ -305,6 +323,16 @@ class Hub:
         # unauthenticated-by-token route is the correct design here, bounded
         # instead by the ticket's own short TTL/single-use/attempt-count limits.
         app.router.add_post("/pair/redeem", self._handle_pair_redeem)
+        # Onboarding routes (this module's "Onboarding" section below,
+        # onboarding.py, extension_zip.py) -- deliberately plain HTTP, NOT
+        # gated by the long-lived token, for the identical bootstrapping
+        # reason `/pair/redeem` above is ungated: a browser that has never
+        # been configured holds no token to authenticate with. See that
+        # section for the full reasoning, including what these routes do and
+        # do not expose.
+        app.router.add_get("/setup", self._handle_setup_page)
+        app.router.add_get("/setup/extension.zip", self._handle_setup_extension_zip)
+        app.router.add_get("/setup/android-extension.bin", self._handle_setup_android_artifact)
         # Background soft-detach sweep (design doc §6.3/§7) -- started/stopped
         # via aiohttp's own app lifecycle so `cli.py`'s `hub` command needs no
         # changes to benefit from it. Tests that want deterministic control
@@ -343,6 +371,133 @@ class Hub:
 
     async def _handle_healthz(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "devices": len(self.registry.all())})
+
+    # ------------------------------------------------------------------
+    # Onboarding -- GET /setup, GET /setup/extension.zip,
+    # GET /setup/android-extension.bin (onboarding.py, extension_zip.py).
+    #
+    # The bug this section fixes: `cli.py`'s `init` used to print a
+    # filesystem path on the HUB machine ("select: /home/<user>/.local/
+    # share/amplifier-browser-bridge/extension") as the instruction for
+    # loading the extension into Edge. That instruction is only correct
+    # when Edge happens to run on the same machine as the hub -- and this
+    # project exists specifically for the opposite case (hub on a Linux
+    # box, Edge on a MacBook or an Android phone), where the printed path
+    # does not exist on the browser's machine at all. These routes let the
+    # BROWSER fetch its own install artifact, from wherever it is, instead
+    # of the operator trying to hand it a path on someone else's disk.
+    #
+    # ## Why these routes are NOT gated by the long-lived token
+    #
+    # A browser that has never been configured holds no hub token -- it
+    # cannot authenticate to fetch the thing that would give it one. This
+    # is the identical bootstrapping problem `/pair/redeem` above already
+    # solves the same way (see pairing.py's module docstring, "Why the
+    # ticket does not weaken the token as the security boundary"): gating
+    # onboarding behind the very credential onboarding exists to hand out
+    # would make it unreachable by the one browser that needs it.
+    #
+    # `muxplex` (a sibling project) hit the identical shape of problem
+    # serving its own CA certificate + setup page, and resolved it the
+    # same way for the same reason: the CA CERTIFICATE is not secret --
+    # only its private key, which never leaves the server, is. "Sharing it
+    # doesn't reduce your security. Sharing the .key does." (muxplex's
+    # docs/TRUSTING_THE_LOCAL_CA.md, "Security notes"). The parallel here
+    # is exact: this extension's SOURCE CODE is not a secret either -- it
+    # is the same code already public on GitHub. `GET /setup` and
+    # `GET /setup/extension.zip` hand out only that code plus generic
+    # install instructions; downloading it here saves a `git clone`, and
+    # nothing more. What actually stays secret -- the long-lived hub
+    # token -- is never served by any route in this section.
+    #
+    # ## What "reachable" bounds this to
+    #
+    # Exactly the same boundary as every other hub route: something
+    # already on this hub's tailnet (auth.py's module docstring,
+    # docs/POLICY.md). An attacker who is not on the tailnet cannot reach
+    # `/setup` at all. Someone who IS on the tailnet (during the live
+    # window of an in-progress pairing) could in principle race the
+    # intended device for a pairing code shown in the URL fragment -- but
+    # that fragment never crosses this route at all (browsers never send
+    # the URL fragment to a server; see onboarding.py's module docstring)
+    # and the code itself is the same short-lived, single-use,
+    # narrowly-scoped ticket `/pair/redeem` already accepts, bounded by
+    # the identical entropy/TTL/attempt-count reasoning in pairing.py.
+    # Nothing here widens that.
+    #
+    # ## The one route that DOES carry a live credential
+    #
+    # `GET /setup/android-extension.bin`, when configured
+    # (`self.android_artifact`), serves a pre-built CRX that has a hub
+    # token baked into it by design (android_bake.py's accepted trust
+    # model -- Edge Android has no reachable options page, so there is no
+    # other channel to configure it). That file is a real credential, and
+    # this route does hand it to anyone on the tailnet who asks -- but
+    # this is NOT new exposure: the retired `scripts/serve-android-setup.py`
+    # already served the identical bytes, from its own unauthenticated
+    # listener, under the identical tailnet-only boundary. Consolidating
+    # both platforms onto this hub's existing listener REMOVES a second
+    # listening port from the host's attack surface; it does not add one.
+    # This route is opt-in (serves nothing unless `--android-artifact` was
+    # explicitly configured) specifically so a hub never hands out a stale
+    # or wrong build by accident.
+    # ------------------------------------------------------------------
+
+    async def _handle_setup_page(self, request: web.Request) -> web.Response:
+        user_agent = request.headers.get("User-Agent", "")
+        platform = detect_platform(user_agent)
+        # request.url reflects what the CLIENT actually addressed (the Host
+        # header aiohttp parsed the request against), not necessarily this
+        # process's own --host bind value -- exactly the address that
+        # belongs in a manual `pair`/hub-URL instruction shown back to that
+        # same client.
+        host = request.url.host or "127.0.0.1"
+        port = request.url.port or DEFAULT_PORT
+        html = render_setup_page(
+            platform=platform,
+            host=host,
+            port=port,
+            android_artifact_available=self.android_artifact is not None,
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    async def _handle_setup_extension_zip(self, request: web.Request) -> web.Response:
+        try:
+            data = build_extension_zip_bytes()
+        except (ExtensionSourceNotFoundError, ExtensionIntegrityError) as e:
+            # Fail loud with an actionable 500, never a silently-truncated or
+            # empty zip -- a bad/incomplete download is worse than a clear
+            # error naming the exact staging failure.
+            logger.error("could not build desktop extension zip for /setup/extension.zip: %s", e)
+            return web.Response(status=500, text=f"could not build extension package: {e}")
+        return web.Response(
+            body=data,
+            content_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="amplifier-browser-bridge-extension.zip"'},
+        )
+
+    async def _handle_setup_android_artifact(self, request: web.Request) -> web.Response:
+        if self.android_artifact is None or not self.android_artifact.is_file():
+            return web.Response(
+                status=404,
+                text=(
+                    "no Android artifact configured on this hub -- build one with "
+                    "scripts/package-android.sh and restart the hub with "
+                    "--android-artifact <path to the .crx/.bin file> (see docs/ANDROID.md)"
+                ),
+            )
+        # Served as an opaque octet-stream `.bin` regardless of the source
+        # file's own extension -- the same fix `scripts/serve-android-setup.py`
+        # (now retired) applied for the same reason: Chromium intercepts a
+        # `.crx`-recognized download and Edge Android silently discards it.
+        # See docs/ANDROID.md's "Two packaging traps".
+        data = self.android_artifact.read_bytes()
+        filename = f"{self.android_artifact.stem}.bin"
+        return web.Response(
+            body=data,
+            content_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     # ------------------------------------------------------------------
     # Device protocol (extension <-> hub)
