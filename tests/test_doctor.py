@@ -256,6 +256,139 @@ def test_doctor_network_exposure_silent_on_critical_combo_when_auth_enabled(
     assert "CRITICAL COMBINATION" not in check.message
 
 
+# --- service_status check: "installed but not running" vs "genuinely broken" ---
+
+
+def test_doctor_service_status_ok_when_not_supported(tmp_path: Path, token_file: Path) -> None:
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    unsupported = ServiceInfo(
+        platform="windows",
+        supported=False,
+        installed=False,
+        active=None,
+        unit_path=None,
+        detail="Windows is not implemented in this release",
+    )
+    with patch("amplifier_browser_bridge.doctor.describe_service", return_value=unsupported):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:1/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "service_status")
+    assert check.ok
+    assert "not available on this platform" in check.message
+
+
+def test_doctor_service_status_ok_when_not_installed(tmp_path: Path, token_file: Path) -> None:
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    not_installed = ServiceInfo(
+        platform="linux",
+        supported=True,
+        installed=False,
+        active=None,
+        unit_path=None,
+        detail="not installed",
+    )
+    with patch("amplifier_browser_bridge.doctor.describe_service", return_value=not_installed):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:1/agent", "secret-123", token_file))
+
+    check = _by_name(checks, "service_status")
+    assert check.ok
+    assert "no amplifier-browser-bridge service installed" in check.message
+
+
+def test_doctor_service_status_fails_and_skips_downstream_when_locally_stopped(
+    tmp_path: Path, token_file: Path
+) -> None:
+    """The load-bearing behavior this check exists for: a service installed but not
+    running, on the SAME host doctor is targeting, must be reported as the actionable
+    cause -- and the network checks below it must be skipped, not report a second,
+    less specific failure for the same root cause."""
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    stopped = ServiceInfo(
+        platform="linux",
+        supported=True,
+        installed=True,
+        active=False,
+        unit_path=Path("/home/x/.config/systemd/user/amplifier-browser-bridge.service"),
+        detail="installed but NOT active (unit: .../amplifier-browser-bridge.service)",
+    )
+    with patch("amplifier_browser_bridge.doctor.describe_service", return_value=stopped):
+        checks = asyncio.run(run_doctor("ws://127.0.0.1:8900/agent", "secret-123", token_file))
+
+    service_check = _by_name(checks, "service_status")
+    assert not service_check.ok
+    assert "NOT running" in service_check.message
+    assert "service start" in service_check.message
+
+    assert _by_name(checks, "hub_reachable").status == "skipped"
+    assert _by_name(checks, "token_match").status == "skipped"
+    assert _by_name(checks, "device_connected").status == "skipped"
+    assert all_ok(checks) is False
+
+
+@pytest.mark.asyncio
+async def test_doctor_service_status_ok_when_locally_active(tmp_path: Path, token_file: Path) -> None:
+    """An active local service must not block the real network checks below it."""
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    hub = Hub(
+        token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
+    )
+    server = TestServer(hub.build_app())
+    await server.start_server()
+    try:
+        hub_url = f"ws://{server.host}:{server.port}/agent"
+        active = ServiceInfo(
+            platform="linux",
+            supported=True,
+            installed=True,
+            active=True,
+            unit_path=Path("/unit"),
+            detail="installed and active",
+        )
+        with patch("amplifier_browser_bridge.doctor.describe_service", return_value=active):
+            checks = await run_doctor(hub_url, "secret-123", token_file)
+    finally:
+        await server.close()
+
+    service_check = _by_name(checks, "service_status")
+    assert service_check.ok
+    assert _by_name(checks, "hub_reachable").ok
+
+
+def test_doctor_service_status_is_informational_only_when_hub_url_is_a_different_host(
+    tmp_path: Path, token_file: Path
+) -> None:
+    """A service stopped on THIS machine must not be reported as a failure when
+    --hub-url points at a different host -- this check has no way to see a remote
+    machine's service state, and must say so rather than assert a failure it cannot
+    actually prove."""
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    stopped = ServiceInfo(
+        platform="linux",
+        supported=True,
+        installed=True,
+        active=False,
+        unit_path=Path("/unit"),
+        detail="installed but NOT active (unit: /unit)",
+    )
+    with (
+        patch("amplifier_browser_bridge.doctor.describe_service", return_value=stopped),
+        patch("amplifier_browser_bridge.doctor.detect_tailscale_ip", return_value=None),
+    ):
+        checks = asyncio.run(run_doctor("ws://100.200.200.200:8900/agent", "secret-123", token_file))
+
+    service_check = _by_name(checks, "service_status")
+    assert service_check.ok  # never asserted as a failure for a host it can't see
+    assert "DIFFERENT host" in service_check.message
+    # downstream must NOT be skipped on this check's account -- the real network
+    # attempt still runs and reports its own (unreachable) result
+    assert _by_name(checks, "hub_reachable").status == "fail"
+
+
 def test_doctor_reports_auth_disabled_honestly(tmp_path: Path) -> None:
     """No token file at all -- token_store check must still be 'ok' (not a
     failure -- dev mode is a legitimate, documented state) but its message must

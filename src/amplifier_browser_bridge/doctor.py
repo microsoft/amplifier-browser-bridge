@@ -27,6 +27,7 @@ from .auth import (
 )
 from .client import HubClient, HubError
 from .netinfo import detect_tailscale_ip, is_loopback, is_wildcard_bind
+from .service import describe_service
 
 CheckStatus = Literal["ok", "fail", "skipped"]
 
@@ -153,6 +154,62 @@ def _check_network_exposure(hub_url: str, auth_enabled: bool) -> DoctorCheck:
     return DoctorCheck("network_exposure", "ok", " ".join(lines))
 
 
+def _check_service_status(hub_url: str) -> DoctorCheck:
+    """Tell "hub installed as a service but not running" apart from "hub genuinely
+    misconfigured" -- without this, a stopped service and a broken hub look
+    identical: `hub_reachable` just fails, with no hint which one it is.
+
+    This check inspects the service on THE MACHINE RUNNING DOCTOR, via
+    `service.describe_service()` (local systemctl/launchctl calls) -- it has no way
+    to inspect a service on a DIFFERENT machine over the network. It is only treated
+    as authoritative (able to make this a real `fail` that skips the downstream
+    network checks below) when `hub_url`'s host looks like THIS machine -- loopback,
+    or this machine's own detected Tailscale IP. Otherwise it's informational only,
+    exactly like `_check_network_exposure`'s own honesty pattern: never assert
+    something this check cannot actually see.
+    """
+    host = urlsplit(hub_url).hostname or ""
+    detected_tailscale_ip = detect_tailscale_ip()
+    is_local = is_loopback(host) or (detected_tailscale_ip is not None and detected_tailscale_ip == host)
+
+    info = describe_service()
+    if not info.supported:
+        return DoctorCheck(
+            "service_status",
+            "ok",
+            f"service management not available on this platform ({info.detail}). If the hub "
+            "isn't already running some other way (foreground terminal, your own process "
+            "manager), start it with `amplifier-browser-bridge hub ...`.",
+        )
+    if not info.installed:
+        return DoctorCheck(
+            "service_status",
+            "ok",
+            "no amplifier-browser-bridge service installed on this machine. If the hub isn't already "
+            "running some other way, install one with `amplifier-browser-bridge service install` "
+            "so it survives logout and reboot.",
+        )
+    if info.active:
+        return DoctorCheck("service_status", "ok", f"service {info.detail}.")
+
+    # installed but not active
+    if is_local:
+        return DoctorCheck(
+            "service_status",
+            "fail",
+            f"service is {info.detail} -- the hub is NOT running. Start it with "
+            "`amplifier-browser-bridge service start`, or see `amplifier-browser-bridge service status` "
+            "for the failure reason.",
+        )
+    return DoctorCheck(
+        "service_status",
+        "ok",
+        f"this machine's own service is {info.detail}, but --hub-url ({hub_url!r}) targets a "
+        "DIFFERENT host, so this may not reflect the actual hub process -- inspect the service on "
+        "the machine that's actually supposed to be running it.",
+    )
+
+
 async def run_doctor(
     hub_url: str,
     token: str | None,
@@ -179,6 +236,17 @@ async def run_doctor(
         )
     checks.append(_check_token_file_siblings(file_path, store))
     checks.append(_check_network_exposure(hub_url, store.auth_enabled))
+
+    service_check = _check_service_status(hub_url)
+    checks.append(service_check)
+    if service_check.status == "fail":
+        # The service check already named the actionable cause (installed but not
+        # running, on THIS machine) -- attempting the network round trip anyway would
+        # just produce a second, less specific failure for the same root cause.
+        checks.append(DoctorCheck("hub_reachable", "skipped", "skipped (service not running)"))
+        checks.append(DoctorCheck("token_match", "skipped", "skipped (service not running)"))
+        checks.append(DoctorCheck("device_connected", "skipped", "skipped (service not running)"))
+        return checks
 
     client = HubClient(hub_url, token=token)
     try:
