@@ -16,6 +16,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
@@ -1049,6 +1050,61 @@ def reload(device: str) -> None:
     _run_command(device, "reload", {})
 
 
+@main.command()
+@click.option(
+    "--ttl",
+    type=int,
+    default=600,
+    show_default=True,
+    help="Pairing code lifetime, in seconds, before it expires unredeemed (single-use regardless).",
+)
+def pair(ttl: int) -> None:
+    """Mint a short-lived pairing code for a new browser device -- replaces hand-
+    transcribing a raw hub URL + 32-hex token into the extension's options page
+    (docs/PROTOCOL.md's Pairing section).
+
+    Requires a hub already running and reachable at AMPLIFIER_BROWSER_BRIDGE_HUB_URL /
+    --hub-url's default (start one with `amplifier-browser-bridge hub` or
+    `amplifier-browser-bridge service install` first) -- this talks to it exactly
+    like every other command, over the same token-authenticated /agent route, so
+    it requires the same AMPLIFIER_BROWSER_BRIDGE_TOKEN this CLI already needs for
+    `devices`/`doctor`/etc.
+    """
+    try:
+        result = asyncio.run(_client().create_pairing(ttl_seconds=float(ttl)))
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    except (OSError, TimeoutError) as e:
+        # Unlike a rejected token (HubError, above -- the hub answered, just said
+        # no), this is "nothing answered at all" -- name that distinction rather
+        # than letting a raw connection exception escape as an unhandled traceback.
+        raise click.ClickException(
+            f"could not reach hub at {DEFAULT_HUB_URL}: {e}. Is `amplifier-browser-bridge hub` "
+            "(or the service) running?"
+        ) from e
+    if not result.get("ok"):
+        raise click.ClickException(result.get("error") or "pairing request failed")
+
+    ticket = result["ticket"]
+    host_port = urlsplit(DEFAULT_HUB_URL).netloc  # same host:port this command just talked to over /agent
+    code = f"{ticket}@{host_port}"
+
+    click.echo(f"Pairing code (valid {ttl}s, single use):")
+    click.echo("")
+    click.echo(f"    {code}")
+    click.echo("")
+    click.echo("On the browser being paired: click the extension's toolbar icon, open its")
+    click.echo('Settings page, enter this code under "Pair with a hub", and click Pair.')
+    click.echo("No hub URL or token to copy by hand -- pairing fetches both automatically.")
+    if not result.get("persisted", True):
+        click.echo("")
+        click.echo(
+            "NOTE: this hub has no token file to persist a minted device token into -- the "
+            "token this code produces will only live in this hub process's memory and will "
+            "need to be re-paired after the next hub restart."
+        )
+
+
 def _warn_divergent_token_siblings(active_token_file: Path, active_token: str) -> None:
     """Print a loud warning if a file that looks like ANOTHER token store sits next
     to the one `amplifier-browser-bridge init` just wrote/reused, holding a different value.
@@ -1200,11 +1256,20 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
     click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
     click.echo(f"       select: {staged_dir}")
     click.echo("")
-    click.echo("  3. Configure it:")
-    click.echo("       Click the extension's toolbar icon (its only UI) to open the options page.")
+    click.echo("  3. Configure it -- once the hub from step 1 is running, PAIR it (recommended,")
+    click.echo("     no hub URL or token to copy by hand):")
+    click.echo(f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge pair")
+    click.echo("       Click the extension's toolbar icon to open its Settings page, enter the")
+    click.echo('       printed code under "Pair with a hub", and click Pair.')
+    click.echo("")
+    click.echo("     Or configure it manually instead:")
+    click.echo('       Open Settings -> "Manual configuration (advanced)" ->')
     click.echo(f"       Hub URL: ws://{resolved_host}:{hub_port}/device")
     click.echo(f"       Token:   {token_result.token}")
     click.echo("       Click Save.")
+    click.echo("")
+    click.echo("     The hub and this token exist so the agent reaches your browser over your own ")
+    click.echo('     network -- no relay server in the path. See README\'s "Why the setup is this long".')
     click.echo("")
     click.echo("  4. Confirm it worked:")
     click.echo(
@@ -1439,12 +1504,19 @@ def hub(host: str, port: int, token_file: str | None, audit_log: str | None, com
         # tailnet IS via a wildcard bind) -- but the exposure is now named
         # loudly, every time, rather than being an invisible default.
         click.echo(wildcard_bind_warning(host, port), err=True)
+    resolved_token_file = resolve_token_file(token_file)
     token_store = load_token_store(token_file)
     audit_path = audit_log or os.environ.get(
         "AMPLIFIER_BROWSER_BRIDGE_AUDIT_LOG", "./amplifier-browser-bridge-audit.jsonl"
     )
     hub_instance = Hub(
-        token_store=token_store, audit_log=AuditLog(audit_path), command_timeout=command_timeout
+        token_store=token_store,
+        audit_log=AuditLog(audit_path),
+        command_timeout=command_timeout,
+        # Lets a successful `pair` redemption persist its freshly-minted
+        # per-device token into the SAME file `token_store` above was loaded
+        # from -- see Hub.__init__'s docstring and pairing.py's module docstring.
+        token_file=resolved_token_file,
     )
     app = hub_instance.build_app()
     banner = (

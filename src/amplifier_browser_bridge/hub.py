@@ -60,19 +60,21 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from aiohttp import WSMsgType, web
+from aiohttp import ContentTypeError, WSMsgType, web
 
 from .addressing import Target, TargetError
 from .args_bool import truthy
 from .audit import AuditLog
-from .auth import TokenStore
+from .auth import TokenStore, persist_device_token
 from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .effects import EffectsReport
+from .pairing import DEFAULT_TICKET_TTL_SECONDS, PairingError, PairingStore, format_ticket
 from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
 from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .scope import SCOPE_FIELDS, ScopeError, SessionScope
+from .setup import generate_token as generate_device_token
 from .tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
@@ -225,10 +227,24 @@ class Hub:
         cdp_idle_seconds: float = DEFAULT_SOFT_DETACH_IDLE_SECONDS,
         soft_detach_sweep_interval: float = DEFAULT_SOFT_DETACH_SWEEP_INTERVAL_SECONDS,
         keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL_SECONDS,
+        token_file: Any = None,
     ) -> None:
         self.registry = DeviceRegistry()
         self.token_store = token_store
         self.audit = audit_log
+        # Pairing (see pairing.py's module docstring): in-memory-only ticket store,
+        # fresh on every hub process start -- a restart invalidates every
+        # outstanding ticket unconditionally, by construction. `token_file`, if
+        # given, is where a successful redemption PERSISTS its freshly-minted
+        # per-device token (see `_handle_pair_redeem`) so it survives a restart --
+        # the same file `token_store` was originally loaded from (cli.py's `hub`
+        # command passes it through for exactly this reason). `None` (e.g. in
+        # tests, or a hub whose token_store came from AMPLIFIER_BROWSER_BRIDGE_HUB_TOKEN
+        # alone with no file) means a minted device token lives only in memory
+        # for this process's lifetime -- pairing still works, it just doesn't
+        # survive a restart, which is honestly reported in that response.
+        self.pairing = PairingStore()
+        self.token_file = token_file
         self.command_timeout = command_timeout
         self.policy = policy if policy is not None else PolicyEngine(audit_log)
         # Per-(device, tab) CDP attach bookkeeping (Phase 4, design doc §7) --
@@ -283,6 +299,12 @@ class Hub:
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_get("/device", self._handle_device_ws)
         app.router.add_get("/agent", self._handle_agent_ws)
+        # Pairing redeem route (pairing.py, this module's "Agent protocol" ->
+        # "Pairing" sections): deliberately plain HTTP, NOT gated by the
+        # long-lived token -- see pairing.py's module docstring for why an
+        # unauthenticated-by-token route is the correct design here, bounded
+        # instead by the ticket's own short TTL/single-use/attempt-count limits.
+        app.router.add_post("/pair/redeem", self._handle_pair_redeem)
         # Background soft-detach sweep (design doc §6.3/§7) -- started/stopped
         # via aiohttp's own app lifecycle so `cli.py`'s `hub` command needs no
         # changes to benefit from it. Tests that want deterministic control
@@ -697,6 +719,9 @@ class Hub:
                 elif rtype == "kill_switch_status":
                     result = self._handle_kill_switch_status()
                     await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
+                elif rtype == "create_pairing":
+                    result = self._handle_create_pairing(req)
+                    await ws.send_json({"v": PROTOCOL_VERSION, "type": "result", "id": rid, **result})
                 else:
                     await ws.send_json(
                         {
@@ -855,6 +880,92 @@ class Hub:
 
     def _handle_kill_switch_status(self) -> dict[str, Any]:
         return {"ok": True, "kill_switch_active": self.policy.kill_switch_active}
+
+    # ------------------------------------------------------------------
+    # Pairing (pairing.py) -- ticket MINTING is here, on the SAME
+    # token-authenticated `/agent` route as every other agent command (see
+    # `_handle_agent_ws`'s token check, which runs before `rtype` is even
+    # inspected). Ticket REDEMPTION is the separate, unauthenticated-by-token
+    # `_handle_pair_redeem` HTTP handler below -- see pairing.py's module
+    # docstring for why that asymmetry is the whole point.
+    # ------------------------------------------------------------------
+
+    def _handle_create_pairing(self, req: dict[str, Any]) -> dict[str, Any]:
+        raw_ttl = req.get("ttl_seconds")
+        ttl_seconds = DEFAULT_TICKET_TTL_SECONDS
+        if raw_ttl is not None:
+            try:
+                ttl_seconds = float(raw_ttl)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"ttl_seconds must be numeric, got {raw_ttl!r}"}
+            if ttl_seconds <= 0:
+                return {"ok": False, "error": "ttl_seconds must be positive"}
+        record = self.pairing.create(ttl_seconds=ttl_seconds)
+        self.audit.record("pairing_created", expires_in=ttl_seconds)
+        return {
+            "ok": True,
+            "ticket": format_ticket(record.ticket),
+            "expires_in": ttl_seconds,
+            "persisted": self.token_file is not None,
+        }
+
+    async def _handle_pair_redeem(self, request: web.Request) -> web.Response:
+        """`POST /pair/redeem` -- the ONE hub route a brand-new, never-before-seen
+        device can reach without already holding the long-lived token. See
+        pairing.py's module docstring for the full entropy/lifetime/threat-model
+        reasoning behind why this is safe: the ticket this consumes is short-
+        lived, single-use, and attempt-bounded, and its only power is minting a
+        real per-device token -- it grants no other capability.
+        """
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ContentTypeError, UnicodeDecodeError):
+            return web.json_response({"ok": False, "error": "request body must be JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"ok": False, "error": "request body must be a JSON object"}, status=400)
+
+        raw_ticket = body.get("ticket")
+        device_id = body.get("device_id")
+        if not isinstance(raw_ticket, str) or not raw_ticket:
+            return web.json_response({"ok": False, "error": "'ticket' is required"}, status=400)
+        if not isinstance(device_id, str) or not device_id:
+            return web.json_response({"ok": False, "error": "'device_id' is required"}, status=400)
+
+        try:
+            self.pairing.redeem(raw_ticket)
+        except PairingError as e:
+            self.audit.record("pairing_redeem_failed", device_id=device_id, error=str(e))
+            return web.json_response({"ok": False, "error": str(e)}, status=403)
+
+        if self.token_store.auth_enabled:
+            token = generate_device_token()
+            self.token_store.device_tokens[device_id] = token
+            persisted = False
+            if self.token_file is not None:
+                try:
+                    persist_device_token(self.token_file, device_id, token)
+                    persisted = True
+                except OSError:
+                    logger.exception(
+                        "pairing: minted a device token for %s but could not persist it to %s -- "
+                        "it will be lost on the next hub restart",
+                        device_id,
+                        self.token_file,
+                    )
+        else:
+            # Auth disabled hub-wide (dev mode, loudly logged at startup -- see
+            # __init__) -- nothing to protect, so pairing hands back an empty
+            # token, consistent with every other device on this hub already
+            # being accepted with no token at all (auth.py's TokenStore.validate).
+            token = ""
+            persisted = False
+
+        label = body.get("label") if isinstance(body.get("label"), str) else None
+        platform = body.get("platform") if isinstance(body.get("platform"), str) else None
+        self.audit.record(
+            "pairing_redeemed", device_id=device_id, label=label, platform=platform, persisted=persisted
+        )
+        return web.json_response({"ok": True, "token": token, "device_id": device_id, "persisted": persisted})
 
     def _maybe_seal_session(self, session_id: str | None) -> None:
         """Seal a session the first time any of its commands yields page

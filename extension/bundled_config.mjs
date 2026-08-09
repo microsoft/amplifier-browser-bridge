@@ -46,6 +46,14 @@ import { validateHubUrl } from "./config_validate.mjs";
  * describeConfigProvenance below both reference them. */
 export const CONFIG_SOURCE_BUNDLED = "bundled";
 export const CONFIG_SOURCE_MANUAL = "manual";
+/** Set by options.js's "Pair with a hub" flow (pairing_code.mjs) once a pairing
+ * code has been redeemed for a real hub URL + per-device token -- distinct from
+ * CONFIG_SOURCE_MANUAL (hand-typed into the Manual configuration fields) purely
+ * for provenance display (describeConfigProvenance below); every write-once/
+ * never-re-adopt guarantee that applies to CONFIG_SOURCE_MANUAL applies equally
+ * here (see options.js's Save/Pair handlers, which both set
+ * amplifier_browser_bridge_setup_completed). */
+export const CONFIG_SOURCE_PAIRED = "paired";
 
 /** The extension-relative resource path background.js fetches at startup. Exported
  * so tests (and, if ever needed, other modules) never have to re-type this literal. */
@@ -140,6 +148,12 @@ export function describeConfigProvenance(state) {
   }
   if (configSource === CONFIG_SOURCE_MANUAL) {
     return "These values were entered manually on this options page.";
+  }
+  if (configSource === CONFIG_SOURCE_PAIRED) {
+    return (
+      "These values were obtained by pairing with a hub -- the hub URL and token were fetched " +
+      "automatically from a single pairing code, never typed or copied by hand."
+    );
   }
   return null;
 }

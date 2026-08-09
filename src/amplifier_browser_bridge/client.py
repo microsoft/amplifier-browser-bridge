@@ -167,6 +167,26 @@ class HubClient:
         without changing it."""
         return await self._request({"v": PROTOCOL_VERSION, "id": new_id(), "type": "kill_switch_status"})
 
+    async def create_pairing(self, *, ttl_seconds: float | None = None) -> dict[str, Any]:
+        """Mint a short-lived, single-use pairing ticket (`pairing.py`) for a new
+        browser device to redeem via `POST /pair/redeem` -- replaces hand-
+        transcribing a raw hub URL + 32-hex token into the extension's options
+        page. This is an OPERATOR action: it reaches the hub over this same
+        token-authenticated `/agent` route as every other command here, so
+        minting a ticket requires already holding the real token (see
+        pairing.py's module docstring for why that asymmetry -- unauthenticated
+        REDEMPTION, authenticated MINTING -- is the load-bearing property).
+
+        Returns `{"ok": True, "ticket": "AAAAA-BBBBB", "expires_in": <seconds>,
+        "persisted": bool}` on success. `persisted` is `False` when the hub has
+        no token_file to write a redeemed device token into (in-memory only --
+        see hub.py's `Hub.__init__`), reported honestly rather than silently.
+        """
+        req: dict[str, Any] = {"v": PROTOCOL_VERSION, "id": new_id(), "type": "create_pairing"}
+        if ttl_seconds is not None:
+            req["ttl_seconds"] = ttl_seconds
+        return await self._request(req)
+
     async def establish_session(
         self,
         *,

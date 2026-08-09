@@ -17,9 +17,29 @@
 // is exhausted, the page renders an HONEST "couldn't determine status" state rather than
 // leaving whatever optimistic string was showing. A stale optimistic string must never be
 // a terminal state.
+//
+// Pairing (design/product council review, 2026-08): the primary configuration path is
+// now "Pair with a hub" -- a single pairing code (from `amplifier-browser-bridge pair`)
+// replaces hand-transcribing a raw ws:// URL and a 32-hex token into two separate
+// fields. The Hub URL/Token fields still exist (collapsed under "Manual configuration
+// (advanced)" in options.html) for scripting, dev hubs with no running pairing session,
+// or an operator who prefers typing values directly -- pairing does not remove that
+// capability, it just stops being the default path. See pairing_code.mjs for the code
+// parser and src/amplifier_browser_bridge/pairing.py for the server-side ticket design
+// (entropy/lifetime/threat-model reasoning).
+//
+// Connection-status detail (craft-inspector / human-advocate review, 2026-08): the
+// status line used to collapse EVERY "configured but not connected" cause into one
+// generic sentence -- a hub that's unreachable and a hub that rejected this device's
+// token rendered identically, and there was no error text identifying which. That is a
+// WCAG 3.3.1 (Error Identification) gap: an error occurred with no error identified.
+// `renderStatus` below now branches on `response.lastError.code` (background.js,
+// connection_error.mjs) so "hub unreachable", "token rejected", and "connected and
+// working" are each their own distinct, actionable message.
 
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
-import { describeConfigProvenance, CONFIG_SOURCE_MANUAL } from "./bundled_config.mjs";
+import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
+import { parsePairingCode, buildDeviceWsUrl, buildRedeemUrl } from "./pairing_code.mjs";
 
 const urlInput = document.getElementById("hub-url");
 const tokenInput = document.getElementById("hub-token");
@@ -28,6 +48,9 @@ const errorEl = document.getElementById("error");
 const statusEl = document.getElementById("status");
 const saveButton = document.getElementById("save");
 const provenanceEl = document.getElementById("provenance");
+const pairCodeInput = document.getElementById("pair-code");
+const pairErrorEl = document.getElementById("pair-error");
+const pairButton = document.getElementById("pair");
 
 // Renders the "where did these values come from" line -- see bundled_config.mjs's
 // describeConfigProvenance for why this exists: a field silently pre-filled with a baked
@@ -46,21 +69,51 @@ async function loadCurrentValues() {
     "amplifier_browser_bridge_config_source",
     "amplifier_browser_bridge_config_bundled_at",
   ]);
-  urlInput.value = stored.amplifier_browser_bridge_hub_url || "";
-  tokenInput.value = stored.amplifier_browser_bridge_hub_token || "";
+  if (urlInput) urlInput.value = stored.amplifier_browser_bridge_hub_url || "";
+  if (tokenInput) tokenInput.value = stored.amplifier_browser_bridge_hub_token || "";
   renderProvenance({
     configSource: stored.amplifier_browser_bridge_config_source,
     configBundledAt: stored.amplifier_browser_bridge_config_bundled_at,
   });
 }
 
-// Sends the status query exactly once. NEVER throws and NEVER returns a bare value the
-// caller could confuse with a real answer -- always `{ ok: true, response }` (a real
-// answer arrived) or `{ ok: false, error }` (it didn't, for whatever reason: the
-// background script isn't running, sendMessage rejected, or it resolved with nothing).
-// This is the single chokepoint between "did we hear back" and "what does it mean",
-// so every caller gets an explicit, un-ignorable failure signal instead of a value
-// that's merely falsy.
+// ---------------------------------------------------------------------------
+// Device identity -- read/created directly against chrome.storage.local, the
+// SAME key background.js's ensureIdentity()/getOrCreateId() use. Duplicated
+// (not imported from background.js, which is chrome.*-API-entangled and not a
+// pure module) rather than requiring a round trip through the service worker:
+// this needs to work even on a brand-new, never-configured install, where
+// background.js's connect() has never run ensureIdentity() at all yet (it only
+// runs once `configured` is true -- see background.js's connectLocked()). A
+// pairing redemption is exactly the case that must work BEFORE that's true.
+// ---------------------------------------------------------------------------
+
+const DEVICE_ID_STORAGE_KEY = "amplifier_browser_bridge_device_id";
+
+async function getOrCreateDeviceId() {
+  const stored = await chrome.storage.local.get(DEVICE_ID_STORAGE_KEY);
+  if (stored[DEVICE_ID_STORAGE_KEY]) return stored[DEVICE_ID_STORAGE_KEY];
+  const id = crypto.randomUUID();
+  await chrome.storage.local.set({ [DEVICE_ID_STORAGE_KEY]: id });
+  return id;
+}
+
+function platformLabel() {
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  if (/Android/i.test(ua)) return "edge-android";
+  if (/Macintosh/i.test(ua)) return "edge-macos";
+  if (/Windows/i.test(ua)) return "edge-windows";
+  if (/Linux/i.test(ua)) return "edge-linux";
+  return "edge-unknown";
+}
+
+// Sends the status query exactly once. NEVER throws and NEVER returns a bare
+// value the caller could confuse with a real answer -- always `{ ok: true,
+// response }` (a real answer arrived) or `{ ok: false, error }` (it didn't, for
+// whatever reason: the background script isn't running, sendMessage rejected, or
+// it resolved with nothing). This is the single chokepoint between "did we hear
+// back" and "what does it mean", so every caller gets an explicit,
+// un-ignorable failure signal instead of a value that's merely falsy.
 async function queryStatusOnce() {
   let response;
   try {
@@ -83,6 +136,15 @@ async function queryStatusOnce() {
 // Renders a REAL response. This is the only place allowed to show a "we know the truth"
 // status -- every branch here is an honest description of what the background script
 // just told us, never an assumption about what it's probably still doing.
+//
+// Three distinguishable "not connected" causes (craft-inspector / human-advocate
+// review, see this file's module docstring): `response.lastError.code` is one of
+// "auth_rejected" (the hub rejected this device's token), "unreachable" (nothing
+// answered at the configured address), or "hub_error" (the hub returned some other
+// error) -- see connection_error.mjs for exactly how background.js derives this.
+// `lastError` is `null` when the most recent attempt is still in flight (e.g. right
+// after a fresh Save/Pair) -- that case falls through to the pre-existing generic
+// message, which remains honest ("not connected yet," not "here's why").
 function renderStatus(response) {
   if (!response.configured) {
     if (response.legacyConfigDetected) {
@@ -95,19 +157,37 @@ function renderStatus(response) {
         "no longer read. Re-enter them below and click Save.";
     } else {
       statusEl.className = "warn";
-      statusEl.textContent = "Not configured -- enter a Hub URL below and click Save.";
+      statusEl.textContent = "Not configured -- pair with a hub, or enter a Hub URL below and click Save.";
     }
     return;
   }
   if (response.connected) {
     statusEl.className = "ok";
     statusEl.textContent = `Connected to ${response.hubUrl} as device ${response.deviceId || "(pending)"}.`;
-  } else {
-    statusEl.className = "warn";
-    statusEl.textContent =
-      `Configured for ${response.hubUrl}, but not currently connected -- ` +
-      "is the hub running and reachable? Run `amplifier-browser-bridge doctor` from the CLI for a full check.";
+    return;
   }
+
+  const lastError = response.lastError;
+  if (lastError && lastError.code === "auth_rejected") {
+    statusEl.className = "warn";
+    statusEl.textContent = lastError.message;
+    return;
+  }
+  if (lastError && lastError.code === "unreachable") {
+    statusEl.className = "warn";
+    statusEl.textContent = lastError.message;
+    return;
+  }
+  if (lastError && lastError.code === "hub_error") {
+    statusEl.className = "warn";
+    statusEl.textContent = lastError.message;
+    return;
+  }
+
+  statusEl.className = "warn";
+  statusEl.textContent =
+    `Configured for ${response.hubUrl}, but not currently connected -- ` +
+    "is the hub running and reachable? Run `amplifier-browser-bridge doctor` from the CLI for a full check.";
 }
 
 // The honest "we tried, and we still don't know" terminal state -- what a caller lands
@@ -153,46 +233,121 @@ const LOAD_STATUS_POLL_DELAYS_MS = [0, 300, 800, 2000, 4000];
 // first attempt waits a beat; growing gaps after that cover slower reconnects.
 const SAVE_STATUS_POLL_DELAYS_MS = [500, 1500, 3000, 6000, 10000];
 
-toggleTokenLink.addEventListener("click", () => {
-  const showing = tokenInput.type === "text";
-  tokenInput.type = showing ? "password" : "text";
-  toggleTokenLink.textContent = showing ? "show" : "hide";
-});
+if (toggleTokenLink) {
+  toggleTokenLink.addEventListener("click", () => {
+    const showing = tokenInput.type === "text";
+    tokenInput.type = showing ? "password" : "text";
+    toggleTokenLink.textContent = showing ? "show" : "hide";
+  });
+}
 
-saveButton.addEventListener("click", async () => {
-  errorEl.textContent = "";
-  const urlValidation = validateHubUrl(urlInput.value);
-  if (!urlValidation.valid) {
-    errorEl.textContent = urlValidation.error;
-    return;
-  }
-  const tokenValidation = validateHubToken(tokenInput.value);
-  if (!tokenValidation.valid) {
-    errorEl.textContent = tokenValidation.error;
-    return;
-  }
-
+// Shared by both the Pair and Save handlers: write the resolved hub URL/token to
+// storage under one config source, refresh the provenance line, and kick off the
+// same post-write status poll -- the two paths differ only in WHERE hubUrl/token
+// came from and which CONFIG_SOURCE_* to record.
+async function persistConfigAndPoll(hubUrl, token, configSource) {
   await chrome.storage.local.set({
-    amplifier_browser_bridge_hub_url: urlValidation.normalized,
-    amplifier_browser_bridge_hub_token: tokenInput.value,
+    amplifier_browser_bridge_hub_url: hubUrl,
+    amplifier_browser_bridge_hub_token: token,
+    amplifier_browser_bridge_config_source: configSource,
+    amplifier_browser_bridge_config_bundled_at: null,
+    amplifier_browser_bridge_setup_completed: true,
+  });
+  renderProvenance({ configSource, configBundledAt: null });
+  statusEl.className = "unknown";
+  statusEl.textContent = configSource === CONFIG_SOURCE_PAIRED ? "Paired. Connecting..." : "Saved. Connecting...";
+  // storage.onChanged (background.js) reconnects immediately; pollStatusUntilKnown
+  // either catches that success or -- if it never arrives -- lands on the honest
+  // "couldn't determine status" state instead of leaving this line up forever.
+  pollStatusUntilKnown(SAVE_STATUS_POLL_DELAYS_MS);
+}
+
+if (saveButton) {
+  saveButton.addEventListener("click", async () => {
+    errorEl.textContent = "";
+    const urlValidation = validateHubUrl(urlInput.value);
+    if (!urlValidation.valid) {
+      errorEl.textContent = urlValidation.error;
+      return;
+    }
+    const tokenValidation = validateHubToken(tokenInput.value);
+    if (!tokenValidation.valid) {
+      errorEl.textContent = tokenValidation.error;
+      return;
+    }
     // A deliberate Save is the user affirmatively taking ownership of these values --
     // whether they were blank, hand-typed from scratch, or started out pre-filled from a
     // bundled first-run default (see bundled_config.mjs). From this point on the config
     // is "manual": setup_completed blocks any future bundled-config adoption from ever
     // overwriting it again, even across a rebuild carrying a different baked token.
-    amplifier_browser_bridge_config_source: CONFIG_SOURCE_MANUAL,
-    amplifier_browser_bridge_config_bundled_at: null,
-    amplifier_browser_bridge_setup_completed: true,
+    await persistConfigAndPoll(urlValidation.normalized, tokenInput.value, CONFIG_SOURCE_MANUAL);
   });
-  renderProvenance({ configSource: CONFIG_SOURCE_MANUAL, configBundledAt: null });
+}
 
-  statusEl.className = "unknown";
-  statusEl.textContent = "Saved. Connecting...";
-  // storage.onChanged (background.js) reconnects immediately; pollStatusUntilKnown
-  // either catches that success or -- if it never arrives -- lands on the honest
-  // "couldn't determine status" state instead of leaving this line up forever.
-  pollStatusUntilKnown(SAVE_STATUS_POLL_DELAYS_MS);
-});
+// ---------------------------------------------------------------------------
+// Pairing -- see this file's module docstring and pairing_code.mjs.
+// ---------------------------------------------------------------------------
+
+if (pairButton) {
+  pairButton.addEventListener("click", async () => {
+    pairErrorEl.textContent = "";
+    const parsed = parsePairingCode(pairCodeInput.value);
+    if (!parsed.valid) {
+      pairErrorEl.textContent = parsed.error;
+      return;
+    }
+
+    pairButton.disabled = true;
+    const originalLabel = pairButton.textContent;
+    pairButton.textContent = "Pairing...";
+    try {
+      const deviceId = await getOrCreateDeviceId();
+      const redeemUrl = buildRedeemUrl(parsed.host, parsed.port);
+      let response;
+      try {
+        // Rides the extension's own <all_urls> host_permissions -- fetches from an
+        // extension page are not subject to the same-origin/CORS restrictions a
+        // normal web page's fetch would be, the same reason background.js's
+        // fetchBytes() can reach an arbitrary origin (see that function's comment).
+        response = await fetch(redeemUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ticket: parsed.ticket,
+            device_id: deviceId,
+            label: platformLabel(),
+            platform: (typeof navigator !== "undefined" && navigator.platform) || "unknown",
+          }),
+        });
+      } catch (err) {
+        pairErrorEl.textContent =
+          `Could not reach the hub at ${parsed.host}:${parsed.port} -- is \`amplifier-browser-bridge hub\` ` +
+          `(or the service) running, and is this device on the same tailnet? (${(err && err.message) || err})`;
+        return;
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        pairErrorEl.textContent = `Hub at ${parsed.host}:${parsed.port} returned an unreadable response (HTTP ${response.status}).`;
+        return;
+      }
+
+      if (!response.ok || !data || !data.ok) {
+        pairErrorEl.textContent = (data && data.error) || `Pairing failed (HTTP ${response.status}).`;
+        return;
+      }
+
+      const hubUrl = buildDeviceWsUrl(parsed.host, parsed.port);
+      await persistConfigAndPoll(hubUrl, data.token || "", CONFIG_SOURCE_PAIRED);
+      pairCodeInput.value = "";
+    } finally {
+      pairButton.disabled = false;
+      pairButton.textContent = originalLabel;
+    }
+  });
+}
 
 // Auto-run on real page load, skipped when options.test.mjs sets this flag before
 // importing -- tests drive queryStatusOnce/pollStatusUntilKnown directly with their
@@ -209,6 +364,7 @@ export {
   renderStatus,
   renderUnknown,
   pollStatusUntilKnown,
+  getOrCreateDeviceId,
   LOAD_STATUS_POLL_DELAYS_MS,
   SAVE_STATUS_POLL_DELAYS_MS,
 };

@@ -159,3 +159,42 @@ def mask_token(token: str) -> str:
     """Truncate a token for display -- doctor/init output should never print a full
     secret to a terminal (which may be logged, screen-shared, or scrolled back)."""
     return f"{token[:8]}..." if len(token) > 8 else "***"
+
+
+def persist_device_token(path: str | Path, device_id: str, token: str) -> None:
+    """Add or update one `devices[device_id]` entry in the token file at `path`,
+    preserving everything else already in it (the `default` token, every OTHER
+    device's token). Used by the pairing flow (`pairing.py`/`hub.py`) to make a
+    freshly-minted per-device token durable across a hub restart -- the ticket
+    itself is intentionally never persisted (see pairing.py's module docstring),
+    but the real token it produces follows the exact same on-disk shape and
+    permissions discipline as every other token this project writes.
+
+    Creates the file (with `default: null` -- i.e. no shared token, only this one
+    device) if it does not exist yet. Best-effort chmod 0600, matching
+    `setup.py`'s `ensure_token_file` (some filesystems/platforms don't support
+    it; not fatal either way).
+    """
+    file_path = Path(path).expanduser()
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict[str, object] = {"default": None, "devices": {}}
+    if file_path.is_file():
+        try:
+            loaded = json.loads(file_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            loaded = None
+        if isinstance(loaded, dict):
+            data = loaded
+
+    devices = data.get("devices")
+    if not isinstance(devices, dict):
+        devices = {}
+    devices[device_id] = token
+    data["devices"] = devices
+
+    file_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        file_path.chmod(0o600)
+    except OSError:
+        pass  # best-effort; not fatal (e.g. some filesystems/platforms don't support chmod)

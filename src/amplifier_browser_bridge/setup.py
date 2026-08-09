@@ -47,6 +47,14 @@ _EXTENSION_FILES = (
     "args_bool.mjs",
     "fetch_utils.mjs",
     "download_claim.mjs",
+    # Pairing (options.js's "Pair with a hub" flow, this project's `amplifier-browser-bridge
+    # pair` command): pure parse/format logic for the pairing code, imported statically
+    # by options.js -- same 87ce68d whitelist-omission failure mode applies if omitted.
+    "pairing_code.mjs",
+    # Connection-error classification (background.js's lastConnectError tracking,
+    # options.js's renderStatus) -- imported statically by background.js. Same
+    # 87ce68d whitelist-omission failure mode applies if omitted.
+    "connection_error.mjs",
     # Zero-config Android install: background.js statically imports this at module
     # top level for the bundled first-run config adoption decision (see that
     # module's docstring and scripts/package-android.sh). Same 87ce68d failure mode

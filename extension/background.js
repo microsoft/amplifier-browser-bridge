@@ -22,6 +22,7 @@ import {
 } from "./download_claim.mjs";
 import { EffectsCollector, EFFECTS_WINDOW_MS, emptyEffectsReport } from "./effects_collector.mjs";
 import { resolveBundledConfigAdoption, CONFIG_SOURCE_BUNDLED, BUNDLED_CONFIG_RESOURCE } from "./bundled_config.mjs";
+import { classifyHubErrorMessage, classifyCloseEvent, badgeTitleForErrorCode } from "./connection_error.mjs";
 
 const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 15000; // measured to hold a desktop MV3 worker alive
@@ -46,6 +47,17 @@ let heartbeatSeq = 0;
 // invocation, never a typeof check -- same discipline as probeCapabilities()).
 // "none" until probed.
 let effectsTier = "none";
+// Last classified connection failure reason (connection_error.mjs), or `null` if
+// either never attempted yet or the most recent attempt is currently in flight /
+// succeeded. Reset at the START of every new connect attempt (connectLocked())
+// and set by either an explicit hub `error` frame (onMessage) or, absent that, the
+// WebSocket `close` event itself -- see this module's "Connection lifecycle"
+// section. Surfaced via amplifier_browser_bridge_get_status so options.js/popup.js
+// can render WHICH of "hub unreachable" / "token rejected" / other this is,
+// instead of one generic "not connected" sentence (craft-inspector / human-advocate
+// findings: an undesigned state guaranteed to fire on every failed connection is
+// not an edge case, and an unidentified error is a WCAG 3.3.1 gap).
+let lastConnectError = null;
 
 // ---------------------------------------------------------------------------
 // Runtime configuration -- hub URL + shared token, read from chrome.storage.local
@@ -206,11 +218,17 @@ const BADGE_STATE = {
   error: { text: "\u00d7", color: "#d9534f", title: "Amplifier Browser Bridge: connection error -- click the toolbar icon for options." },
 };
 
-function setBadge(state) {
+// `overrideTitle`, if given, replaces BADGE_STATE[state]'s generic title with a
+// reason-specific one (connection_error.mjs's badgeTitleForErrorCode) -- e.g.
+// distinguishing "hub rejected this device's token" from "could not reach the
+// hub" instead of one generic "connection error" tooltip for both. Text/color
+// stay keyed off `state` (both distinct-error cases still use the same
+// red/"\u00d7" visual -- only the accessible-name text differs).
+function setBadge(state, overrideTitle) {
   const spec = BADGE_STATE[state] || BADGE_STATE.error;
   chrome.action.setBadgeText({ text: spec.text });
   chrome.action.setBadgeBackgroundColor({ color: spec.color });
-  chrome.action.setTitle({ title: spec.title });
+  chrome.action.setTitle({ title: overrideTitle || spec.title });
 }
 
 // ---------------------------------------------------------------------------
@@ -266,24 +284,31 @@ async function probeCapabilities() {
   //
   // Every other capability here is probed by actually invoking it, because
   // Edge Android ships APIs that are present but silently non-functional
-  // (design doc §2). chrome.debugger is the one API where that rule does
-  // active harm: on Edge desktop, calling ANY chrome.debugger method --
-  // including the nominally read-only getTargets() -- raises the browser's
-  // "<Extension> started debugging this browser" infobar. That banner is
-  // persistent, occupies real screen space, and cannot be suppressed by any
-  // extension API.
+  // (design doc §2). chrome.debugger is the one API in this list handled
+  // differently, but NOT because probing it would raise the banner: reading
+  // Chromium's own source (chrome/browser/extensions/api/debugger/debugger_api.cc,
+  // `ExtensionDevToolsClientHost::Attach()`) shows the "<Extension> started
+  // debugging this browser" infobar is created ONLY from `Attach()` -- i.e.
+  // only by a real `chrome.debugger.attach()` call. `DebuggerGetTargetsFunction::
+  // Run()` (the nominally read-only getTargets()) does not route through
+  // Attach() and creates no infobar. An earlier version of this comment
+  // claimed otherwise ("calling ANY chrome.debugger method... raises... the
+  // infobar") as a field observation; that claim does not match the source
+  // and has been corrected here.
   //
-  // This probe runs on startup, on every chrome.tabs.onActivated (i.e. every
-  // tab switch), on every onUpdated:complete, and on the keepalive alarm. So
-  // a behavioral probe here meant the human got a permanent debugger banner
-  // just for having the extension installed -- a direct violation of the
-  // co-working etiquette in design doc §6.3 ("never disturb the human").
-  //
-  // Presence detection is safe and sufficient for THIS API specifically:
-  // chrome.debugger is genuinely absent (undefined) on Edge Android, which is
-  // exactly the case we need to distinguish. Real functional confirmation
-  // happens on first actual attach -- an operation the caller explicitly
-  // asked for, where the banner is an honest signal rather than a surprise.
+  // The real reason presence-detection (not invocation) is still correct here:
+  // this probe runs on startup, on every chrome.tabs.onActivated (i.e. every
+  // tab switch), on every onUpdated:complete, and on the keepalive alarm --
+  // there is no benign, side-effect-free chrome.debugger call to make that
+  // often (getTargets() itself is harmless re: the banner, but still opens a
+  // debugging surface far more frequently than this project's actual CDP
+  // escalation needs, for zero additional signal beyond what `typeof` already
+  // gives). chrome.debugger is genuinely absent (undefined) on Edge Android,
+  // which is exactly the case presence-detection needs to distinguish. Real
+  // functional confirmation happens on first actual attach -- an operation
+  // the caller explicitly asked for (design doc §7), where the banner (now
+  // correctly understood to come from THAT call, not from probing) is an
+  // honest signal rather than a surprise.
   caps.debugger = typeof chrome.debugger?.attach === "function";
 
   try {
@@ -553,6 +578,10 @@ async function connectLocked() {
     return;
   }
 
+  // A fresh attempt starts with a clean slate -- a stale reason from a prior
+  // attempt must never linger past a new one that hasn't resolved yet. See
+  // this module's `lastConnectError` docstring.
+  lastConnectError = null;
   setBadge("connecting");
   await ensureIdentity();
   if (!capabilities) capabilities = await probeCapabilities();
@@ -578,9 +607,19 @@ async function connectLocked() {
     onMessage(event.data);
   });
 
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (event) => {
     stopHeartbeat();
-    setBadge("error");
+    // An explicit hub `error` frame (handled in onMessage, below) is the MORE
+    // specific signal when one arrived on THIS attempt -- only fall back to
+    // classifying the bare close event itself (connection_error.mjs's
+    // classifyCloseEvent) when nothing more specific already explains why.
+    if (!lastConnectError) {
+      lastConnectError = classifyCloseEvent(event);
+    }
+    setBadge(
+      lastConnectError.code === "auth_rejected" ? "auth_rejected" : "error",
+      badgeTitleForErrorCode(lastConnectError.code)
+    );
     scheduleReconnect();
   });
 
@@ -678,6 +717,16 @@ async function onMessage(raw) {
   if (msg.type === "ping") {
     heartbeatSeq += 1;
     send({ v: PROTOCOL_VERSION, id: crypto.randomUUID(), type: "heartbeat", device_id: deviceId, seq: heartbeatSeq });
+    return;
+  }
+
+  if (msg.type === "error") {
+    // The hub sends this exact frame, then closes, on a bad hello token (see
+    // hub.py's `_handle_device_message`) -- classify it NOW, before the `close`
+    // event fires, so the close handler's fallback classification never
+    // overwrites this more specific one. See this module's `lastConnectError`
+    // docstring and connection_error.mjs.
+    lastConnectError = classifyHubErrorMessage(msg);
     return;
   }
 
@@ -2054,6 +2103,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         hubUrl,
         deviceId,
         legacyConfigDetected,
+        // See this module's `lastConnectError` docstring -- null whenever the
+        // most recent attempt is still in flight or the connection is currently
+        // up; otherwise `{code, message, at}` naming exactly why it isn't.
+        lastError: lastConnectError,
       });
     } catch (err) {
       sendResponse({ error: String((err && err.message) || err) });

@@ -12,6 +12,7 @@
     color: #1a1a1a;
   }
   h1 { font-size: 1.25rem; }
+  h2 { font-size: 1rem; margin-top: 2rem; }
   label { display: block; font-weight: 600; margin-top: 1rem; }
   input[type="text"], input[type="password"] {
     width: 100%;
@@ -37,8 +38,14 @@
   #status.ok { background: #e6f4ea; color: #1e4620; }
   #status.warn { background: #fdecea; color: #611a15; }
   #status.unknown { background: #f1f1f1; color: #333; }
-  #error { color: #b00020; font-size: 0.9rem; margin-top: 0.5rem; min-height: 1.2em; }
+  #pair-error, #error { color: #b00020; font-size: 0.9rem; margin-top: 0.5rem; min-height: 1.2em; }
   #toggle-token { cursor: pointer; font-size: 0.85rem; margin-left: 0.5rem; }
+  details {
+    margin-top: 1.5rem;
+    border-top: 1px solid #ddd;
+    padding-top: 0.75rem;
+  }
+  summary { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -51,27 +58,47 @@
 
   <div id="provenance" class="hint"></div>
 
-  <label for="hub-url">Hub URL</label>
-  <input type="text" id="hub-url" placeholder="ws://100.x.y.z:8900/device" autocomplete="off" />
-  <div class="hint">
-    Use a tailnet IP literal, not a MagicDNS name (MagicDNS resolution is unreliable
-    per-device -- see docs/designs/browser-bridge.md section 4). The path defaults to
-    "/device" if you leave it off.
-  </div>
+  <h2>Pair with a hub</h2>
+  <p class="hint">
+    Run <code>amplifier-browser-bridge pair</code> on the machine running your hub. It prints a
+    short, single-use pairing code -- paste it below. This fetches the real hub address and a
+    fresh per-device token automatically; you never type or copy a raw hub URL or a 32-character
+    token by hand.
+  </p>
+  <label for="pair-code">Pairing code</label>
+  <input type="text" id="pair-code" placeholder="7F3K9-QXTM2@100.x.y.z:8900" autocomplete="off" />
+  <div id="pair-error"></div>
+  <button id="pair" type="button">Pair</button>
 
-  <label for="hub-token">Hub Token</label>
-  <div class="row">
-    <input type="password" id="hub-token" placeholder="(leave blank only if the hub has auth disabled)" autocomplete="off" />
-    <span id="toggle-token">show</span>
-  </div>
-  <div class="hint">
-    Get this from <code>amplifier-browser-bridge init</code> (it prints the token and writes it to the hub's
-    token file) or from whoever runs your hub.
-  </div>
+  <details id="manual-config">
+    <summary>Manual configuration (advanced)</summary>
+    <p class="hint">
+      For scripting, a hub with no running pairing session, or entering values by hand. A
+      deliberate Save here always takes ownership of the configuration, the same as pairing does.
+    </p>
 
-  <div id="error"></div>
+    <label for="hub-url">Hub URL</label>
+    <input type="text" id="hub-url" placeholder="ws://100.x.y.z:8900/device" autocomplete="off" />
+    <div class="hint">
+      Use a tailnet IP literal, not a MagicDNS name (MagicDNS resolution is unreliable
+      per-device -- see docs/designs/browser-bridge.md section 4). The path defaults to
+      "/device" if you leave it off.
+    </div>
 
-  <button id="save">Save</button>
+    <label for="hub-token">Hub Token</label>
+    <div class="row">
+      <input type="password" id="hub-token" placeholder="(leave blank only if the hub has auth disabled)" autocomplete="off" />
+      <span id="toggle-token">show</span>
+    </div>
+    <div class="hint">
+      Get this from <code>amplifier-browser-bridge init</code> (it prints the token and writes it to the hub's
+      token file) or from whoever runs your hub.
+    </div>
+
+    <div id="error"></div>
+
+    <button id="save">Save</button>
+  </details>
 
   <div id="status" class="unknown">Checking status...</div>
 
