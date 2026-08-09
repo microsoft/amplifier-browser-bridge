@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -30,10 +31,11 @@ from .auth import (
     resolve_token_file,
 )
 from .client import HubClient, HubError
-from .doctor import run_doctor
+from .doctor import DoctorCheck, run_doctor
 from .extension_integrity import ExtensionIntegrityError
 from .hub import DEFAULT_COMMAND_TIMEOUT, DEFAULT_PORT, Hub, HubBindError, serve_hub
 from .netinfo import detect_tailscale_ip, is_wildcard_bind, wildcard_bind_warning
+from .pairing import DEFAULT_TICKET_TTL_SECONDS
 from .policy import Denylist, host_of
 from .protocol import COMMANDS
 from .service import (
@@ -48,7 +50,13 @@ from .service import (
     service_stop,
     service_uninstall,
 )
-from .setup import DEFAULT_STAGE_DIR, ExtensionSourceNotFoundError, ensure_token_file, stage_extension
+from .setup import (
+    DEFAULT_STAGE_DIR,
+    ExtensionSourceNotFoundError,
+    TokenResult,
+    ensure_token_file,
+    stage_extension,
+)
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
@@ -1178,6 +1186,217 @@ def _resolve_hub_host(explicit_host: str | None) -> tuple[str, str | None]:
     )
 
 
+def _stdin_is_interactive() -> bool:
+    """True if both stdin and stdout are attached to a real terminal.
+
+    Factored into its own function (rather than inlined `sys.stdin.isatty()`) so
+    tests can monkeypatch it: `click.testing.CliRunner` always wraps stdin/stdout in
+    non-tty streams, so without this seam the interactive branch of `init` below
+    would be unreachable from any test.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        # Some non-standard stdin/stdout replacements (frozen apps, certain
+        # subprocess pipes) raise instead of returning False -- treat that the
+        # same as "not a terminal" rather than letting init crash over it.
+        return False
+
+
+def _resolve_interactivity(*, yes: bool, non_interactive: bool) -> bool:
+    """Whether `init` should run its guided, prompting flow.
+
+    \b
+    - `--non-interactive` always wins: never prompt, never take the new
+      side-effecting actions (service install) -- exactly the pre-existing,
+      print-only `init` behavior. This is also what a caller gets automatically
+      whenever stdin/stdout aren't a real terminal (CI, scripts, digital twins,
+      an editor's integrated terminal running this non-interactively) -- an
+      interactive prompt with nothing attached to answer it would otherwise hang
+      forever, which is a regression `init` must never introduce.
+    - `--yes` forces the guided flow to run even without a real terminal (for a
+      script that explicitly wants the automation, e.g. "install the service for
+      me"), but never blocks on a prompt -- see `init`'s docstring for exactly
+      what it automates vs. what it still prints as a manual step.
+    - Otherwise: guided flow if and only if this looks like a real terminal.
+    """
+    if non_interactive:
+        return False
+    return yes or _stdin_is_interactive()
+
+
+def _print_remaining_steps(
+    *,
+    token_result: TokenResult,
+    staged_dir: Path,
+    resolved_host: str,
+    hub_port: int,
+    detected_note: str | None,
+) -> None:
+    """The full manual-steps block -- service/foreground hub, load extension,
+    pair (or configure manually), confirm with doctor.
+
+    This is the SINGLE place this text is written. Every caller that needs to
+    hand the user "the exact remaining steps" -- the classic non-interactive
+    `init`, and every bail-out point in the guided flow below (declined the
+    service offer, service unsupported on this platform, user stops partway
+    through pairing) -- calls this same function, so the printed hub/doctor
+    commands can never drift out of agreement with each other the way they did
+    before the A1 fix (see `_resolve_hub_host`'s docstring for that incident).
+    """
+    click.echo("Remaining steps (manual -- Edge has no CLI for these):")
+    click.echo("")
+    click.echo("  1. Start the hub as a background service (recommended -- survives logout and reboot):")
+    click.echo(f"       amplifier-browser-bridge service install --host {resolved_host} --port {hub_port}")
+    if detected_note:
+        click.echo(f"       {detected_note}")
+    click.echo("")
+    click.echo("     Or run it directly in this terminal instead (stops when the terminal closes):")
+    click.echo(
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge hub --host {resolved_host} --port {hub_port}"
+    )
+    click.echo("")
+    click.echo("  2. Load the extension:")
+    click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
+    click.echo(f"       select: {staged_dir}")
+    click.echo("")
+    click.echo("  3. Configure it -- once the hub from step 1 is running, PAIR it (recommended,")
+    click.echo("     no hub URL or token to copy by hand):")
+    click.echo(
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
+        f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
+    )
+    click.echo("       Click the extension's toolbar icon to open its Settings page, enter the")
+    click.echo('       printed code under "Pair with a hub", and click Pair.')
+    click.echo("")
+    click.echo("     Or configure it manually instead:")
+    click.echo('       Open Settings -> "Manual configuration (advanced)" ->')
+    click.echo(f"       Hub URL: ws://{resolved_host}:{hub_port}/device")
+    click.echo(f"       Token:   {token_result.token}")
+    click.echo("       Click Save.")
+    click.echo("")
+    click.echo("     The hub and this token exist so the agent reaches your browser over your own ")
+    click.echo('     network -- no relay server in the path. See README\'s "Why the setup is this long".')
+    click.echo("")
+    click.echo("  4. Confirm it worked:")
+    click.echo(
+        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+        f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+    )
+
+
+# How long to wait for a just-installed service's hub to actually accept
+# connections before giving up and reporting a partial-failure state. This
+# project's hub is a small aiohttp app with no slow startup work (no DB
+# migrations, no model loading) -- real installs bind well under a second: 8s
+# is generous headroom, not a number chosen to paper over a slow start.
+_SERVICE_READY_TIMEOUT_S = 8.0
+_SERVICE_READY_POLL_S = 0.25
+
+
+def _wait_for_hub_reachable(host: str, port: int, token: str | None, *, timeout: float | None = None) -> bool:
+    """Poll (never sleep-and-hope) until the hub answers on its `/agent` route
+    with the given token, or `timeout` elapses. Used right after `service
+    install` to turn "the unit file was written" into "the hub is actually
+    reachable" -- these are not the same fact, and `service install`'s own
+    `Restart=on-failure` retry loop means a bad bind fails LOUDLY over time
+    rather than instantly, so a single immediate check would be too eager to
+    report a false failure."""
+    deadline = time.monotonic() + (timeout if timeout is not None else _SERVICE_READY_TIMEOUT_S)
+    url = f"ws://{host}:{port}/agent"
+    while True:
+        try:
+            asyncio.run(HubClient(url, token=token).list_devices())
+            return True
+        except (HubError, OSError, TimeoutError):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_SERVICE_READY_POLL_S)
+
+
+def _print_doctor_checks(checks: list[DoctorCheck]) -> bool:
+    """Print each check's icon/name/message; return True iff any check failed.
+
+    Shared by the standalone `doctor` command and `init`'s guided flow's final
+    confirmation step, so the two can never print doctor output in two
+    different shapes.
+    """
+    any_failed = False
+    for check in checks:
+        icon = {"ok": "[ok]  ", "fail": "[FAIL]", "skipped": "[skip]"}[check.status]
+        click.echo(f"{icon} {check.name}: {check.message}")
+        if check.status == "fail":
+            any_failed = True
+    return any_failed
+
+
+def _offer_service_install(
+    *,
+    resolved_host: str,
+    hub_port: int,
+    token_result: TokenResult,
+    detected_note: str | None,
+    yes: bool,
+) -> bool:
+    """Guided-flow step 1: offer to install and start the hub as a background
+    service, verify it actually came up, and report which happened.
+
+    Returns True iff the hub is confirmed reachable at the end (the caller may
+    then continue the guided flow into pairing). Returns False for an honest
+    "not now" -- the user declined, or this platform has no service support at
+    all (`service.py`'s deliberate, explicit Windows/no-systemctl gap) -- in
+    which case the caller falls back to `_print_remaining_steps` and stops;
+    False is never returned silently. A service that DID install but never
+    becomes reachable is not a "not now" -- it's a real failure -- so that case
+    raises `click.ClickException` instead of returning False (see below).
+    """
+    service_info = describe_service()
+    install_it = service_info.supported
+    if install_it and not yes:
+        click.echo("")
+        click.echo("  1. Start the hub as a background service (recommended -- survives logout and reboot).")
+        if detected_note:
+            click.echo(f"     {detected_note}")
+        install_it = click.confirm(
+            f"     Install and start it now? (amplifier-browser-bridge service install "
+            f"--host {resolved_host} --port {hub_port})",
+            default=True,
+        )
+
+    if not install_it:
+        click.echo("")
+        if not service_info.supported:
+            click.echo(f"     {service_info.detail}")
+        return False
+
+    try:
+        info = service_install(resolved_host, hub_port, token_result.token_file)
+    except (ServiceUnsupportedError, OSError) as e:
+        raise click.ClickException(
+            f"could not install the hub service: {e}\n"
+            "  Your token and staged extension above are unaffected -- run the hub directly instead:\n"
+            f"    AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge "
+            f"hub --host {resolved_host} --port {hub_port}"
+        ) from e
+
+    click.echo(f"     Installed and started the {SERVICE_NAME} service ({info.platform}).")
+
+    if not _wait_for_hub_reachable(resolved_host, hub_port, token_result.token):
+        raise click.ClickException(
+            f"the {SERVICE_NAME} service installed but never became reachable at "
+            f"ws://{resolved_host}:{hub_port}/agent within {_SERVICE_READY_TIMEOUT_S:.0f}s.\n"
+            "  Your token and staged extension from above are still valid -- this is a partial "
+            "setup, not a lost one. Check what's wrong with:\n"
+            "    amplifier-browser-bridge service status\n"
+            "    amplifier-browser-bridge service logs\n"
+            "  Then, once fixed, get a pairing code with:\n"
+            f"    AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
+            f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
+        )
+    click.echo(f"     Confirmed: hub reachable at ws://{resolved_host}:{hub_port}/agent")
+    return True
+
+
 @main.command()
 @click.option(
     "--dest",
@@ -1202,10 +1421,39 @@ def _resolve_hub_host(explicit_host: str | None) -> tuple[str, str | None]:
     show_default=True,
     help="Port to print in the printed `amplifier-browser-bridge hub`/`service install` commands.",
 )
-def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | None, hub_port: int) -> None:
-    """First-run setup: generate a hub token, stage the extension, print next steps.
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    default=False,
+    help="Take the recommended action at each guided step without asking (installs the hub "
+    "service; never blocks waiting for you to load the extension into Edge -- prints that and "
+    "the pairing command as a manual step instead, since there's no one here to say when you're "
+    "ready). Also forces the guided flow to run even without a real terminal, for a script that "
+    "explicitly wants the service pre-installed.",
+)
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    default=False,
+    help="Never prompt or install the service automatically -- just print the remaining manual "
+    "steps, exactly like `init` did before this flag existed. This is also the automatic "
+    "behavior whenever stdin/stdout aren't a real terminal (CI, scripts, digital twins); pass "
+    "this explicitly only to force that behavior from an interactive shell.",
+)
+def init(
+    dest: str | None,
+    token_file: str | None,
+    force: bool,
+    hub_host: str | None,
+    hub_port: int,
+    yes: bool,
+    non_interactive: bool,
+) -> None:
+    """First-run setup: generate a hub token, stage the extension, then get you to a
+    redeemable pairing code -- interactively, when run from a real terminal.
 
-    Does three things, each idempotent (safe to re-run, e.g. after `git pull`):
+    Always does two things first, each idempotent (safe to re-run, e.g. after `git pull`):
 
     \b
     1. Ensures a hub token exists (generates one on first run; reuses it on later
@@ -1214,9 +1462,22 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
        ~/.local/share) -- NOT this repo checkout, so re-running after an update
        never changes the path an already-loaded extension was loaded from, which is
        what lets its saved chrome.storage.local config survive the update.
-    3. Prints the exact remaining manual steps. Loading an unpacked extension in
-       edge://extensions IS a manual step (Edge has no CLI/API for it) -- this command
-       does not pretend otherwise.
+
+    From a real terminal (or with --yes), it then walks you through the rest: offers
+    to install and start the hub as a background service (declining leaves you the
+    exact foreground command instead -- nothing is silently skipped), confirms the
+    hub actually came up, and once you say the extension is loaded, mints a pairing
+    code right then -- not earlier -- so the code's 10-minute lifetime is spent
+    waiting on you to finish pairing, not waiting on you to find "Load unpacked" in
+    edge://extensions. If it expires anyway, `amplifier-browser-bridge pair` mints a
+    fresh one any time.
+
+    Piped, scripted, or run without a terminal attached (CI, a digital twin, --non-
+    interactive), it never prompts and never installs anything beyond the token and
+    the staged extension -- it just prints the exact remaining manual steps, same as
+    every earlier release. Loading an unpacked extension in edge://extensions IS a
+    manual step regardless of mode -- Edge has no CLI/API for it, and this command
+    never pretends otherwise.
     """
     try:
         token_result = ensure_token_file(token_file, force=force)
@@ -1240,42 +1501,123 @@ def init(dest: str | None, token_file: str | None, force: bool, hub_host: str | 
         click.echo(wildcard_bind_warning(resolved_host, hub_port))
 
     click.echo("")
-    click.echo("Remaining steps (manual -- Edge has no CLI for these):")
-    click.echo("")
-    click.echo("  1. Start the hub as a background service (recommended -- survives logout and reboot):")
-    click.echo(f"       amplifier-browser-bridge service install --host {resolved_host} --port {hub_port}")
-    if detected_note:
-        click.echo(f"       {detected_note}")
-    click.echo("")
-    click.echo("     Or run it directly in this terminal instead (stops when the terminal closes):")
-    click.echo(
-        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge hub --host {resolved_host} --port {hub_port}"
+
+    if not _resolve_interactivity(yes=yes, non_interactive=non_interactive):
+        _print_remaining_steps(
+            token_result=token_result,
+            staged_dir=staged_dir,
+            resolved_host=resolved_host,
+            hub_port=hub_port,
+            detected_note=detected_note,
+        )
+        return
+
+    hub_ready = _offer_service_install(
+        resolved_host=resolved_host,
+        hub_port=hub_port,
+        token_result=token_result,
+        detected_note=detected_note,
+        yes=yes,
     )
+    if not hub_ready:
+        _print_remaining_steps(
+            token_result=token_result,
+            staged_dir=staged_dir,
+            resolved_host=resolved_host,
+            hub_port=hub_port,
+            detected_note=detected_note,
+        )
+        return
+
     click.echo("")
     click.echo("  2. Load the extension:")
     click.echo("       edge://extensions -> enable Developer mode -> Load unpacked ->")
     click.echo(f"       select: {staged_dir}")
+
+    if yes:
+        click.echo("")
+        click.echo("  3. Once it's loaded, get a pairing code whenever you're ready (minted fresh")
+        click.echo("     right when you ask, so it can't expire waiting on you):")
+        click.echo(
+            f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
+            f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
+        )
+        click.echo('       Click the extension\'s toolbar icon -> Settings -> "Pair with a hub".')
+        click.echo("")
+        click.echo("  4. Confirm it worked:")
+        click.echo(
+            f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+            f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+        )
+        return
+
+    if not click.confirm("\n     Loaded, and its Settings page is open?", default=True):
+        click.echo("")
+        click.echo("No problem -- whenever you're ready:")
+        click.echo(
+            f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
+            f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
+        )
+        click.echo(
+            f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+            f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+        )
+        return
+
+    # Mint LAZILY -- right now, at the moment the user says they're ready, not
+    # back when the hub was started. This is the fix for the TTL trap: a
+    # first-time user finding Developer mode and Load unpacked in
+    # edge://extensions can easily take longer than the ticket's 10-minute
+    # lifetime (pairing.py's DEFAULT_TICKET_TTL_SECONDS), and a code minted
+    # eagerly (e.g. right after the service comes up) would spend most of that
+    # window waiting on a step that hasn't happened yet. Waiting for this
+    # confirmation before minting means the 10 minutes are spent on the two
+    # things actually left to do (paste the code, click Pair), which take
+    # seconds -- and the ticket is still shown with its TTL and the exact
+    # re-mint command in the same breath, so an expired code is never a silent
+    # dead end even if the user steps away mid-pairing.
+    try:
+        pairing_result = asyncio.run(
+            HubClient(f"ws://{resolved_host}:{hub_port}/agent", token=token_result.token).create_pairing(
+                ttl_seconds=DEFAULT_TICKET_TTL_SECONDS
+            )
+        )
+    except HubError as e:
+        raise click.ClickException(str(e)) from e
+    if not pairing_result.get("ok"):
+        raise click.ClickException(pairing_result.get("error") or "pairing request failed")
+
+    code = f"{pairing_result['ticket']}@{resolved_host}:{hub_port}"
     click.echo("")
-    click.echo("  3. Configure it -- once the hub from step 1 is running, PAIR it (recommended,")
-    click.echo("     no hub URL or token to copy by hand):")
-    click.echo(f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge pair")
-    click.echo("       Click the extension's toolbar icon to open its Settings page, enter the")
-    click.echo('       printed code under "Pair with a hub", and click Pair.')
+    click.echo(f"  3. Pairing code (valid {int(DEFAULT_TICKET_TTL_SECONDS)}s, single use):")
     click.echo("")
-    click.echo("     Or configure it manually instead:")
-    click.echo('       Open Settings -> "Manual configuration (advanced)" ->')
-    click.echo(f"       Hub URL: ws://{resolved_host}:{hub_port}/device")
-    click.echo(f"       Token:   {token_result.token}")
-    click.echo("       Click Save.")
+    click.echo(f"       {code}")
     click.echo("")
-    click.echo("     The hub and this token exist so the agent reaches your browser over your own ")
-    click.echo('     network -- no relay server in the path. See README\'s "Why the setup is this long".')
-    click.echo("")
-    click.echo("  4. Confirm it worked:")
+    click.echo("     Click the extension's toolbar icon, open Settings, enter this code under")
+    click.echo('     "Pair with a hub", and click Pair. If it expires before you get there, get a')
     click.echo(
-        f"       AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
-        f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+        f"     fresh one: AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
+        f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{hub_port}/agent amplifier-browser-bridge pair"
     )
+
+    if not click.confirm("\n     Entered the code and clicked Pair?", default=True):
+        click.echo("")
+        click.echo("Check any time with:")
+        click.echo(
+            f"  AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+            f"--hub-url ws://{resolved_host}:{hub_port}/agent"
+        )
+        return
+
+    click.echo("")
+    click.echo("  4. Confirming...")
+    checks = asyncio.run(
+        run_doctor(f"ws://{resolved_host}:{hub_port}/agent", token_result.token, token_result.token_file)
+    )
+    any_failed = _print_doctor_checks(checks)
+    if any_failed:
+        raise click.ClickException("one or more checks failed -- see above.")
+    click.echo("\nAll checks passed. Try: amplifier-browser-bridge devices")
 
 
 @main.group(name="service")
@@ -1450,12 +1792,7 @@ def doctor(hub_url: str | None, token: str | None, token_file: str | None) -> No
     effective_token = token if token is not None else DEFAULT_TOKEN
     checks = asyncio.run(run_doctor(effective_url, effective_token, token_file))
 
-    any_failed = False
-    for check in checks:
-        icon = {"ok": "[ok]  ", "fail": "[FAIL]", "skipped": "[skip]"}[check.status]
-        click.echo(f"{icon} {check.name}: {check.message}")
-        if check.status == "fail":
-            any_failed = True
+    any_failed = _print_doctor_checks(checks)
 
     if any_failed:
         raise click.ClickException("one or more checks failed -- see above.")

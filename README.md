@@ -119,8 +119,8 @@ Every command below was run verbatim on a clean machine with no prior configurat
 #    (no `git+`, no URL) will work too and this collapses to that one command.
 uv tool install git+https://github.com/bkrabach/amplifier-browser-bridge@main
 
-# 2. First-run setup: generates a hub token, stages the extension into a stable directory,
-#    and prints the exact remaining manual steps.
+# 2. This is the ONLY other command you need to run. From a real terminal it walks
+#    you through everything else -- installing the hub, then pairing the extension.
 amplifier-browser-bridge init
 ```
 
@@ -133,56 +133,85 @@ uv tool install .        # a real, non-editable install -- NOT `uv pip install -
 amplifier-browser-bridge init
 ```
 
-`amplifier-browser-bridge init` prints something like:
+### `init` is the one command -- it walks you through the rest
+
+Earlier releases had `init` print four manual steps (`service install`, load the extension,
+`pair`, `doctor`) that you had to know existed and run in order. `init` now runs the first and
+third of those *for you*, interactively, and stops for exactly the one step that is genuinely
+manual (Edge has no CLI for loading an unpacked extension). This is real output, from a real run
+on this project's own dev machine, with nothing pre-configured (see "Verified interactive `init`
+end-to-end" below for the full, unedited transcript this was captured from):
 
 ```
-Generated new hub token (stored in ~/.config/amplifier-browser-bridge/tokens.json).
-Staged extension -> ~/.local/share/amplifier-browser-bridge/extension
+$ amplifier-browser-bridge init
+Generated new hub token (stored in /home/user/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /home/user/.local/share/amplifier-browser-bridge/extension
 
-Remaining steps (manual -- Edge has no CLI for these):
-
-  1. Start the hub as a background service (recommended -- survives logout and reboot):
-       amplifier-browser-bridge service install --host 100.x.y.z --port 8900
-       (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.x.y.z)
-
-     Or run it directly in this terminal instead (stops when the terminal closes):
-       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 100.x.y.z --port 8900
+  1. Start the hub as a background service (recommended -- survives logout and reboot).
+     (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.124.126.19)
+     Install and start it now? (amplifier-browser-bridge service install --host 100.124.126.19 --port 8900) [Y/n]:
+     Installed and started the amplifier-browser-bridge service (linux).
+     Confirmed: hub reachable at ws://100.124.126.19:8900/agent
 
   2. Load the extension:
        edge://extensions -> enable Developer mode -> Load unpacked ->
-       select: ~/.local/share/amplifier-browser-bridge/extension
+       select: /home/user/.local/share/amplifier-browser-bridge/extension
 
-  3. Configure it:
-       Click the extension's toolbar icon (its only UI) to open the options page.
-       Hub URL: ws://100.x.y.z:8900/device
-       Token:   <the generated token, printed above>
-       Click Save.
+     Loaded, and its Settings page is open? [Y/n]:
 
-  4. Confirm it worked:
-       AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> amplifier-browser-bridge doctor --hub-url ws://127.0.0.1:8900/agent
+  3. Pairing code (valid 600s, single use):
+
+       FS55M-H87XV@100.124.126.19:8900
+
+     Click the extension's toolbar icon, open Settings, enter this code under
+     "Pair with a hub", and click Pair. If it expires before you get there, get a
+     fresh one: AMPLIFIER_BROWSER_BRIDGE_TOKEN=<token> AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://100.124.126.19:8900/agent amplifier-browser-bridge pair
+
+     Entered the code and clicked Pair? [Y/n]:
 ```
+
+Answering `[Y/n]` with Enter (the default) at each prompt installs a real systemd/launchd
+service, confirms the hub is actually reachable before moving on, then -- only once you say the
+extension is loaded -- mints the pairing code you paste into it. Three things worth calling out
+about that sequence:
+
+- **The pairing code is minted lazily, not eagerly.** A first-time user finding "Developer mode"
+  and "Load unpacked" in `edge://extensions` can easily take longer than the code's 10-minute
+  lifetime (`pairing.py`'s `DEFAULT_TICKET_TTL_SECONDS`). Minting the code only after you confirm
+  the extension is loaded means the 10 minutes are spent on what's actually left to do (paste the
+  code, click Pair) rather than ticking away while you're still finding the right menu. If it
+  still expires, the exact re-mint command is printed in the same breath as the code -- never a
+  silent dead end.
+- **Declining an offer never leaves you stuck.** Say `n` to the service prompt and `init` prints
+  the exact foreground command instead (`amplifier-browser-bridge hub --host ... --port ...`);
+  say `n` to "Loaded, and its Settings page is open?" and it prints the exact `pair`/`doctor`
+  commands to run once you are. Nothing is silently skipped.
+- **Piped, scripted, or run without a terminal attached** (CI, a digital twin, a redirected
+  command), `init` never prompts and never installs anything beyond the token and the staged
+  extension -- it prints the classic four-step block instead, exactly like every earlier release.
+  Pass `--non-interactive` to force that from a real terminal too, or `--yes` to auto-accept the
+  service install (never blocking on the browser step) even without a terminal attached.
 
 **A1 fix (security review finding):** `amplifier-browser-bridge hub` used to default to `--host 0.0.0.0` --
 binding every network interface the machine has (home Wi-Fi, hotel Wi-Fi, a corporate LAN), not
 just the Tailscale tailnet this project's threat model assumes -- and `init` printed that default
 back as the recommended command. `hub` now defaults to `--host 127.0.0.1` (loopback only); `init`
-auto-detects this machine's own Tailscale IP (`tailscale ip -4`) as shown above so the printed
-command stays cross-device-capable without a silent wildcard bind. If Tailscale can't be
+auto-detects this machine's own Tailscale IP (`tailscale ip -4`) as shown above so the printed/
+installed command stays cross-device-capable without a silent wildcard bind. If Tailscale can't be
 detected, `init` falls back to `127.0.0.1` and says so explicitly -- cross-device use then
 requires passing `--hub-host <your tailnet IP>` yourself. Passing (or auto-falling to) a
 wildcard host anywhere prints a specific, named warning listing exactly what it exposes. See
 [SECURITY.md](SECURITY.md) for the full accounting.
 
-**Running the hub as a service (recommended).** Step 1's `service install` is what makes the
-hub survive logout and reboot instead of dying with the terminal it was started in -- see
-"Running the hub as a service" below for the full command surface (`start`/`stop`/`restart`/
+**Running the hub as a service (recommended).** This is what `init` offers to install for you --
+see "Running the hub as a service" below for the full command surface (`start`/`stop`/`restart`/
 `status`/`logs`/`uninstall`), what gets baked into the unit, how token rotation and Tailscale
 IP changes are handled, and the real install-to-uninstall transcript this was verified against.
-The foreground `hub` command shown as a fallback above still works exactly as before, for quick
-local testing or when a service manager isn't available (see that section's platform table).
+The foreground `hub` command shown when you decline the offer still works exactly as before, for
+quick local testing or when a service manager isn't available (see that section's platform table).
 
-Follow those four steps -- step 2 (loading an unpacked extension) is a genuinely manual step;
-Edge has no CLI or API for it. Then issue a command:
+Once pairing is confirmed (`init`'s last step runs `doctor` automatically and tells you), issue a
+command:
 
 ```bash
 amplifier-browser-bridge devices
@@ -516,6 +545,139 @@ independently measured working on real Edge installs on macOS and Android (see
 not be completed in that specific sandbox; every other step -- install, `amplifier-browser-bridge init`, `amplifier-browser-bridge hub`,
 `amplifier-browser-bridge doctor`'s diagnostic chain, extension load, options-page auto-open, and config persistence
 via the real UI -- was verified with real commands and real output as shown above.
+
+### Verified interactive `init` end-to-end (guided flow)
+
+Run 2026-08-08 on this project's own Linux dev machine, in a real PTY (not `click.testing`), on a
+real Tailscale tailnet, with a real `systemd --user` service -- the one thing this run could not
+do is redeem the pairing code, because **no Edge binary exists in this environment.** That gap is
+stated here, not glossed over; everything up to it is real. Prior leftover state
+(`~/.config/amplifier-browser-bridge/`, `~/.local/share/amplifier-browser-bridge/`) was moved
+aside first so this starts from nothing, same as a genuinely new machine.
+
+```console
+$ amplifier-browser-bridge init
+Generated new hub token (stored in /home/bkrabach/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /home/bkrabach/.local/share/amplifier-browser-bridge/extension
+
+
+  1. Start the hub as a background service (recommended -- survives logout and reboot).
+     (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.124.126.19)
+     Install and start it now? (amplifier-browser-bridge service install --host 100.124.126.19 --port 8900) [Y/n]:
+Created symlink /home/bkrabach/.config/systemd/user/default.target.wants/amplifier-browser-bridge.service → /home/bkrabach/.config/systemd/user/amplifier-browser-bridge.service.
+     Installed and started the amplifier-browser-bridge service (linux).
+     Confirmed: hub reachable at ws://100.124.126.19:8900/agent
+
+  2. Load the extension:
+       edge://extensions -> enable Developer mode -> Load unpacked ->
+       select: /home/bkrabach/.local/share/amplifier-browser-bridge/extension
+
+     Loaded, and its Settings page is open? [Y/n]:
+
+  3. Pairing code (valid 600s, single use):
+
+       E09QH-4JXD9@100.124.126.19:8900
+
+     Click the extension's toolbar icon, open Settings, enter this code under
+     "Pair with a hub", and click Pair. If it expires before you get there, get a
+     fresh one: AMPLIFIER_BROWSER_BRIDGE_TOKEN=1a521bba7821c3bd6a12f2aab0ad2ad9 AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://100.124.126.19:8900/agent amplifier-browser-bridge pair
+
+     Entered the code and clicked Pair? [Y/n]: n
+
+Check any time with:
+  AMPLIFIER_BROWSER_BRIDGE_TOKEN=1a521bba7821c3bd6a12f2aab0ad2ad9 amplifier-browser-bridge doctor --hub-url ws://100.124.126.19:8900/agent
+```
+
+That `n` above is honest, not staged for effect: there is no Edge browser in this environment to
+answer "yes" to. Running the printed `doctor` command right after confirms exactly the state that
+implies -- everything about the hub half is healthy, and the one thing left is the manual browser
+step:
+
+```console
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN=1a521bba7821c3bd6a12f2aab0ad2ad9 amplifier-browser-bridge doctor --hub-url ws://100.124.126.19:8900/agent
+[ok]   token_store: auth enabled; token file: /home/bkrabach/.config/amplifier-browser-bridge/tokens.json
+[ok]   token_file_siblings: no other token-like files found alongside /home/bkrabach/.config/amplifier-browser-bridge/tokens.json
+[ok]   network_exposure: this doctor invocation targets host '100.124.126.19' -- not a wildcard bind, but confirm this is the address you intend (your machine's own tailnet IP, not something wider). this machine's own Tailscale IP: 100.124.126.19. [...Tailscale default-ACL disclosure continues; see docs/tailscale-acl-example.hujson...]
+[ok]   service_status: service installed and active (unit: /home/bkrabach/.config/systemd/user/amplifier-browser-bridge.service).
+[ok]   hub_reachable: hub reachable at ws://100.124.126.19:8900/agent
+[ok]   token_match: token accepted by hub
+[FAIL] device_connected: no browser device has ever connected to this hub. Load the extension unpacked (edge://extensions -> Developer mode -> Load unpacked), click its toolbar icon, and set the Hub URL/token on the options page.
+Error: one or more checks failed -- see above.
+```
+
+**The `pair` command printed above (with `AMPLIFIER_BROWSER_BRIDGE_HUB_URL` included) was also
+actually run and actually worked** -- confirming the fix for a real bug this verification pass
+found along the way: an earlier draft of this flow (and the classic manual instructions before it)
+printed a bare `amplifier-browser-bridge pair` with no `AMPLIFIER_BROWSER_BRIDGE_HUB_URL`, which
+silently defaults to `ws://127.0.0.1:8900/agent`. That's fine when the hub is on loopback, but
+wrong for the *recommended* case (this machine's own Tailscale IP) -- `pair` failed with a
+connection error against the very hub `init` had just told you to install, the first time this was
+run end to end. Every `pair` invocation `init` prints now carries the matching
+`AMPLIFIER_BROWSER_BRIDGE_HUB_URL`, the same way `doctor`'s printed invocation always has:
+
+```console
+$ AMPLIFIER_BROWSER_BRIDGE_TOKEN=1a521bba7821c3bd6a12f2aab0ad2ad9 AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://100.124.126.19:8900/agent amplifier-browser-bridge pair
+Pairing code (valid 600s, single use):
+
+    5BGAV-ZGBX2@100.124.126.19:8900
+
+On the browser being paired: click the extension's toolbar icon, open its
+Settings page, enter this code under "Pair with a hub", and click Pair.
+No hub URL or token to copy by hand -- pairing fetches both automatically.
+```
+
+(That code was minted in an earlier pass of this same verification, before the transcript above
+was re-captured against the fixed `pair` invocation -- both runs are real, from the same session.)
+
+The non-interactive fallback and the decline path were verified too, in the same real session.
+Piped/non-interactive (`--non-interactive`, forced here even though this WAS a real terminal, to
+prove the flag overrides tty detection) reuses the existing token (idempotent) and prints exactly
+the classic four-step block:
+
+```console
+$ amplifier-browser-bridge init --non-interactive
+Reusing existing hub token (stored in /home/bkrabach/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /home/bkrabach/.local/share/amplifier-browser-bridge/extension
+
+Remaining steps (manual -- Edge has no CLI for these):
+
+  1. Start the hub as a background service (recommended -- survives logout and reboot):
+       amplifier-browser-bridge service install --host 100.124.126.19 --port 8900
+       (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.124.126.19)
+     [... steps 2-4, identical to the block shown earlier in this README ...]
+```
+
+And declining the service offer prints the exact foreground command, then falls through to that
+same classic block -- nothing is silently skipped:
+
+```console
+$ amplifier-browser-bridge init
+Reusing existing hub token (stored in /home/bkrabach/.config/amplifier-browser-bridge/tokens.json).
+Staged extension -> /home/bkrabach/.local/share/amplifier-browser-bridge/extension
+
+
+  1. Start the hub as a background service (recommended -- survives logout and reboot).
+     (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.124.126.19)
+     Install and start it now? (amplifier-browser-bridge service install --host 100.124.126.19 --port 8900) [Y/n]: n
+
+Remaining steps (manual -- Edge has no CLI for these):
+
+  1. Start the hub as a background service (recommended -- survives logout and reboot):
+       amplifier-browser-bridge service install --host 100.124.126.19 --port 8900
+       (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.124.126.19)
+
+     Or run it directly in this terminal instead (stops when the terminal closes):
+       AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=/home/bkrabach/.config/amplifier-browser-bridge/tokens.json amplifier-browser-bridge hub --host 100.124.126.19 --port 8900
+     [... steps 2-4 follow, identical to the block shown earlier in this README ...]
+```
+
+**What's proven vs. what's BLOCKED:** everything on this machine -- token generation, extension
+staging, real `systemd --user` install/start/status, real hub reachability confirmation, real
+ticket minting and the fixed `pair` invocation, the non-interactive and decline fallbacks, and the
+final `doctor` diagnostic -- is real output from real commands. Redeeming the pairing code inside
+an actual Edge browser is **BLOCKED**: this environment has no Edge binary. That single step is
+the same one every other verification pass in this README names as unprovable here (see "Known
+gap in this specific verification" above) -- nothing new is being asserted about it.
 
 ### Update survives configuration (verified)
 

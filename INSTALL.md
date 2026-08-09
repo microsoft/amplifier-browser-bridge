@@ -86,29 +86,36 @@ prefer a local clone -- e.g. to inspect the source first -- that also works:
 > not on PyPI, and both fail with a package-not-found error. When a release is
 > published, that one-liner will replace the `git+https://...` command above.
 
-`init` generates a token, prints the exact remaining commands (including
-which host/port to bind), and tells you whether it auto-detected a Tailscale
-IP. Follow its printed instructions to actually start the hub -- the
-**recommended** path installs it as a background service (survives logout
-and reboot):
+Run from a real terminal, `init` walks you through the rest of this step
+itself: it generates a token, offers to install and start the hub as a
+background service, and confirms the hub actually came up before moving on.
+Answer `Y` (or just press Enter) at the prompt:
 
-```bash
-amplifier-browser-bridge service install --host <the address init printed> --port 8900
+```
+  1. Start the hub as a background service (recommended -- survives logout and reboot).
+     (auto-detected this machine's Tailscale IP via `tailscale ip -4`: 100.x.y.z)
+     Install and start it now? (amplifier-browser-bridge service install --host 100.x.y.z --port 8900) [Y/n]:
+     Installed and started the amplifier-browser-bridge service (linux).
+     Confirmed: hub reachable at ws://100.x.y.z:8900/agent
 ```
 
-Or, for quick local testing, run it directly in the current terminal instead
-(it stops the moment you close that terminal or press Ctrl-C):
+If you'd rather run the hub yourself in a terminal you keep open (it stops
+the moment you close that terminal or press Ctrl-C), answer `n` -- `init`
+prints the exact command instead of installing anything:
 
 ```bash
 AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE=~/.config/amplifier-browser-bridge/tokens.json \
   amplifier-browser-bridge hub --host <the address init printed> --port 8900
 ```
 
-**Write down two things `init` prints**, you will need them in Step 3:
-
-- The **Hub URL** (something like `ws://100.x.y.z:8900/device` --
-  cross-device -- or `ws://127.0.0.1:8900/device` -- same-machine only).
-- The **token** (a long random string).
+**Running this from a script, CI, or anything without a real terminal
+attached** (no tty)? `init` detects that automatically and never prompts --
+it prints the classic four manual steps (service install, load the
+extension, pair, doctor) instead, same as every earlier release, so nothing
+hangs waiting on input that will never arrive. Pass `--non-interactive` to
+force that behavior even from a real terminal, or `--yes` to auto-accept the
+service install without a terminal attached (it still won't block waiting
+for you to load the extension -- see Step 3).
 
 Leave the hub running. If it stops, the extension will show a disconnected
 state and nothing will work until you restart it -- this is exactly what the
@@ -172,15 +179,36 @@ amplifier-browser-bridge service logs                                  # tail it
 
 ## Step 3 -- Configure the extension
 
-On the options page that opened in Step 2:
+If you're following `init`'s guided flow (a real terminal, no `--non-interactive`),
+it asks whether the extension is loaded and its Settings page is open, then mints
+a **pairing code** right at that moment (not earlier -- see the source
+repository's README, "Why the code is minted lazily"):
 
-- **Hub URL**: paste the URL `init` printed in Step 1
-  (`ws://<host>:<port>/device`).
-- **Token**: paste the token `init` printed in Step 1.
+```
+  3. Pairing code (valid 600s, single use):
+
+       FS55M-H87XV@100.124.126.19:8900
+
+     Click the extension's toolbar icon, open Settings, enter this code under
+     "Pair with a hub", and click Pair.
+```
+
+Click the extension's toolbar icon, open **Settings**, paste that single code
+into **"Pair with a hub"**, and click **Pair** -- it fetches the Hub URL and a
+freshly-minted token automatically, so there is nothing else to copy by hand.
+If the code expires before you get here, `init` also prints the exact command
+to mint a fresh one.
+
+**Configuring manually instead** (piped/non-interactive `init`, or you just
+prefer typing both values in yourself)? On the options page opened in Step 2,
+choose "Manual configuration (advanced)":
+
+- **Hub URL**: paste the URL `init` printed (`ws://<host>:<port>/device`).
+- **Token**: paste the token `init` printed.
 - Click **Save**.
 
-The extension connects to the hub immediately after saving. The toolbar icon
-and the options page's status line tell you whether it connected.
+The extension connects to the hub immediately after saving (either path). The
+toolbar icon and the options page's status line tell you whether it connected.
 
 **If hub and browser are on different devices**, the Hub URL must use your
 Tailscale IP address (e.g. `100.x.y.z`), not `127.0.0.1` and not a Tailscale
