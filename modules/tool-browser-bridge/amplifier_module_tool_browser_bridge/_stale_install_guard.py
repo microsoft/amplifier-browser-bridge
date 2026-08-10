@@ -35,8 +35,15 @@ which names a missing class instead of the actual problem: a dead install pointe
 `import_hub_client_or_explain()` detects this exact shape (a resolved module with no
 `__file__`) and raises `StaleEditableInstallError` naming what was found -- the stale
 `.pth` file and the path it points at that no longer exists, if locatable -- and the
-fix (`amplifier reset --remove cache -y`), instead of leaving the caller to debug a
-missing-class ImportError that has nothing to do with `HubClient` itself.
+fix (reinstalling the package so its editable-install pointer is rebuilt), instead of
+leaving the caller to debug a missing-class ImportError that has nothing to do with
+`HubClient` itself.
+
+Note: this module has exactly one declared dependency (`amplifier-browser-bridge`,
+this repo's own root package -- see `pyproject.toml`). It has no dependency on, and
+must not name, any specific *host* tool's reinstall/cache-reset command -- whatever
+process installed this package (uv, pip, or a host application's own dependency
+manager) is what the fix below applies to.
 """
 
 from __future__ import annotations
@@ -116,8 +123,10 @@ def _explain_namespace_shadow(module: Any) -> str:
     lines += [
         "",
         (
-            "Fix: run `amplifier reset --remove cache -y` to rebuild the module cache "
-            "and reinstall, then restart Amplifier."
+            "Fix: reinstall the amplifier_browser_bridge package so this editable-install "
+            "pointer is rebuilt (e.g. `pip install -e .` or `uv sync` from this "
+            "repository, or whatever your host tool uses to (re)install Python packages), "
+            "then restart."
         ),
     ]
     return "\n".join(lines)

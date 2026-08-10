@@ -135,7 +135,11 @@ def test_namespace_shadow_is_diagnosed_with_actionable_message(tmp_path: Path) -
     assert "_editable_impl_amplifier_browser_bridge.pth" in result.stdout
     assert "deleted-cache-dir" in result.stdout
     assert "does not exist on disk" in result.stdout
-    assert "amplifier reset --remove cache -y" in result.stdout
+    assert "reinstall the amplifier_browser_bridge package" in result.stdout
+    # The fix must not name any specific host tool's command (e.g. an application's
+    # cache-reset command) -- this module has no dependency on any such tool, only
+    # on generic Python packaging actions any host could perform.
+    assert "amplifier reset" not in result.stdout
 
 
 def test_namespace_shadow_without_a_locatable_pth_still_diagnoses(tmp_path: Path) -> None:
@@ -151,7 +155,7 @@ def test_namespace_shadow_without_a_locatable_pth_still_diagnoses(tmp_path: Path
     assert result.returncode == 0, f"subprocess failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     assert "DIAGNOSED_AS_SHADOW" in result.stdout
     assert "namespace package" in result.stdout
-    assert "amplifier reset --remove cache -y" in result.stdout
+    assert "reinstall the amplifier_browser_bridge package" in result.stdout
     # Honest degradation: nothing to claim about a specific stale .pth file here.
     assert "_editable_impl_amplifier_browser_bridge.pth" not in result.stdout.split("MESSAGE_START")[1]
 
