@@ -400,5 +400,9 @@ in the source repository.
 | Options page URL uses a MagicDNS name and nothing connects | Switch to the Tailscale IP literal (`tailscale ip -4`) instead -- see Step 3. |
 | Extension connects, then goes dark for a long time on a phone/mobile device | Battery-optimization settings are suspending the browser in the background -- see `docs/ANDROID.md` in the source repository for the exact onboarding steps this project's own testing found necessary. |
 
-For anything not covered here, file an issue at
-<https://github.com/microsoft/amplifier-browser-bridge/issues>.
+For anything not covered here, there is no support channel -- this project has no
+issue tracker and provides no assistance (see [SUPPORT.md](SUPPORT.md)). The
+troubleshooting material in this repository is what exists: this table, the
+`doctor` command's own output, and `docs/ANDROID.md` for mobile-specific
+behavior. Security vulnerabilities are the one exception and go to MSRC -- see
+[SECURITY.md](SECURITY.md).

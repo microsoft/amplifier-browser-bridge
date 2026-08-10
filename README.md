@@ -907,7 +907,7 @@ contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additio
 - [docs/AGENT_SURFACES.md](docs/AGENT_SURFACES.md) -- MCP server and Amplifier tool module, with verified end-to-end proof
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) -- this project's own threat model: what protects you and what does not
 - [CONTRIBUTING.md](CONTRIBUTING.md) -- dev setup, engineering conventions, loading the extension and running the hub locally
-- [SECURITY.md](SECURITY.md) -- how to report a vulnerability (MSRC); [SUPPORT.md](SUPPORT.md) -- what is in and out of scope for issues
+- [SECURITY.md](SECURITY.md) -- how to report a vulnerability (MSRC, the one channel that exists); [SUPPORT.md](SUPPORT.md) -- this project has no issue tracker and no support channel
 
 ## License
 
