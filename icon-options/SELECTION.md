@@ -141,12 +141,15 @@ human has seen this icon. This section is the commitment that closes it. It
 exists because "logged as a follow-up" is not a plan until someone is
 accountable for it, it is due at a moment, and it fails loudly.
 
-**Owner: `bkrabach`** — the GitHub owner of `origin`
-(`github.com/bkrabach/amplifier-browser-bridge`). Named from evidence, not
-assigned: the repo carries no `CODEOWNERS`, and all 71 commits are authored by
-the `Amplifier` bot identity, so the remote owner is the only accountable human
-this repository actually attests to. **Acknowledgement is pending** — this is a
-derived assignment, not an accepted handoff, and the owner may reassign it.
+**Owner: `bkrabach`** — at the time this section was written, the GitHub owner
+of `origin`, which was then a personal repository under the `bkrabach` account
+(since deleted; the project now lives at `github.com/microsoft/amplifier-browser-bridge`,
+and that original URL is intentionally not linked here because it no longer
+resolves). Named from evidence, not assigned: the repo carried no `CODEOWNERS`,
+and all 71 commits were authored by the `Amplifier` bot identity, so the remote
+owner was the only accountable human this repository actually attested to.
+**Acknowledgement is pending** — this is a derived assignment, not an accepted
+handoff, and the owner may reassign it.
 
 **Due: the store-submission gate, not a calendar date.** The study blocks
 marking the submission checklist in `PUBLISH.md` (owned by `goal/parity`)
