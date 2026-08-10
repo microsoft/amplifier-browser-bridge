@@ -383,6 +383,99 @@ async def test_doctor_service_status_ok_when_locally_active(tmp_path: Path, toke
     assert _by_name(checks, "hub_reachable").ok
 
 
+@pytest.mark.asyncio
+async def test_doctor_reachability_overrides_a_stale_service_stopped_record(
+    tmp_path: Path, token_file: Path
+) -> None:
+    """Defect 3 regression, from a real DTU measurement: the hub was
+    demonstrably up and minting real pairing codes, but `browser_setup_status`
+    still reported `service_status: fail` and skipped hub_reachable/
+    token_match/device_connected -- because the OLD code decided "broken" from
+    the local unit file before ever attempting the real network round trip.
+    Reachability must be ground truth: when the hub answers, the stale
+    service record is corrected to `ok` and every downstream check actually
+    runs, rather than being skipped."""
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    stopped = ServiceInfo(
+        platform="linux",
+        supported=True,
+        installed=True,
+        active=False,
+        unit_path=Path("/home/x/.config/systemd/user/amplifier-browser-bridge.service"),
+        detail="installed but NOT active (unit: .../amplifier-browser-bridge.service)",
+    )
+    hub = Hub(
+        token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
+    )
+    record = hub.registry.get_or_create("dev-1")
+
+    class _FakeSocket:
+        async def send_json(self, data: dict) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    record.ws = _FakeSocket()
+    record.touch()
+
+    server = TestServer(hub.build_app())
+    await server.start_server()
+    try:
+        hub_url = f"ws://{server.host}:{server.port}/agent"
+        with patch("amplifier_browser_bridge.doctor.describe_service", return_value=stopped):
+            checks = await run_doctor(hub_url, "secret-123", token_file)
+    finally:
+        await server.close()
+
+    service_check = _by_name(checks, "service_status")
+    assert service_check.ok, "reachability must correct a stale local service record"
+    assert "IS reachable" in service_check.message
+    assert _by_name(checks, "hub_reachable").ok
+    assert _by_name(checks, "token_match").ok
+    device_check = _by_name(checks, "device_connected")
+    assert device_check.ok
+    assert "dev-1" in device_check.message
+    assert all_ok(checks) is True
+
+
+@pytest.mark.asyncio
+async def test_doctor_reachability_overrides_stale_service_record_even_on_token_mismatch(
+    tmp_path: Path, token_file: Path
+) -> None:
+    """A rejected token is still proof the hub answered -- the stale
+    'not active' service record must be corrected even when the downstream
+    check that actually fails is token_match, not device_connected."""
+    from amplifier_browser_bridge.service import ServiceInfo
+
+    stopped = ServiceInfo(
+        platform="linux",
+        supported=True,
+        installed=True,
+        active=False,
+        unit_path=Path("/unit"),
+        detail="installed but NOT active (unit: /unit)",
+    )
+    hub = Hub(
+        token_store=TokenStore(default_token="secret-123"), audit_log=AuditLog(tmp_path / "audit.jsonl")
+    )
+    server = TestServer(hub.build_app())
+    await server.start_server()
+    try:
+        hub_url = f"ws://{server.host}:{server.port}/agent"
+        with patch("amplifier_browser_bridge.doctor.describe_service", return_value=stopped):
+            checks = await run_doctor(hub_url, "wrong-token", token_file)
+    finally:
+        await server.close()
+
+    service_check = _by_name(checks, "service_status")
+    assert service_check.ok
+    assert _by_name(checks, "hub_reachable").ok
+    assert not _by_name(checks, "token_match").ok
+    assert _by_name(checks, "device_connected").status == "skipped"
+
+
 def test_doctor_service_status_is_informational_only_when_hub_url_is_a_different_host(
     tmp_path: Path, token_file: Path
 ) -> None:

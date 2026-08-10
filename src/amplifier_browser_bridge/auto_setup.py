@@ -47,6 +47,11 @@ call site that actually needs it.
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
+import shutil
+import sys
+import sysconfig
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,13 +62,71 @@ from .extension_integrity import ExtensionIntegrityError
 from .hub_location import DEFAULT_PORT, write_hub_location
 from .netinfo import is_wildcard_bind, wildcard_bind_warning
 from .pairing import DEFAULT_TICKET_TTL_SECONDS
-from .service import ServiceInfo, ServiceUnsupportedError, describe_service, service_install
+from .service import (
+    SERVICE_NAME,
+    ServiceInfo,
+    ServiceInstallError,
+    ServiceUnsupportedError,
+    describe_service,
+    service_install,
+)
 from .setup import ExtensionSourceNotFoundError, TokenResult, ensure_token_file, stage_extension
 
 # Same default readiness budget `init`'s own guided flow uses after installing the
 # service (cli.py's `_SERVICE_READY_TIMEOUT_S`) -- named here too so a caller building
 # the `browser_setup` tool's input schema can see/override it without reading cli.py.
 DEFAULT_WAIT_REACHABLE_S = 8.0
+
+
+def _resolve_cli_invocation() -> tuple[str, str | None]:
+    """A `amplifier-browser-bridge` invocation the READER of a manual_*_command
+    string can actually run -- not necessarily the process calling this tool. A
+    bundle-only Amplifier install has no `amplifier-browser-bridge` console
+    script on PATH at all (measured on a clean DTU container: `command -v
+    amplifier-browser-bridge` -> exit 1, zero files found on the whole disk),
+    so a manual command that just assumes the bare name is on the reader's
+    PATH is exactly the same class of bug as the loopback hub URL and the
+    missing HUB_URL on a printed `pair` command -- printed instruction that
+    doesn't work. Fixed structurally here (one resolver, three call sites all
+    derive from it) rather than by correcting the string in each of
+    `manual_hub_command`/`manual_pair_command`/`manual_doctor_command`.
+
+    Returns `(invocation, warning)`. `invocation` is always a single string
+    that is verified runnable on THIS machine before being returned -- never a
+    guess about where a console script "usually" lives:
+
+      1. `shutil.which` -- already on PATH; shortest, most familiar command.
+      2. This interpreter's own scripts directory (`sysconfig.get_path`) --
+         where `uv tool install`/`pip install` puts the console script for
+         the environment THIS code is actually running in, regardless of
+         whether that directory happens to be on PATH. Derived at runtime,
+         never a hardcoded layout (e.g. `~/.local/bin`), because the same
+         Amplifier install might be a `uv tool install` venv, a plain venv, or
+         something else entirely.
+      3. `<this interpreter> -m amplifier_browser_bridge.cli` -- the one
+         invocation guaranteed to work: this function only ever runs from
+         inside `run_auto_setup`, AFTER `from .cli import ...` has already
+         succeeded in this exact process (see module docstring's "why cli is
+         imported lazily"), so this exact interpreter can always re-invoke
+         that same module this way. `warning` is set only for this case,
+         since it's the one that depends on being run on THIS machine, as the
+         user this Amplifier installation runs as -- never assumed silently.
+    """
+    which = shutil.which(SERVICE_NAME)
+    if which:
+        return which, None
+
+    scripts_dir = Path(sysconfig.get_path("scripts"))
+    candidate = scripts_dir / SERVICE_NAME
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate), None
+
+    fallback = shlex.join([sys.executable, "-m", "amplifier_browser_bridge.cli"])
+    return fallback, (
+        f"no `{SERVICE_NAME}` console script found on PATH or at {scripts_dir} -- the manual_* "
+        f"commands below use `{fallback}` instead. This only works when run on THIS machine, as "
+        "the same user this Amplifier installation runs as."
+    )
 
 
 @dataclass
@@ -183,6 +246,23 @@ async def run_auto_setup(
                 "extension are unaffected -- start the hub directly instead (see "
                 "manual_hub_command)."
             )
+        except ServiceInstallError as e:
+            # Measured, not theoretical (DTU, clean container, no user D-Bus
+            # session): `service_install()` looked capable (systemctl/launchctl
+            # present and probed usable) but the install itself failed --
+            # `ServiceInstallError` is what `service_install()` now guarantees
+            # every such failure arrives as, so this is the ONE place this
+            # class of failure needs handling, not a growing list of
+            # `subprocess.CalledProcessError`/`RuntimeError` except clauses
+            # scattered across every caller. Degrades exactly like
+            # ServiceUnsupportedError: token and staged extension are
+            # unaffected, manual_hub_command still works.
+            service_outcome = {"attempted": True, "installed": False, "reason": str(e)}
+            warnings.append(
+                f"the hub background service failed to install: {e} Your token and staged extension "
+                "are unaffected -- start the hub directly instead (see manual_hub_command), or retry "
+                "once the underlying issue is resolved."
+            )
         except OSError as e:
             service_outcome = {"attempted": True, "installed": False, "reason": str(e)}
             warnings.append(f"service install failed: {e}. See manual_hub_command to run the hub directly.")
@@ -200,16 +280,23 @@ async def run_auto_setup(
     )
 
     setup_url = _setup_url(resolved_host, port)
+    # Resolved once, used by all three manual_*_command strings below -- see
+    # `_resolve_cli_invocation`'s docstring for why this can't just be the bare
+    # `amplifier-browser-bridge` name (measured: absent from PATH on a
+    # bundle-only install).
+    cli_invocation, cli_invocation_warning = _resolve_cli_invocation()
+    if cli_invocation_warning:
+        warnings.append(cli_invocation_warning)
     manual_hub_command = (
-        f"AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} amplifier-browser-bridge "
+        f"AMPLIFIER_BROWSER_BRIDGE_TOKEN_FILE={token_result.token_file} {cli_invocation} "
         f"hub --host {resolved_host} --port {port}"
     )
     manual_pair_command = (
         f"AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} "
-        f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{port}/agent amplifier-browser-bridge pair"
+        f"AMPLIFIER_BROWSER_BRIDGE_HUB_URL=ws://{resolved_host}:{port}/agent {cli_invocation} pair"
     )
     manual_doctor_command = (
-        f"AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} amplifier-browser-bridge doctor "
+        f"AMPLIFIER_BROWSER_BRIDGE_TOKEN={token_result.token} {cli_invocation} doctor "
         f"--hub-url ws://{resolved_host}:{port}/agent"
     )
 

@@ -304,16 +304,24 @@ async def run_doctor(
     checks.append(_check_hub_location(hub_url))
     checks.append(_check_network_exposure(hub_url, store.auth_enabled))
 
+    # Reachability is the GROUND TRUTH for whether the hub is up -- never the
+    # locally-recorded systemd/launchd unit alone. Measured on a real DTU: a hub
+    # demonstrably up and minting real pairing codes still got reported as
+    # `service_status: fail` with hub_reachable/token_match/device_connected all
+    # skipped, because the previous version of this function decided "broken"
+    # from the local unit file BEFORE ever attempting the actual network round
+    # trip. A unit file can go stale in ways this check cannot see from the
+    # filesystem alone: a hub started manually outside the service manager, one
+    # running under some other process manager entirely, or a unit written but
+    # never loaded by a failed `service install` (see service.py's
+    # `_systemd_install` -- that specific case is now rolled back at the
+    # source, but older/partial state from before this fix, or from any other
+    # service manager, is still possible). So the real network attempt always
+    # runs FIRST; the local service record is corrected afterward if the hub
+    # proves it's actually up, and is only trusted to explain (and skip
+    # downstream on) a GENUINE network failure.
     service_check = _check_service_status(hub_url)
-    checks.append(service_check)
-    if service_check.status == "fail":
-        # The service check already named the actionable cause (installed but not
-        # running, on THIS machine) -- attempting the network round trip anyway would
-        # just produce a second, less specific failure for the same root cause.
-        checks.append(DoctorCheck("hub_reachable", "skipped", "skipped (service not running)"))
-        checks.append(DoctorCheck("token_match", "skipped", "skipped (service not running)"))
-        checks.append(DoctorCheck("device_connected", "skipped", "skipped (service not running)"))
-        return checks
+    locally_reported_stopped = service_check.status == "fail"
 
     client = HubClient(hub_url, token=token)
     try:
@@ -321,6 +329,12 @@ async def run_doctor(
     except HubError as e:
         message = str(e)
         if message.strip().lower() == "unauthorized":
+            # The hub answered -- rejecting our token is proof of life, not
+            # proof of absence. A stale "not active" unit record cannot
+            # survive contact with a hub that just talked back.
+            if locally_reported_stopped:
+                service_check = _reachable_despite_stale_service_record(service_check, hub_url)
+            checks.append(service_check)
             checks.append(DoctorCheck("hub_reachable", "ok", f"hub reachable at {hub_url}"))
             checks.append(
                 DoctorCheck(
@@ -333,30 +347,51 @@ async def run_doctor(
             )
             checks.append(DoctorCheck("device_connected", "skipped", "skipped (token mismatch)"))
         else:
+            checks.append(service_check)
+            if locally_reported_stopped:
+                # Genuinely unreachable AND the local record agrees -- the
+                # service check already named the actionable cause; a second,
+                # less specific network failure for the same root cause adds
+                # nothing.
+                checks.append(DoctorCheck("hub_reachable", "skipped", "skipped (service not running)"))
+                checks.append(DoctorCheck("token_match", "skipped", "skipped (service not running)"))
+                checks.append(DoctorCheck("device_connected", "skipped", "skipped (service not running)"))
+            else:
+                checks.append(
+                    DoctorCheck(
+                        "hub_reachable",
+                        "fail",
+                        f"cannot reach hub at {hub_url}: {message}. Is `amplifier-browser-bridge hub` running? "
+                        "Check the host/port and that you're on the same tailnet.",
+                    )
+                )
+                checks.append(DoctorCheck("token_match", "skipped", "skipped (hub unreachable)"))
+                checks.append(DoctorCheck("device_connected", "skipped", "skipped (hub unreachable)"))
+        return checks
+    except OSError as e:
+        checks.append(service_check)
+        if locally_reported_stopped:
+            checks.append(DoctorCheck("hub_reachable", "skipped", "skipped (service not running)"))
+            checks.append(DoctorCheck("token_match", "skipped", "skipped (service not running)"))
+            checks.append(DoctorCheck("device_connected", "skipped", "skipped (service not running)"))
+        else:
             checks.append(
                 DoctorCheck(
                     "hub_reachable",
                     "fail",
-                    f"cannot reach hub at {hub_url}: {message}. Is `amplifier-browser-bridge hub` running? Check the "
-                    "host/port and that you're on the same tailnet.",
+                    f"cannot reach hub at {hub_url}: {e}. Is `amplifier-browser-bridge hub` running? Check the host/port "
+                    "and that you're on the same tailnet.",
                 )
             )
             checks.append(DoctorCheck("token_match", "skipped", "skipped (hub unreachable)"))
             checks.append(DoctorCheck("device_connected", "skipped", "skipped (hub unreachable)"))
         return checks
-    except OSError as e:
-        checks.append(
-            DoctorCheck(
-                "hub_reachable",
-                "fail",
-                f"cannot reach hub at {hub_url}: {e}. Is `amplifier-browser-bridge hub` running? Check the host/port "
-                "and that you're on the same tailnet.",
-            )
-        )
-        checks.append(DoctorCheck("token_match", "skipped", "skipped (hub unreachable)"))
-        checks.append(DoctorCheck("device_connected", "skipped", "skipped (hub unreachable)"))
-        return checks
 
+    # Reachable, and the token was accepted -- unambiguous proof of life. Correct
+    # the service check if it disagreed; the network never lies about this.
+    if locally_reported_stopped:
+        service_check = _reachable_despite_stale_service_record(service_check, hub_url)
+    checks.append(service_check)
     checks.append(DoctorCheck("hub_reachable", "ok", f"hub reachable at {hub_url}"))
     checks.append(DoctorCheck("token_match", "ok", "token accepted by hub"))
 
@@ -388,6 +423,26 @@ async def run_doctor(
         checks.append(DoctorCheck("device_connected", "ok", f"{len(live)} device(s) live: {device_ids}"))
 
     return checks
+
+
+def _reachable_despite_stale_service_record(service_check: DoctorCheck, hub_url: str) -> DoctorCheck:
+    """Correct a `service_status: fail` verdict once the hub has PROVEN it's up.
+
+    `_check_service_status` can only see THIS machine's own systemd/launchd
+    record -- it has no way to know the hub is actually being served some
+    other way (a manual/foreground run, a different process manager, or a
+    unit left behind by a failed `service install`). A hub that just answered
+    a real network request (even to reject a token) is ground truth; the
+    local record is a hint that lost.
+    """
+    return DoctorCheck(
+        "service_status",
+        "ok",
+        f"{service_check.message} -- however the hub IS reachable at {hub_url} right now, so it's being "
+        "served some other way (a manual/foreground run, a different process manager, or a stale "
+        "service record). Reachability is the ground truth here, not the local service record.",
+        detail=service_check.detail,
+    )
 
 
 def all_ok(checks: list[DoctorCheck]) -> bool:

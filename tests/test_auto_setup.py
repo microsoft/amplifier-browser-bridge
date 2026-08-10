@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import socket
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -31,9 +32,9 @@ import pytest
 
 from amplifier_browser_bridge.audit import AuditLog
 from amplifier_browser_bridge.auth import TokenStore
-from amplifier_browser_bridge.auto_setup import run_auto_setup
+from amplifier_browser_bridge.auto_setup import _resolve_cli_invocation, run_auto_setup
 from amplifier_browser_bridge.hub import Hub, serve_hub
-from amplifier_browser_bridge.service import ServiceUnsupportedError
+from amplifier_browser_bridge.service import ServiceInstallError, ServiceUnsupportedError
 from amplifier_browser_bridge.setup import ensure_token_file
 
 
@@ -245,3 +246,164 @@ def test_missing_extension_source_is_reported_not_raised(
     )
     assert result["ok"] is False
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 regression: a service that LOOKED installable but failed
+# (ServiceInstallError -- the CalledProcessError-wrapping case) must degrade
+# exactly as honestly as ServiceUnsupportedError, never crash the tool call.
+# ---------------------------------------------------------------------------
+
+
+def test_degrades_honestly_when_service_install_fails_with_service_install_error(tmp_path: Path) -> None:
+    """Measured DTU failure shape: `systemctl --user daemon-reload` failed with
+    `CalledProcessError` (no user D-Bus session), which used to escape
+    `run_auto_setup` as a raw, unhandled exception -- the entire tool call's
+    output, verbatim, was just that traceback string. `ServiceInstallError` is
+    what `service.service_install()` now guarantees this class of failure
+    arrives as; this must be caught and degraded exactly like
+    ServiceUnsupportedError, never re-raised."""
+    port = _free_port()
+
+    with patch(
+        "amplifier_browser_bridge.auto_setup.service_install",
+        side_effect=ServiceInstallError(
+            "`systemctl --user` failed during daemon-reload: Failed to connect to bus: No medium found"
+        ),
+    ):
+        result = asyncio.run(
+            run_auto_setup(
+                host="127.0.0.1",
+                port=port,
+                token_file=tmp_path / "tokens.json",
+                dest=tmp_path / "extension",
+                install_service=True,
+                wait_reachable_s=0.1,
+            )
+        )
+
+    assert result["ok"] is True
+    assert result["service"]["attempted"] is True
+    assert result["service"]["installed"] is False
+    assert any("failed to install" in w for w in result["warnings"])
+    assert result["manual_hub_command"]  # still a complete, usable fallback
+    assert (tmp_path / "tokens.json").is_file()  # token unaffected
+    assert Path(result["staged_extension_dir"]).is_dir()  # staged extension unaffected
+
+
+# ---------------------------------------------------------------------------
+# Defect 2 regression: manual_*_command strings must be runnable by whoever
+# reads them, not just by whoever happens to have the CLI on their own PATH.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cli_invocation_prefers_path_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "amplifier_browser_bridge.auto_setup.shutil.which", lambda name: "/usr/local/bin/" + name
+    )
+
+    invocation, warning = _resolve_cli_invocation()
+
+    assert invocation == "/usr/local/bin/amplifier-browser-bridge"
+    assert warning is None
+
+
+def test_resolve_cli_invocation_falls_back_to_interpreter_scripts_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scripts_dir = tmp_path / "bin"
+    scripts_dir.mkdir()
+    script = scripts_dir / "amplifier-browser-bridge"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    monkeypatch.setattr("amplifier_browser_bridge.auto_setup.shutil.which", lambda name: None)
+    monkeypatch.setattr(
+        "amplifier_browser_bridge.auto_setup.sysconfig.get_path", lambda name: str(scripts_dir)
+    )
+
+    invocation, warning = _resolve_cli_invocation()
+
+    assert invocation == str(script)
+    assert warning is None
+
+
+def test_resolve_cli_invocation_falls_back_to_module_invocation_and_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The measured bundle-only-install shape: no console script anywhere findable
+    -- `command -v amplifier-browser-bridge` -> exit 1, zero files on the whole
+    disk. Must still return SOMETHING runnable (this exact interpreter, which
+    is guaranteed to have the module importable -- this function only runs
+    from inside `run_auto_setup`, after `.cli` already imported successfully),
+    with an explicit warning rather than a silently-wrong bare command name."""
+    empty_scripts_dir = tmp_path / "no-scripts-here"
+    monkeypatch.setattr("amplifier_browser_bridge.auto_setup.shutil.which", lambda name: None)
+    monkeypatch.setattr(
+        "amplifier_browser_bridge.auto_setup.sysconfig.get_path", lambda name: str(empty_scripts_dir)
+    )
+
+    invocation, warning = _resolve_cli_invocation()
+
+    assert sys.executable in invocation
+    assert "amplifier_browser_bridge.cli" in invocation
+    assert warning is not None
+    assert "no `amplifier-browser-bridge` console script found" in warning
+
+
+def test_manual_commands_use_resolved_cli_invocation_not_a_bare_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end through `run_auto_setup`: when no console script is findable,
+    the manual_*_command strings must carry a runnable invocation (this
+    interpreter's own path), not the bare `amplifier-browser-bridge` name a
+    bundle-only install doesn't have on PATH -- and the gap must be surfaced in
+    `warnings`, not silently swallowed."""
+    empty_scripts_dir = tmp_path / "no-scripts-here"
+    monkeypatch.setattr("amplifier_browser_bridge.auto_setup.shutil.which", lambda name: None)
+    monkeypatch.setattr(
+        "amplifier_browser_bridge.auto_setup.sysconfig.get_path", lambda name: str(empty_scripts_dir)
+    )
+    port = _free_port()
+
+    result = asyncio.run(
+        run_auto_setup(
+            host="127.0.0.1",
+            port=port,
+            token_file=tmp_path / "tokens.json",
+            dest=tmp_path / "extension",
+            install_service=False,
+            wait_reachable_s=0.1,
+        )
+    )
+
+    for key in ("manual_hub_command", "manual_pair_command", "manual_doctor_command"):
+        assert "amplifier-browser-bridge " not in result[key] or sys.executable in result[key]
+        assert sys.executable in result[key], f"{key} must carry a runnable invocation: {result[key]!r}"
+    assert any("no `amplifier-browser-bridge` console script found" in w for w in result["warnings"])
+
+
+def test_manual_commands_stay_short_when_console_script_is_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common case (Amplifier's own `uv tool install`, or any install that
+    puts the console script on PATH) must not carry the noisy `-m` fallback or
+    a spurious warning."""
+    monkeypatch.setattr(
+        "amplifier_browser_bridge.auto_setup.shutil.which", lambda name: "/usr/local/bin/" + name
+    )
+    port = _free_port()
+
+    result = asyncio.run(
+        run_auto_setup(
+            host="127.0.0.1",
+            port=port,
+            token_file=tmp_path / "tokens.json",
+            dest=tmp_path / "extension",
+            install_service=False,
+            wait_reachable_s=0.1,
+        )
+    )
+
+    assert "/usr/local/bin/amplifier-browser-bridge" in result["manual_hub_command"]
+    assert not any("console script found" in w for w in result["warnings"])

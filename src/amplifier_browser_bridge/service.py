@@ -139,8 +139,35 @@ _WINDOWS_UNSUPPORTED_DETAIL = (
 
 class ServiceUnsupportedError(RuntimeError):
     """Raised when a service operation is requested on a platform/configuration this
-    module cannot drive (Windows, or Linux without `systemctl` on PATH). Never a
-    silent no-op or a quiet fallback to a foreground process -- see module docstring.
+    module cannot drive (Windows, or Linux without a USABLE `systemctl --user`
+    session -- see `_systemctl_user_probe`). Never a silent no-op or a quiet
+    fallback to a foreground process -- see module docstring.
+    """
+
+
+class ServiceInstallError(RuntimeError):
+    """Raised when the platform/configuration DOES look like it can run a service
+    (a usable `systemctl --user` session, or launchd on macOS), but the install
+    itself failed for some other reason -- a `systemctl`/`launchctl` command
+    rejected by the service manager, a malformed unit, etc.
+
+    Deliberately distinct from `ServiceUnsupportedError`: that one means "this
+    machine cannot run a service at all, don't bother retrying the same way";
+    this one means "the environment looked capable, this specific attempt
+    failed, and the underlying `subprocess.CalledProcessError`/`RuntimeError`
+    is attached via `__cause__` for anyone who wants the raw detail." Both are
+    caught the same way by callers that only care about "service didn't get
+    installed, degrade honestly" (see `auto_setup.run_auto_setup`) -- the
+    split exists for anyone who wants to tell the two situations apart, not to
+    force every caller to.
+
+    Constructed at the `service_install()` boundary (never inside
+    `_systemd_install`/`_launchd_install` themselves) so this is the ONE place
+    a raw `subprocess.CalledProcessError` or `launchctl` `RuntimeError` gets
+    translated -- every caller of `service_install()` (this CLI's own `service
+    install` command, `init`, and `auto_setup.run_auto_setup`) is protected by
+    this single conversion point, not by each caller separately remembering to
+    catch a lower-level exception type.
     """
 
 
@@ -173,9 +200,58 @@ def _is_windows() -> bool:
     return sys.platform == "win32"
 
 
+def _systemctl_user_probe() -> tuple[bool, str]:
+    """Whether `systemctl --user` is actually USABLE, not merely present on PATH.
+
+    Presence of the binary is not evidence a user service can be installed.
+    Measured, not theoretical: a container can ship `systemctl` on PATH with no
+    user D-Bus session at all -- every `--user` operation then fails with
+    ``Failed to connect to bus: No medium found``, which `shutil.which` alone
+    cannot see (containers, WSL1, minimal init environments are all real cases
+    of this, not edge cases).
+
+    Probed with a read-only, side-effect-free call (`--user list-units`) rather
+    than trusting binary presence -- this is the ONE place that decides whether
+    every other systemd operation in this module is attempted at all, so a
+    false positive here is what let a raw `CalledProcessError` (from
+    `daemon-reload` failing inside `_systemd_install`) escape as an unhandled
+    exception instead of the honest `ServiceUnsupportedError` a caller like
+    `auto_setup.run_auto_setup` already knows how to degrade from.
+
+    Returns `(usable, detail)` -- `detail` explains what was actually observed
+    either way, so `_no_systemctl_detail()` can report the REAL reason (binary
+    missing vs. binary present but no usable session) instead of a message
+    that's only accurate for the first case.
+    """
+    which = shutil.which("systemctl")
+    if which is None:
+        return False, "the `systemctl` binary was not found on PATH"
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "list-units", "--no-legend", "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"`systemctl --user` could not be run: {e}"
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        return False, (
+            "`systemctl` is on PATH, but `systemctl --user` failed"
+            + (f": {stderr}" if stderr else f" (exit {result.returncode})")
+            + " -- there is likely no user D-Bus session available here (common in containers, "
+            "WSL1, or other minimal init environments)."
+        )
+    return True, ""
+
+
 def _have_systemctl() -> bool:
-    """Gates every systemd operation -- never assume a Linux box uses systemd."""
-    return shutil.which("systemctl") is not None
+    """Gates every systemd operation -- never assume a Linux box uses systemd, and
+    never assume the `systemctl` binary being on PATH means a usable user service
+    manager. See `_systemctl_user_probe`."""
+    return _systemctl_user_probe()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -272,13 +348,42 @@ def _systemd_install(
 
     _SYSTEMD_UNIT_DIR.mkdir(parents=True, exist_ok=True)
     _SYSTEMD_UNIT_PATH.write_text(unit_content, encoding="utf-8")
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
-    # `enable --now` is a no-op on an already-running unit, so a re-install (new
-    # host/port, rotated audit-log path, ...) would silently keep serving the STALE
-    # arguments without this. `restart` also starts a stopped unit, so it is safe on
-    # both first install and re-install.
-    subprocess.run(["systemctl", "--user", "restart", SERVICE_NAME], check=True)
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        # systemd never actually loaded what we just wrote -- `daemon-reload`
+        # failing means this unit file has zero effect on the running system. Left
+        # on disk, it would make every later `describe_service()`/`doctor` call
+        # report "installed but NOT active" forever after, even though this
+        # install attempt never got as far as systemd's knowledge of it at all.
+        # That is precisely the misleading state a real (measured, not
+        # theoretical) DTU run surfaced: a stale unit file outliving a failed
+        # install, contradicting the hub's actual (unrelated) reachability.
+        # Roll back so the on-disk state matches reality: never installed.
+        _SYSTEMD_UNIT_PATH.unlink(missing_ok=True)
+        raise ServiceInstallError(_describe_systemctl_failure(e, step="daemon-reload")) from e
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", SERVICE_NAME],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # `enable --now` is a no-op on an already-running unit, so a re-install (new
+        # host/port, rotated audit-log path, ...) would silently keep serving the STALE
+        # arguments without this. `restart` also starts a stopped unit, so it is safe on
+        # both first install and re-install.
+        subprocess.run(
+            ["systemctl", "--user", "restart", SERVICE_NAME], check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        # Past this point systemd DOES know about the new unit -- daemon-reload
+        # above already succeeded. No rollback here: whatever `describe_service()`
+        # reports from here on (installed, not-yet-active, failed) reflects what
+        # systemd actually has loaded, so it is accurate information rather than a
+        # stale artifact -- unlike the daemon-reload failure above.
+        raise ServiceInstallError(_describe_systemctl_failure(e, step="enable/restart")) from e
 
 
 def _systemd_uninstall() -> None:
@@ -521,12 +626,24 @@ def _launchd_describe() -> ServiceInfo:
 
 
 def _no_systemctl_detail() -> str:
+    """Explain why `systemctl --user` isn't usable -- accurately either way: the
+    binary missing entirely, or present but with no usable user D-Bus session
+    (see `_systemctl_user_probe`). Never assumes the former just because that
+    used to be the only case this checked."""
+    _, reason = _systemctl_user_probe()
+    reason = reason or "systemd --user is not usable on this machine"
     return (
-        "service management requires `systemctl`, which was not found on PATH. This "
-        "system does not appear to use systemd (e.g. a container without systemd, "
-        "WSL1, or another init system). Run `amplifier-browser-bridge hub` directly to "
-        "start the server without a service manager."
+        f"service management requires a usable `systemctl --user` session: {reason} Run "
+        "`amplifier-browser-bridge hub` directly to start the server without a service manager."
     )
+
+
+def _describe_systemctl_failure(e: subprocess.CalledProcessError, *, step: str) -> str:
+    """Format a `systemctl --user` command failure with its actual stderr, not just
+    a bare exit code -- this is what a caller sees inside `ServiceInstallError`."""
+    stderr = (e.stderr or "").strip() if isinstance(e.stderr, str) else ""
+    detail = f": {stderr}" if stderr else f" (exit {e.returncode})"
+    return f"`systemctl --user` failed during {step} ({shlex.join(e.cmd)}){detail}"
 
 
 def service_install(
@@ -561,9 +678,20 @@ def service_install(
     if _is_windows():
         raise ServiceUnsupportedError(_WINDOWS_UNSUPPORTED_DETAIL)
     if _is_darwin():
-        _launchd_install(
-            host, port, token_file_path, resolved_audit_log, command_timeout, android_artifact_path
-        )
+        try:
+            _launchd_install(
+                host, port, token_file_path, resolved_audit_log, command_timeout, android_artifact_path
+            )
+        except RuntimeError as e:
+            # `_launchd_bootstrap` raises a plain RuntimeError for a genuine
+            # launchctl failure (see its own docstring) -- converted to
+            # ServiceInstallError HERE, at the one call site every caller of
+            # `service_install()` goes through, so this CLI's own `service
+            # install`/`init` commands and `auto_setup.run_auto_setup` are all
+            # protected by the same conversion rather than each needing to
+            # remember `except RuntimeError` (too broad to catch safely on its
+            # own) alongside `ServiceUnsupportedError`.
+            raise ServiceInstallError(str(e)) from e
         return _launchd_describe()
     if _have_systemctl():
         _systemd_install(
@@ -683,6 +811,7 @@ __all__ = [
     "DEFAULT_SERVICE_AUDIT_LOG",
     "SERVICE_NAME",
     "ServiceInfo",
+    "ServiceInstallError",
     "ServiceUnsupportedError",
     "describe_service",
     "service_install",

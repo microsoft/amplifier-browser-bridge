@@ -11,6 +11,7 @@ the kind of side effect this project's tests avoid elsewhere too.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 
 import amplifier_browser_bridge.service as svc
 from amplifier_browser_bridge.service import (
+    ServiceInstallError,
     ServiceUnsupportedError,
     describe_service,
     service_install,
@@ -381,4 +383,167 @@ def test_service_install_raises_service_unsupported_when_no_systemctl_and_not_da
     monkeypatch.setattr(svc, "_have_systemctl", lambda: False)
 
     with pytest.raises(ServiceUnsupportedError, match="systemctl"):
+        service_install("127.0.0.1", 8900, tmp_path / "tokens.json")
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 regression: binary-present-but-no-usable-bus, and CalledProcessError
+# / RuntimeError never escaping service_install() as a raw exception
+# ---------------------------------------------------------------------------
+
+
+def test_systemctl_user_probe_distinguishes_missing_binary_from_no_usable_bus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured DTU failure shape: `systemctl` IS on PATH, but `systemctl
+    --user ...` fails because there is no user D-Bus session (`Failed to
+    connect to bus: No medium found`). Presence of the binary alone must not
+    be trusted as evidence of a usable session."""
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/systemctl")
+
+    def fake_run(cmd, **kw):
+        assert cmd[:2] == ["systemctl", "--user"]
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="Failed to connect to bus: No medium found\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    usable, reason = svc._systemctl_user_probe()
+
+    assert usable is False
+    assert "systemctl" in reason
+    assert "on PATH" in reason
+    assert "Failed to connect to bus" in reason
+    assert svc._have_systemctl() is False
+
+
+def test_systemctl_user_probe_reports_missing_binary_distinctly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    usable, reason = svc._systemctl_user_probe()
+
+    assert usable is False
+    assert "not found on PATH" in reason
+
+
+def test_systemctl_user_probe_true_when_user_bus_usable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    )
+
+    assert svc._have_systemctl() is True
+
+
+def test_no_systemctl_detail_reflects_no_bus_reason_not_a_hardcoded_missing_binary_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: before this fix, `_no_systemctl_detail()` always said 'was not
+    found on PATH' even when the binary WAS present and the real problem was no
+    usable user D-Bus session -- an inaccurate message for the exact case this
+    bug report measured."""
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No medium found\n"),
+    )
+
+    detail = svc._no_systemctl_detail()
+
+    assert "not found on PATH" not in detail
+    assert "No medium found" in detail
+
+
+def test_systemd_install_rolls_back_unit_file_when_daemon_reload_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Defect 1's silent-partial-state finding: if `daemon-reload` fails, systemd
+    never actually loaded the unit we just wrote -- leaving it on disk would make
+    every later `describe_service()` call lie ('installed but NOT active')
+    forever after. The file must be rolled back, and the failure must surface as
+    `ServiceInstallError`, never a bare `subprocess.CalledProcessError`."""
+    unit_dir = tmp_path / "systemd" / "user"
+    unit_path = unit_dir / f"{svc.SERVICE_NAME}.service"
+    monkeypatch.setattr(svc, "_SYSTEMD_UNIT_DIR", unit_dir)
+    monkeypatch.setattr(svc, "_SYSTEMD_UNIT_PATH", unit_path)
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text("{}", encoding="utf-8")
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["systemctl", "--user", "daemon-reload"]:
+            # Mimic real subprocess.run(..., check=True): a nonzero exit raises.
+            raise subprocess.CalledProcessError(1, cmd, output="", stderr="Failed to connect to bus\n")
+        raise AssertionError(f"should not reach {cmd} after daemon-reload failure")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ServiceInstallError, match="daemon-reload"):
+        svc._systemd_install("100.124.126.19", 8900, token_file, tmp_path / "audit.jsonl", None)
+
+    assert not unit_path.exists(), "a unit file systemd never loaded must not be left on disk"
+
+
+def test_systemd_install_does_not_roll_back_unit_file_when_enable_fails_after_reload_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once `daemon-reload` succeeds, systemd genuinely knows about the new unit
+    -- the file must be left in place so `describe_service()` reports the REAL
+    (if not-yet-active) state, rather than being deleted out from under a unit
+    systemd has already loaded."""
+    unit_dir = tmp_path / "systemd" / "user"
+    unit_path = unit_dir / f"{svc.SERVICE_NAME}.service"
+    monkeypatch.setattr(svc, "_SYSTEMD_UNIT_DIR", unit_dir)
+    monkeypatch.setattr(svc, "_SYSTEMD_UNIT_PATH", unit_path)
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text("{}", encoding="utf-8")
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["systemctl", "--user", "daemon-reload"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        # Mimic real subprocess.run(..., check=True): a nonzero exit raises.
+        raise subprocess.CalledProcessError(1, cmd, output="", stderr="Unit failed to start\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ServiceInstallError, match="enable/restart"):
+        svc._systemd_install("100.124.126.19", 8900, token_file, tmp_path / "audit.jsonl", None)
+
+    assert unit_path.exists(), "systemd already knows about this unit -- do not delete it out from under it"
+
+
+def test_service_install_raises_service_install_error_not_bare_called_process_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end through the public `service_install()` entry point every caller
+    (this CLI's own commands, and `auto_setup.run_auto_setup`) actually calls."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(svc, "_have_systemctl", lambda: True)
+    unit_dir = tmp_path / "systemd" / "user"
+    monkeypatch.setattr(svc, "_SYSTEMD_UNIT_DIR", unit_dir)
+    monkeypatch.setattr(svc, "_SYSTEMD_UNIT_PATH", unit_dir / f"{svc.SERVICE_NAME}.service")
+
+    def fake_run(cmd, **kw):
+        raise subprocess.CalledProcessError(1, cmd, output="", stderr="Failed to connect to bus\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ServiceInstallError):
+        service_install("127.0.0.1", 8900, token_file)
+
+
+def test_service_install_wraps_launchd_runtime_error_as_service_install_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The macOS analogue of the same bug class: `_launchd_bootstrap` raises a
+    bare RuntimeError on real failure -- `service_install()` must translate it
+    too, not just the systemd path, so no caller needs its own
+    `except RuntimeError` (too broad to catch safely on its own)."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(svc, "_launchd_install", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(ServiceInstallError, match="boom"):
         service_install("127.0.0.1", 8900, tmp_path / "tokens.json")
