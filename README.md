@@ -59,7 +59,8 @@ What that means concretely:
 ## Security posture
 
 This software controls a user's real, authenticated browser session. Before evaluating or
-deploying it, read [SECURITY.md](SECURITY.md) for the full threat model. In brief:
+deploying it, read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the full threat model.
+In brief:
 
 - **The per-device shared token is the load-bearing boundary for most deployments** -- not the
   tailnet. Tailscale's own default ACL policy allows every device on your tailnet to reach every
@@ -117,7 +118,7 @@ Every command below was run verbatim on a clean machine with no prior configurat
 #    required). Verified working 2026-08-08 -- see "Verified clean-room install" below.
 #    Once this package is published to PyPI, `uv tool install amplifier-browser-bridge`
 #    (no `git+`, no URL) will work too and this collapses to that one command.
-uv tool install git+https://github.com/bkrabach/amplifier-browser-bridge@main
+uv tool install git+https://github.com/microsoft/amplifier-browser-bridge@main
 
 # 2. This is the ONLY other command you need to run. From a real terminal it walks
 #    you through everything else -- installing the hub, then pairing the extension.
@@ -127,7 +128,7 @@ amplifier-browser-bridge init
 Prefer a local clone (e.g. to read the source, or to pin a specific commit)?
 
 ```bash
-git clone https://github.com/bkrabach/amplifier-browser-bridge.git
+git clone https://github.com/microsoft/amplifier-browser-bridge.git
 cd amplifier-browser-bridge
 uv tool install .        # a real, non-editable install -- NOT `uv pip install -e .`
 amplifier-browser-bridge init
@@ -215,7 +216,7 @@ installed command stays cross-device-capable without a silent wildcard bind. If 
 detected, `init` falls back to `127.0.0.1` and says so explicitly -- cross-device use then
 requires passing `--hub-host <your tailnet IP>` yourself. Passing (or auto-falling to) a
 wildcard host anywhere prints a specific, named warning listing exactly what it exposes. See
-[SECURITY.md](SECURITY.md) for the full accounting.
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for the full accounting.
 
 **Running the hub as a service (recommended).** This is what `init` offers to install for you --
 see "Running the hub as a service" below for the full command surface (`start`/`stop`/`restart`/
@@ -441,7 +442,7 @@ anonymously over HTTPS and the Quickstart above was then executed **verbatim**, 
 nothing substituted:
 
 ```console
-$ git clone https://github.com/bkrabach/amplifier-browser-bridge.git
+$ git clone https://github.com/microsoft/amplifier-browser-bridge.git
 Cloning into 'amplifier-browser-bridge'...
 $ cd amplifier-browser-bridge && git rev-parse HEAD
 8605536c3e8ceb2f126adff2fcb0e514e625a71b
@@ -785,7 +786,8 @@ to get this extension onto it.
 >   hub. There is no way to revoke one artifact -- the only lever is rotating the hub token
 >   (`init --force`), which invalidates every phone **and** every desktop you configured, each
 >   of which then has to be redone. Tell anyone you hand the file to, including a tester:
->   **if it leaves your control, treat it as compromised.** See [SECURITY.md](SECURITY.md)'s
+>   **if it leaves your control, treat it as compromised.** See
+>   [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)'s
 >   "One credential, two trust models" and "Where a live credential ends up after install".
 > - **This extension's own code has never been confirmed running on a real Android device.** The
 >   Android platform behaviors below were measured on real hardware with a *separate throwaway
@@ -882,10 +884,20 @@ failure that looks like a broken repo rather than a missing package:
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, engineering conventions this project
-holds contributors to, and how to load the extension and run the hub locally. See
-[SECURITY.md](SECURITY.md) to report a vulnerability, and [SUPPORT.md](SUPPORT.md) for what's
-in and out of scope for issues.
+> [!NOTE]
+> This project is not currently accepting external contributions, but we're actively working toward opening this up. We value community input and look forward to collaborating in the future. For now, feel free to fork and experiment!
+
+Most contributions require you to agree to a
+Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
+the rights to use your contribution. For details, visit [Contributor License Agreements](https://cla.opensource.microsoft.com).
+
+When you submit a pull request, a CLA bot will automatically determine whether you need to provide
+a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
+provided by the bot. You will only need to do this once across all repos using our CLA.
+
+This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
+For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
+contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
 
 ## Further reading
 
@@ -893,7 +905,18 @@ in and out of scope for issues.
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) -- the wire protocol, message shapes, command vocabulary
 - [docs/POLICY.md](docs/POLICY.md) -- the consent model in full, including its honest limits
 - [docs/AGENT_SURFACES.md](docs/AGENT_SURFACES.md) -- MCP server and Amplifier tool module, with verified end-to-end proof
+- [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) -- this project's own threat model: what protects you and what does not
+- [CONTRIBUTING.md](CONTRIBUTING.md) -- dev setup, engineering conventions, loading the extension and running the hub locally
+- [SECURITY.md](SECURITY.md) -- how to report a vulnerability (MSRC); [SUPPORT.md](SUPPORT.md) -- what is in and out of scope for issues
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Trademarks
+
+This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft
+trademarks or logos is subject to and must follow
+[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
+Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
+Any use of third-party trademarks or logos are subject to those third-party's policies.

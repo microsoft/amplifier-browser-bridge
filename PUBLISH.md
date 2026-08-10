@@ -73,7 +73,7 @@ documentation exercise with an uncertain outcome; it would be a submission very 
 to be refused, for defensible reasons.
 
 The audience this software actually has — someone who already runs the hub on their own
-tailnet and reads [SECURITY.md](SECURITY.md) before deploying it — reaches it through
+tailnet and reads [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before deploying it — reaches it through
 sideload. That is the distribution model, and it is served.
 
 ## Decisions recorded
@@ -158,5 +158,6 @@ gates, rather than in a second copy here that could drift out of step.
 
 - [INSTALL.md](INSTALL.md) — peer-facing sideload steps; ships inside the zip
 - [README.md](README.md) — what this project is and its current maturity
-- [SECURITY.md](SECURITY.md) — threat model; read before deploying
+- [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — threat model; read before deploying
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability (MSRC)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, tests, lint and type checking

@@ -1,13 +1,13 @@
 """Network-exposure helpers -- what a bind address actually exposes, and a
 best-effort Tailscale IP lookup for a safe default.
 
-This exists because of a real gap (security review finding, see SECURITY.md
+This exists because of a real gap (security review finding, see docs/THREAT_MODEL.md
 and docs/POLICY.md): `amplifier-browser-bridge hub` defaulted to `--host 0.0.0.0`, and
 `amplifier-browser-bridge init` printed that default back as the recommended command. `0.0.0.0`
 binds EVERY network interface the host has -- home Wi-Fi, hotel Wi-Fi, a
 coffee-shop captive network, a corporate LAN -- not just the Tailscale tailnet
 this project's threat model assumes. See `docs/designs/browser-bridge.md` and
-SECURITY.md's "Where the load-bearing boundary actually is" section.
+docs/THREAT_MODEL.md's "Where the load-bearing boundary actually is" section.
 
 Pure, side-effect-free except for `detect_tailscale_ip`'s one best-effort
 subprocess call -- which never raises, and returns `None` (never a fake
@@ -74,7 +74,7 @@ def wildcard_bind_warning(host: str, port: int) -> str:
     Shared by `hub` (printed when it actually binds a wildcard address) and
     `init` (printed when the command it's about to recommend would bind one)
     so the two surfaces never describe the same address differently -- see
-    SECURITY.md and the A1 fix this module exists for.
+    docs/THREAT_MODEL.md and the A1 fix this module exists for.
     """
     return (
         f"WARNING: --host {host} binds port {port} on EVERY network interface this "

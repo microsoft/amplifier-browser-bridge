@@ -27,7 +27,7 @@ what the current token actually is.
 Security note
 --------------
 The artifact this module's output gets packed into now carries a live credential.
-See `SECURITY.md`'s "The Android build now embeds a live hub credential in the
+See `docs/THREAT_MODEL.md`'s "The Android build now embeds a live hub credential in the
 artifact itself" section and `docs/ANDROID.md`'s "Zero-configuration builds"
 section -- this is a disclosed, accepted trade-off under this project's stated trust
 model, not an oversight.
@@ -202,7 +202,7 @@ def cli_main(argv: list[str] | None = None) -> int:
     matching `scripts/package.sh`'s existing build-gate convention. On success, prints
     the resolved (masked) token, hub URL, and output path, plus the security
     disclosure this change is required to surface at the build script's own output
-    (see SECURITY.md).
+    (see docs/THREAT_MODEL.md).
     """
     parser = argparse.ArgumentParser(
         description="Bake a hub URL + token into bundled_config.json for the Android CRX build."
@@ -250,7 +250,7 @@ def cli_main(argv: list[str] | None = None) -> int:
             "SECURITY NOTICE: this artifact now contains a live hub credential. Anyone who "
             "obtains this .crx (or the .bin it is temporarily served as during transfer to a "
             "phone) can connect to the hub as this device. This is the accepted trust model for "
-            "this project's Android distribution -- see SECURITY.md's 'The Android build now "
+            "this project's Android distribution -- see docs/THREAT_MODEL.md's 'The Android build now "
             "embeds a live hub credential in the artifact itself' section and docs/ANDROID.md's "
             "'Zero-configuration builds' section. If this file is ever exposed unintentionally, "
             "rotate the token (`amplifier-browser-bridge init --force`) and rebuild.",

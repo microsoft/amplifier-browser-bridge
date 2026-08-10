@@ -33,13 +33,13 @@ from .service import describe_service
 CheckStatus = Literal["ok", "fail", "skipped"]
 
 # A2 fix (security review finding): `doctor` never reported anything about
-# network exposure or Tailscale ACL posture, even though SECURITY.md's
+# network exposure or Tailscale ACL posture, even though docs/THREAT_MODEL.md's
 # original threat model rested entirely on "the tailnet is the boundary."
 # Tailscale's own default policy is ALLOW-ALL WITHIN THE TAILNET unless an
 # operator has hand-written a restrictive ACL -- for most users, that means
 # the "tailnet boundary" is a no-op and the per-device token is the only
 # real gate. See docs/tailscale-acl-example.json for a starting-point
-# restrictive policy, and SECURITY.md's rewritten threat-model section.
+# restrictive policy, and docs/THREAT_MODEL.md's rewritten threat-model section.
 #
 # Two forms of this fact (real-run maintainer feedback, 2026-08: this check
 # printed ~400 characters of ACL explanation at what should be a success

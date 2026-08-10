@@ -41,7 +41,7 @@ Edge browser -- on this machine, or on a completely different device, over
 your own [Tailscale](https://tailscale.com) network. It is not a sandboxed or
 disposable browser; it is the browser you actually use, with your actual
 sessions. Before installing, read
-[SECURITY.md](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/SECURITY.md)
+[docs/THREAT_MODEL.md](https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/THREAT_MODEL.md)
 in the source repository -- it explains, plainly, what protects you and what
 does not.
 
@@ -72,7 +72,7 @@ straight from GitHub -- no local clone required. On the machine that will run
 it:
 
 ```bash
-uv tool install git+https://github.com/bkrabach/amplifier-browser-bridge@main
+uv tool install git+https://github.com/microsoft/amplifier-browser-bridge@main
 amplifier-browser-bridge init
 ```
 
@@ -298,14 +298,14 @@ What to expect:
 
 Where those numbers come from -- and the parts of this that are *not*
 confirmed for Edge specifically -- is written out in
-[`docs/DEBUGGER_BANNER.md`](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/docs/DEBUGGER_BANNER.md).
+[`docs/DEBUGGER_BANNER.md`](https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/DEBUGGER_BANNER.md).
 
 ## What this extension can do (permissions)
 
 This is not a narrow, single-purpose extension -- it is a general remote-control
 surface for your browser, and its permissions reflect that honestly rather than
 minimizing it. See
-[`docs/permission-justifications.md`](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/docs/permission-justifications.md)
+[`docs/permission-justifications.md`](https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/permission-justifications.md)
 in the source repository for the full, long-form reasoning behind each one
 (`<all_urls>`, `chrome.debugger`, and the persistent connection to the hub in
 particular). In short:
@@ -385,7 +385,7 @@ hoping to put this on a phone, read this section before spending time on it:
   a separate throwaway probe extension, not with this project's code.
 
 The full runbook, including the honest list of what remains unproven, is
-[`docs/ANDROID.md`](https://github.com/bkrabach/amplifier-browser-bridge/blob/main/docs/ANDROID.md)
+[`docs/ANDROID.md`](https://github.com/microsoft/amplifier-browser-bridge/blob/main/docs/ANDROID.md)
 in the source repository.
 
 ## Trouble?
@@ -401,4 +401,4 @@ in the source repository.
 | Extension connects, then goes dark for a long time on a phone/mobile device | Battery-optimization settings are suspending the browser in the background -- see `docs/ANDROID.md` in the source repository for the exact onboarding steps this project's own testing found necessary. |
 
 For anything not covered here, file an issue at
-<https://github.com/bkrabach/amplifier-browser-bridge/issues>.
+<https://github.com/microsoft/amplifier-browser-bridge/issues>.

@@ -40,7 +40,7 @@ plus the tools plus the awareness context in one step):
 
 ```yaml
 includes:
-  - bundle: git+https://github.com/bkrabach/amplifier-browser-bridge@main
+  - bundle: git+https://github.com/microsoft/amplifier-browser-bridge@main
 ```
 
 ...or set it as your default session bundle in `~/.amplifier/settings.yaml`.

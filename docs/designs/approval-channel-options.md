@@ -119,7 +119,7 @@ in the codebase is `type: "confirm"` on the hub's `/agent` WebSocket (`hub.py:59
 That is not an approval. It is an attestation: it forces the agent to make a second, separately
 audited decision, which has real value against *accidental* action and none whatsoever against a
 prompt-injected one. Prompt injection from page content is an assumed, not hypothetical, threat
-in this project (`SECURITY.md` §"Prompt injection from page content is an assumed…").
+in this project (`docs/THREAT_MODEL.md` §"Prompt injection from page content is an assumed…").
 
 So the question is narrow and sharp: **what channel carries a human's approval, and what makes
 that channel unreachable by the model?**

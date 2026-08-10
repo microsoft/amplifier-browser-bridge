@@ -139,7 +139,7 @@ credential does not rotate.** Anyone handed the file -- including a tester, incl
 you six months from now finding it in a Downloads folder -- must be told plainly:
 **if the file leaves your control, treat it as compromised.**
 
-Read all three of these in `SECURITY.md` before building or distributing one:
+Read all three of these in `THREAT_MODEL.md` before building or distributing one:
 
 - *"The Android build now embeds a live hub credential in the artifact itself"* --
   what is in the file and why.

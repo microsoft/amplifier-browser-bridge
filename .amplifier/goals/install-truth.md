@@ -27,7 +27,7 @@ no `uv tool install`, no token file, no `~/.config/amplifier-browser-bridge/`,
 no repo checkout.
 
 T2. Inside it, the public repo is cloned anonymously
-(`https://github.com/bkrabach/amplifier-browser-bridge.git`, no credentials)
+(`https://github.com/microsoft/amplifier-browser-bridge.git`, no credentials)
 and the README's install path is executed verbatim — at minimum
 `uv tool install .`, then `init`, then starting the hub, then `doctor`. The
 real output of each command is recorded inline.

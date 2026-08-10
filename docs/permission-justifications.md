@@ -226,12 +226,12 @@ outbound connections in other extensions:
   token are entered.
 - **Whatever the hub operator's security practices are, this extension
   inherits them entirely.** If the hub runs on a poorly-secured shared
-  machine, binds wider than intended (`SECURITY.md`'s "Where the load-bearing
+  machine, binds wider than intended (`THREAT_MODEL.md`'s "Where the load-bearing
   boundary actually is"), or leaks its token, this extension has no
   independent defense against that -- it was designed to trust its
   configured hub, not to verify it.
 - **A silent, wide network exposure is possible without any code change
-  here at all** -- see `SECURITY.md`'s accounting of the hub's own bind
+  here at all** -- see `THREAT_MODEL.md`'s accounting of the hub's own bind
   address and Tailscale's default allow-all ACL policy. This extension's
   behavior (dial out, obey commands) is identical whether the hub is safely
   scoped or accidentally exposed to an entire home network; it has no way to
@@ -241,7 +241,7 @@ outbound connections in other extensions:
 persistent connection reaches infrastructure the user runs, not a vendor
 endpoint -- but the defense is conditional on the user's own hub deployment
 being sound, not something this extension can verify or enforce on its own.
-A reviewer should read this alongside `SECURITY.md`'s "Where the load-bearing
+A reviewer should read this alongside `THREAT_MODEL.md`'s "Where the load-bearing
 boundary actually is" section before accepting "you control the hub" as a
 complete answer.**
 
