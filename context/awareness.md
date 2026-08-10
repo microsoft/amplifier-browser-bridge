@@ -1,9 +1,13 @@
 # Browser Bridge: addressing, tiers, queued results
 
-25 `browser_*` tools (verified 2026-08-08 in both the native module and the
-MCP server; they differ by one tool each -- native has `browser_reload`, MCP
-has `browser_confirm`. This repo's earlier "sixteen"/"twenty-two" tool-count
-claims were stale -- see `docs/AGENT_SURFACES.md` for the corrected list.)
+27 `browser_*` tools in this native module (verified 2026-08-08 for the first 25 in both
+the native module and the MCP server; they differ by one tool each -- native has
+`browser_reload`, MCP has `browser_confirm`. This repo's earlier "sixteen"/"twenty-two"
+tool-count claims were stale -- see `docs/AGENT_SURFACES.md` for the corrected list.)
+Two of the 27, `browser_setup`/`browser_setup_status`, are native-module-only (not on
+MCP): they do first-run/re-run onboarding in-process -- token, staged extension, hub
+service, and a redeemable pairing link -- so `amplifier bundle add ... --app` is a
+complete install path with no CLI required on PATH.
 
 **Entry point, every time:** `browser_devices()` for `device_id`s and their
 tier, then `browser_tabs(device_id)` for `tab_id`s, then

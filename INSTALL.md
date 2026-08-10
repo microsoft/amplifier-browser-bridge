@@ -18,6 +18,27 @@ If you skip any of the three, nothing will work, and the failure will look
 like "the extension does nothing" rather than a clear error -- so follow the
 steps in order.
 
+## Using this with Amplifier? There's a shorter path
+
+Everything below (Steps 1-4) describes installing the hub, extension, and token
+by hand -- the right path if you're standing this up on its own, or already have
+this zip in hand from somewhere. **If you're setting this up to work with
+[Amplifier](https://github.com/microsoft/amplifier)**, one command replaces
+Step 1 and most of Step 3, with no CLI on PATH required:
+
+```bash
+amplifier bundle add git+https://github.com/microsoft/amplifier-browser-bridge@main#subdirectory=behaviors/browser-bridge.yaml --app
+```
+
+Then, in an Amplifier session, call the `browser_setup` tool -- it generates the
+token, stages this same extension, starts the hub as a background service, and
+hands back a `pair_url` link that does exactly what Step 3 below describes,
+without a terminal. `browser_setup_status` reports the same six checks as
+`amplifier-browser-bridge doctor` any time afterward. See the source repository's
+README.md, "Recommended: install via the Amplifier bundle", for the full detail.
+The rest of this document (Steps 1-4) is the manual path -- useful for
+standalone use, scripting, or if you'd simply rather do each step by hand.
+
 ## Why this install is longer than a normal extension
 
 Those three pieces are not incidental complexity -- they are the product.

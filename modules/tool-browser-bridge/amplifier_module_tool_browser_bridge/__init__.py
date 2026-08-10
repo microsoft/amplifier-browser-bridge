@@ -49,7 +49,9 @@ except ImportError as _import_exc:
     reraise_with_diagnosis(_import_exc)
 
 from amplifier_browser_bridge.auth import resolve_default_token
-from amplifier_browser_bridge.hub_location import resolve_hub_url
+from amplifier_browser_bridge.auto_setup import DEFAULT_WAIT_REACHABLE_S, run_auto_setup
+from amplifier_browser_bridge.doctor import run_doctor
+from amplifier_browser_bridge.hub_location import DEFAULT_PORT, resolve_hub_url
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 
@@ -344,6 +346,15 @@ def _build_tools() -> list[_HubTool]:
             )
         except (VisionConfigError, VisionError) as e:
             return {"ok": False, "error": str(e)}
+
+    async def setup_status_runner(_input_data: dict[str, Any]) -> dict[str, Any]:
+        checks = await run_doctor(DEFAULT_HUB_URL, DEFAULT_TOKEN)
+        return {
+            "ok": all(c.status != "fail" for c in checks),
+            "checks": [
+                {"name": c.name, "status": c.status, "message": c.message, "detail": c.detail} for c in checks
+            ],
+        }
 
     return [
         _HubTool(
@@ -798,6 +809,100 @@ def _build_tools() -> list[_HubTool]:
                 "required": ["session_id"],
             },
             narrow_scope_runner,
+        ),
+        _HubTool(
+            "browser_setup",
+            "Get from 'bundle installed' to 'my browser is connected' -- no CLI on PATH required. "
+            "Generates a hub token if one doesn't exist yet, stages the extension's runtime files, "
+            "resolves and persists the hub's host address (auto-detects this machine's Tailscale IP; "
+            "falls back to 127.0.0.1, which is loopback-only), and -- unless install_service=false -- "
+            "installs the hub as a background OS service (systemd --user on Linux, launchd on macOS) "
+            "so it survives logout and reboot. Then, if the hub is reachable, mints a short-lived "
+            "pairing code and returns ONE link (result.pairing.pair_url) that already carries it: hand "
+            "that to the person setting this up -- opening it on the browser being added downloads the "
+            "extension, walks through 'Load unpacked', and pairs itself automatically. No terminal "
+            "needed on that machine, and nothing here waits on one: unlike the interactive CLI flow "
+            "this wraps, this tool never prompts and never blocks for minutes watching for a browser "
+            "to connect -- call browser_setup_status afterward (any time) to check whether it has. If "
+            "the hub isn't reachable yet (service still starting, unsupported platform, or "
+            "install_service=false with nothing running), result.hub_reachable is false, "
+            "result.pairing is null, and result.warnings/result.service/result.manual_hub_command "
+            "explain exactly what's missing and the manual command to start the hub yourself. Safe to "
+            "call repeatedly -- an existing token is reused (never rotated) unless force_token=true, "
+            "and a previously-configured browser's saved settings are never touched. Loading the "
+            "extension into Edge (edge://extensions -> Developer mode -> Load unpacked) has no CLI/API "
+            "-- Edge simply doesn't expose one -- opening result.pairing.pair_url (or result.setup_url) "
+            "is what walks a human through exactly that one remaining manual step.",
+            {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": (
+                            "Explicit hub bind/advertise host. Default: auto-detect this machine's "
+                            "Tailscale IP; falls back to 127.0.0.1 (NOT reachable from another device) "
+                            "if Tailscale isn't detected."
+                        ),
+                    },
+                    "port": {"type": "integer", "default": DEFAULT_PORT},
+                    "install_service": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "Install/start the hub as a background OS service. Set false if a hub is "
+                            "already running some other way (already a service, started manually, "
+                            "started by someone else) -- this tool then only checks reachability "
+                            "instead of installing anything."
+                        ),
+                    },
+                    "force_token": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Regenerate the hub token even if one already exists. Rotating requires "
+                            "re-pasting the new token into any already-configured browser's options page."
+                        ),
+                    },
+                    "wait_reachable_s": {
+                        "type": "number",
+                        "default": DEFAULT_WAIT_REACHABLE_S,
+                        "description": "How long to wait for the hub to answer before giving up.",
+                    },
+                    "token_file": {
+                        "type": "string",
+                        "description": (
+                            "Advanced: override the default token file path "
+                            "(~/.config/amplifier-browser-bridge/tokens.json)."
+                        ),
+                    },
+                    "dest": {
+                        "type": "string",
+                        "description": (
+                            "Advanced: override the default staged-extension directory path "
+                            "(~/.local/share/amplifier-browser-bridge/extension)."
+                        ),
+                    },
+                },
+            },
+            lambda input_data: run_auto_setup(
+                host=input_data.get("host"),
+                port=input_data.get("port", DEFAULT_PORT),
+                token_file=input_data.get("token_file"),
+                dest=input_data.get("dest"),
+                install_service=bool(input_data.get("install_service", True)),
+                force_token=bool(input_data.get("force_token", False)),
+                wait_reachable_s=float(input_data.get("wait_reachable_s", DEFAULT_WAIT_REACHABLE_S)),
+            ),
+        ),
+        _HubTool(
+            "browser_setup_status",
+            "Diagnose exactly which link in the setup chain is broken or still pending: token store, "
+            "persisted hub location, network exposure, background-service status, hub reachability, "
+            "token match, and whether any browser device has actually connected. Same checks as "
+            "`amplifier-browser-bridge doctor`. Call this any time after browser_setup to confirm a "
+            "browser has connected, or to see exactly what's still missing if it hasn't.",
+            {"type": "object", "properties": {}},
+            setup_status_runner,
         ),
     ]
 

@@ -100,9 +100,56 @@ device-level ACLs instead of one shared string that travels.
 If that trade is not one you want to make, `browser-relay` is the honest recommendation. This
 setup is not going to get shorter, because the length *is* the property.
 
-**This is the USER install path.** `uv tool install` is what you run to use this project.
-`uv pip install -e .` (an *editable* install) is the CONTRIBUTOR path for iterating on this
-repo's own source -- see CONTRIBUTING.md's "Dev setup" if that's what you're doing instead.
+### Recommended: install via the Amplifier bundle
+
+If you're already running [Amplifier](https://github.com/microsoft/amplifier), this is the
+**complete** install path -- one command, no separate `uv tool install`, no CLI on PATH required:
+
+```bash
+amplifier bundle add git+https://github.com/microsoft/amplifier-browser-bridge@main#subdirectory=behaviors/browser-bridge.yaml --app
+```
+
+Verified 2026-08-10 against this exact repo and commit: `amplifier bundle add ... --app` ->
+`✓ Added app bundle`, and `amplifier bundle show` confirms it resolves the `tool-browser-bridge`
+module. This mounts 27 `browser_*` tools into every Amplifier session on this machine -- 25 for
+driving an already-connected browser, plus two that do the REST of onboarding in-process:
+
+- **`browser_setup`** -- generates a hub token if one doesn't exist yet, stages the extension,
+  installs the hub as a background OS service (systemd --user / launchd, so it survives logout
+  and reboot) unless you pass `install_service: false`, and -- once the hub answers -- mints a
+  short-lived pairing code. The one field that matters comes back as `result.pairing.pair_url`:
+  one link that already carries the code. Open it on the browser you're adding (any device on
+  your tailnet, not necessarily this one) and it downloads the extension, walks through "Load
+  unpacked" (the one genuinely manual step -- Edge has no CLI/API for it), and pairs itself.
+  Setup never needs the CLI on PATH: because the bundle pulls in the `tool-browser-bridge`
+  module, which depends on the `amplifier-browser-bridge` library, that library is already
+  present in Amplifier's own Python environment -- `browser_setup` runs entirely in-process.
+- **`browser_setup_status`** -- the same six checks `amplifier-browser-bridge doctor` runs
+  (token store, network exposure, service status, hub reachability, token match, whether a
+  device has connected). Call it any time after `browser_setup` to confirm pairing completed, or
+  to see exactly what's still missing if it hasn't.
+
+Unlike the interactive `init` CLI flow it wraps, `browser_setup` never prompts (a tool call
+returns exactly once, to a chat transcript, not a terminal) and never blocks for minutes waiting
+for a browser to connect -- if the hub isn't reachable yet (service still starting, an
+unsupported platform, or `install_service: false` with nothing running yet),
+`result.hub_reachable` is `false`, `result.pairing` is `null`, and `result.warnings` /
+`result.manual_hub_command` explain exactly what to do next. Safe to call again once the hub is
+up, or any time after -- an existing token is reused, never rotated, unless `force_token: true`.
+
+The CLI (`amplifier-browser-bridge`) is still installed as a dependency underneath this, and
+remains the right surface for scripting, or for running `doctor` / `devices` / `service`
+management directly from a terminal -- see "CLI / power-user path" below for that surface, and
+for how the two setup tools above map onto the same underlying `init` mechanics documented there.
+
+### CLI / power-user path
+
+Prefer a standalone CLI outside of Amplifier, or need to script this? Install it directly.
+
+**This is the USER install path.** `uv tool install` is what you run to use this project as a
+standalone CLI. `uv pip install -e .` (an *editable* install) is the CONTRIBUTOR path for
+iterating on this repo's own source -- see CONTRIBUTING.md's "Dev setup" if that's what you're
+doing instead.
 
 You need [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and Python 3.12 or
 newer. **This package is not on PyPI yet** (see "Status" above -- no packaged release), but the

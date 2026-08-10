@@ -161,8 +161,11 @@ not block, and it was not reported as an error.
 
 ## Amplifier tool module
 
-`modules/tool-browser-bridge/` wraps the same lib as 25 Amplifier tools (see
-the table above), following the `mount()` Iron Law (`creating-amplifier-modules`
+`modules/tool-browser-bridge/` wraps the same lib as 27 Amplifier tools: the 25 in the
+table above, plus `browser_setup` and `browser_setup_status` (native-module-only --
+in-process first-run/re-run setup and diagnostics, no CLI on PATH required; see
+`auto_setup.py` and the README's "Recommended: install via the Amplifier bundle").
+Every tool follows the `mount()` Iron Law (`creating-amplifier-modules`
 skill): each tool is registered via `await coordinator.mount("tools", tool, name=tool.name)`.
 
 ### Adding the bundle
