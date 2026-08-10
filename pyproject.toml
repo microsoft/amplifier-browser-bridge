@@ -44,6 +44,35 @@ dependencies = [
 # deliberate, tested upgrade -- not as a side effect of an unrelated `pip install`.
 mcp = ["mcp>=1.6,<2"]
 
+# Everything the documented quality gate needs, declared once so `uv run` syncs it
+# automatically. Before this existed, the gate was only runnable after a hand-typed
+# `uv pip install` incantation that lived in TWO places -- README.md's testing section
+# and .github/workflows/ci.yml -- which is the same two-lists drift that has already
+# shipped several broken instructions in this repo. A fresh clone running
+# `uv run pytest tests/` used to fail with 46 collection errors; it now just works.
+#
+# `amplifier-core` is here rather than in modules/tool-browser-bridge/pyproject.toml
+# because the module deliberately does not declare it (it is a PEER dependency supplied
+# by the host Amplifier install at runtime) -- but the module's tests still need it
+# importable, and this is the environment those tests run in.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    "amplifier-core",
+    "amplifier-browser-bridge[mcp]",
+    "amplifier-module-tool-browser-bridge",
+]
+
+[tool.uv.sources]
+amplifier-browser-bridge = { workspace = true }
+amplifier-module-tool-browser-bridge = { path = "modules/tool-browser-bridge", editable = true }
+
+[tool.uv.workspace]
+members = ["."]
+
 [project.scripts]
 amplifier-browser-bridge = "amplifier_browser_bridge.cli:main"
 amplifier-browser-bridge-mcp = "amplifier_browser_bridge.mcp_server:main"
