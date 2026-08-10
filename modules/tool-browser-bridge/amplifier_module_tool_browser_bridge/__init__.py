@@ -26,12 +26,32 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from amplifier_browser_bridge import HubClient, HubError, Target
+from amplifier_core import ToolResult
+
+from ._stale_install_guard import reraise_with_diagnosis
+
+# Kept as a real, static `from ... import ...` (wrapped in try/except rather than
+# replaced with a dynamic importlib lookup) so pyright still types HubClient/HubError/
+# Target as their actual classes -- used below in annotations (`-> Target:`) and an
+# `except HubError:` clause, neither of which would type-check against a generic
+# `type` returned from a helper function.
+#
+# A stale editable-install pointer (e.g. after an Amplifier cache reset, or the repo's
+# clone URL moving) leaves `amplifier_browser_bridge` resolving as an empty
+# namespace-package shadow instead of the real module; a bare import here then fails
+# with a cryptic "cannot import name 'HubClient' from 'amplifier_browser_bridge'
+# (unknown location)" that names a missing class instead of the actual dead install
+# pointer. `reraise_with_diagnosis` (see its own docstring) detects that specific shape
+# and raises `StaleEditableInstallError` naming what was actually found instead.
+try:
+    from amplifier_browser_bridge import HubClient, HubError, Target
+except ImportError as _import_exc:
+    reraise_with_diagnosis(_import_exc)
+
 from amplifier_browser_bridge.auth import resolve_default_token
 from amplifier_browser_bridge.hub_location import resolve_hub_url
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
-from amplifier_core import ToolResult
 
 logger = logging.getLogger(__name__)
 

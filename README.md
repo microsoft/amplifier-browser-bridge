@@ -36,8 +36,9 @@ What that means concretely:
 
 - **Proven end-to-end**: the wire protocol, hub dispatch and queueing, the CLI, the MCP server,
   the Amplifier tool module, and the policy engine all have passing automated tests
-  (`pytest tests/`, `pytest modules/tool-browser-bridge/tests/`) and, for the agent surfaces, a
-  documented real run against a live hub (`docs/AGENT_SURFACES.md`, "Verified end-to-end").
+  (`uv run pytest tests/`, `uv run pytest modules/tool-browser-bridge/tests/` -- see "Testing"
+  below) and, for the agent surfaces, a documented real run against a live hub
+  (`docs/AGENT_SURFACES.md`, "Verified end-to-end").
 - **Measured on real hardware, not assumed**: every load-bearing transport and platform
   constraint in the design doc -- MV3 service worker lifetime, Android Doze behavior, background
   tab screenshot support, MagicDNS reliability -- was measured against real Edge installs on
@@ -842,45 +843,38 @@ amplifier-browser-bridge-mcp   # runs over stdio, the default every MCP client s
 ## Testing
 
 ```bash
-# Run from the repo root. `uv pip install` REQUIRES an active virtualenv -- with none
-# active it refuses with "No virtual environment found" and exits non-zero, and the
-# `pytest` lines then die with "command not found". These two lines are not optional.
-uv venv
-source .venv/bin/activate
+# Run from the repo root. No venv activation, no manual install step: `pyproject.toml`'s
+# [dependency-groups] dev declares everything this needs (pytest, pytest-asyncio, ruff,
+# pyright, the `mcp` extra, amplifier-core, and this repo's own two packages), and
+# `uv run` resolves + syncs it automatically on first use. This is the exact same
+# command `.github/workflows/ci.yml` runs, so a green run here means CI is green too.
 
 # Root package -- 412 tests.
-uv pip install -e . pytest pytest-asyncio "mcp<2"
-pytest tests/
+uv run pytest tests/ -v
 
-# Amplifier tool module -- 14 tests. amplifier-core is a PEER dependency the
-# module deliberately does not declare (see its pyproject.toml), so install it here.
-uv pip install -e ./modules/tool-browser-bridge amplifier-core
-pytest modules/tool-browser-bridge/tests/
+# Amplifier tool module -- 14 tests.
+uv run pytest modules/tool-browser-bridge/tests/ -v
 ```
 
-Verified 2026-08-08 by extracting this exact block from `README.md` and running it with
-`bash`, from a fresh anonymous clone, in a container with no venv active.
+Verified 2026-08-09 by extracting this exact block from `README.md` and running it with
+`bash`, from a fresh anonymous clone, with no venv active and nothing pre-installed.
 
-Each part of that first command is load-bearing; dropping any one of them produces a
-failure that looks like a broken repo rather than a missing package:
+**Why there is no "if you omit X, you get error Y" table here anymore:** every earlier version
+of this section told a contributor to hand-type a `uv pip install <list of packages>` command
+before running `pytest` -- and that list lived in three places at once (here, `CONTRIBUTING.md`,
+and `.github/workflows/ci.yml`), each free to drift from the others. That drift already happened
+in practice: dropping `pytest-asyncio` from the hand-typed list produced **32 failed, 380
+passed**, every `async def` test failing with "async def functions are not natively supported"
+(see `.github/workflows/ci.yml` git history for where this was first caught). Declaring the
+dependency set exactly once, in `pyproject.toml`, and having every consumer (`uv run` locally,
+CI) read from that one declaration removes the hand-typed list -- and the drift -- entirely.
+There is no longer a set of packages a contributor or CI can partially install.
 
-| Omit | What actually happens |
-|---|---|
-| `pytest-asyncio` | **32 failed, 380 passed** -- every `async def` test errors with "async def functions are not natively supported" |
-| `mcp<2` | `pytest tests/` aborts during collection: `tests/test_mcp.py` -> `mcp_server.py` -> `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` |
-| `amplifier-core` | `modules/tool-browser-bridge/tests/` aborts during collection: `ModuleNotFoundError: No module named 'amplifier_core'` |
-
-**Two traps worth naming explicitly:**
-
-- **There is no `[dev]` extra.** `pyproject.toml` declares exactly one optional
-  dependency group, `mcp`. `uv pip install -e ".[dev]"` does not fail -- it prints
-  `warning: ... does not have an extra named 'dev'` and **exits 0 having installed
-  nothing**, so the next command dies with 32 collection errors.
-- **`.[mcp]` does not currently work either.** The declared floor is `mcp>=1.6`, which
-  today resolves to `mcp` 2.0.0 -- a release that removed `mcp.server.fastmcp`, the
-  exact symbol `src/amplifier_browser_bridge/mcp_server.py:35` imports. Until that
-  floor is capped in `pyproject.toml`, pass `"mcp<2"` explicitly (1.29.0 resolves and
-  passes). This affects `amplifier-browser-bridge-mcp` at runtime too, not just tests.
+**One trap still worth naming:** `dev` is a [dependency group](https://peps.python.org/pep-0735/)
+(`[dependency-groups]`), not a `[project.optional-dependencies]` extra. `uv pip install -e
+".[dev]"` does not fail loud -- it prints `warning: ... does not have an extra named 'dev'` and
+exits 0 having installed nothing. Use `uv run <command>` (as above) or `uv sync --group dev`
+(to materialize `.venv` explicitly) instead.
 
 ## Contributing
 

@@ -40,20 +40,26 @@ docs/                           design doc, protocol, policy, agent surfaces
 
 This project uses [`uv`](https://docs.astral.sh/uv/) for environment and dependency management.
 
-**This is the CONTRIBUTOR install path** -- an *editable* install that resolves imports straight
-back to this checkout, so edits to `src/amplifier_browser_bridge/` take effect immediately with
-no reinstall. If you just want to USE amplifier-browser-bridge (not develop it), see README.md's
-Quickstart instead: `uv tool install .` is the normal, non-editable user install.
+**This is the CONTRIBUTOR install path.** `pyproject.toml`'s `[dependency-groups] dev` declares
+everything the quality gate below needs -- pytest, pytest-asyncio, ruff, pyright, the `mcp` extra,
+and both of this repo's own packages (`amplifier-browser-bridge`, the root lib, and
+`amplifier-module-tool-browser-bridge`, wired together via `[tool.uv.sources]`/
+`[tool.uv.workspace]`). `uv run <command>` resolves and syncs all of it automatically -- there is
+no separate install step to remember, and nothing for it to fall out of sync with. If you just
+want to USE amplifier-browser-bridge (not develop it), see README.md's Quickstart instead:
+`uv tool install .` is the normal, non-editable user install.
+
+To materialize `.venv` explicitly (e.g. to activate it directly, or run tools without prefixing
+every command with `uv run`):
 
 ```bash
-uv pip install -e ".[dev]"   # or: uv pip install -e . pytest ruff pyright
+uv sync --group dev
 ```
 
-Optional extras:
-
-```bash
-uv pip install -e ".[mcp]"   # MCP server support (amplifier-browser-bridge-mcp)
-```
+**Note:** `dev` is a [dependency group](https://peps.python.org/pep-0735/) (`[dependency-groups]`),
+not a `[project.optional-dependencies]` extra -- `uv pip install -e ".[dev]"` does not fail loud
+here; it prints `warning: ... does not have an extra named 'dev'` and exits 0 having installed
+nothing. Use `uv run <command>` or `uv sync --group dev` as shown above instead.
 
 ### Running the hub locally
 
@@ -88,23 +94,28 @@ re-runs (which re-copy the JS/HTML/manifest files) never disturb a working confi
 ### Running tests
 
 ```bash
-pytest tests/                              # root package
-pytest modules/tool-browser-bridge/tests/  # Amplifier tool module
+uv run pytest tests/ -v                              # root package
+uv run pytest modules/tool-browser-bridge/tests/ -v   # Amplifier tool module
 ```
+
+These are the exact commands `.github/workflows/ci.yml` runs. Bare `pytest tests/` (no `uv run`)
+resolves against whatever `pytest` is first on `PATH` -- typically a global install with no
+knowledge of this project -- and fails with `ModuleNotFoundError: No module named
+'amplifier_browser_bridge'`. `uv run` is not optional decoration here; it is what makes this the
+same command as CI, so a green run locally means a green run in CI and vice versa.
 
 ### Linting and type checking
 
 ```bash
-ruff format --check .
-ruff check .
-pyright
+uv run ruff format --check .
+uv run ruff check .
+uv run pyright --venvpath . src tests
 ```
 
 All three must be clean (formatting, lint, and type checking) before a PR is considered ready.
-`pyright` needs to resolve against this repo's own virtualenv (`.venv`) -- run it from a shell
-where that venv is active, or pass `--venvpath .` explicitly; running it against an unrelated
-environment produces false `reportMissingImports` errors (see `docs/AGENT_SURFACES.md`, "Known
-pyright false positive").
+`--venvpath .` mirrors CI exactly (`.github/workflows/ci.yml`) -- pyright needs to resolve
+against this repo's own virtualenv; running it against an unrelated environment produces false
+`reportMissingImports` errors (see `docs/AGENT_SURFACES.md`, "Known pyright false positive").
 
 ### Extension JavaScript
 

@@ -26,17 +26,19 @@ jobs:
         # `uv venv` step here collides with it ("A virtual environment already exists
         # at: .venv") on every single run. Do not add one back.
 
-      - name: Install project (with mcp extra) and dev tools
-        # pytest-asyncio is required -- README.md's "Testing" section documents this
-        # exactly (Verified 2026-08-08 from a fresh clone): omitting it doesn't error,
-        # it silently produces "32 failed... async def functions are not natively
-        # supported" for every `async def` test. It has no home in pyproject.toml
-        # (no [dev] extra exists, by design -- see README's "Two traps" note), so it
-        # must be installed explicitly here, same as a contributor following
-        # CONTRIBUTING.md/README.md would.
-        run: |
-          uv pip install -e ".[mcp]"
-          uv pip install ruff pyright pytest pytest-asyncio
+      - name: Sync dev environment
+        # `pyproject.toml`'s `[dependency-groups] dev` is the single declared source for
+        # everything this gate needs: pytest, pytest-asyncio, ruff, pyright, the `mcp`
+        # extra, amplifier-core (the tool module's peer dependency), and this repo's own
+        # two packages (amplifier-browser-bridge, amplifier-module-tool-browser-bridge)
+        # wired together via [tool.uv.sources]/[tool.uv.workspace]. This is the exact
+        # same environment CONTRIBUTING.md/README.md tell a contributor to use locally
+        # (`uv run <command>` auto-syncs the same declaration) -- one list, read by both
+        # CI and the docs, instead of the hand-typed `uv pip install` package lists this
+        # step used to be split across (see git history: this job used to install here
+        # AND again in a separate step below, and README.md's Testing section carried a
+        # third copy -- three lists that could each drift independently).
+        run: uv sync --group dev
 
       - name: ruff format --check
         run: uv run ruff format --check .
@@ -53,17 +55,6 @@ jobs:
 
       - name: pytest (root package)
         run: uv run pytest tests/ -v
-
-      - name: Install tool-browser-bridge module (+ amplifier-core, its peer dependency)
-        # amplifier-core is a PEER dependency the module deliberately does not declare
-        # (see modules/tool-browser-bridge/pyproject.toml and the creating-amplifier-modules
-        # skill) -- README.md's own Testing section documents installing it explicitly for
-        # exactly this reason. Omitting it doesn't fail the install step; it fails test
-        # collection instead: "ModuleNotFoundError: No module named 'amplifier_core'"
-        # (confirmed live in this PR's own CI run). `--no-deps` would also skip it, so this
-        # installs the module normally (its one real dependency, amplifier-browser-bridge, is
-        # already satisfied by the sibling install above) plus amplifier-core alongside it.
-        run: uv pip install -e modules/tool-browser-bridge amplifier-core
 
       - name: pytest (tool-browser-bridge module)
         run: uv run pytest modules/tool-browser-bridge/tests/ -v
