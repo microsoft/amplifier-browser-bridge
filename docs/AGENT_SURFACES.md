@@ -6,21 +6,23 @@ the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
 **Hand-verified 2026-08-15 (counted directly against the code, not assumed):**
-the native Amplifier tool module registers **29** tools; the MCP server
-registers **27**. They are not byte-identical sets -- the native module has
+the native Amplifier tool module registers **30** tools; the MCP server
+registers **28**. They are not byte-identical sets -- the native module has
 three the MCP server does not (`browser_reload`, `browser_setup`,
 `browser_setup_status`), and the MCP server has one the native module does
 not (`browser_confirm`). Every other name below is shared by both, named
 `browser_<command>` (mirroring Playwright MCP's vocabulary, design doc
-section 9), including `browser_archive` (D2, browser-state archive) and the
-new `browser_update_extension` (the version-skew story -- see "Extension
-update (Tier 0/1/2)" below). A prior revision of this doc claimed "26 and
-26" -- that count was already stale before this update (it predated
-`browser_setup`/`browser_setup_status` being added to the native module) as
-well as missing this change's own addition; both numbers here were
-re-counted directly from `amplifier_module_tool_browser_bridge/__init__.py`'s
-`_build_tools()` and `mcp_server.py`'s `@mcp.tool()` decorators, the
-authoritative, current lists, not carried forward from the prior claim.
+section 9), including `browser_archive` (D2, browser-state archive),
+`browser_archive_convert` (the new MHTML-to-markdown conversion step -- see
+"Browser-state archive: MHTML -> markdown conversion" below), and
+`browser_update_extension` (the version-skew story -- see "Extension
+update (Tier 0/1/2)" below). A prior revision of this doc claimed "29 and
+27" -- that count was already stale before this update (it predated
+`browser_archive_convert` being added to both surfaces); both numbers here
+were re-counted directly from
+`amplifier_module_tool_browser_bridge/__init__.py`'s `_build_tools()` and
+`mcp_server.py`'s `@mcp.tool()` decorators, the authoritative, current lists,
+not carried forward from the prior claim.
 
 | Tool | Command | Notes | Surface |
 |---|---|---|---|
@@ -51,6 +53,7 @@ authoritative, current lists, not carried forward from the prior claim.
 | `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) | **native module only** |
 | `browser_confirm` | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
 | `browser_archive` | (composed: `windows`/`tabs`/`page_state`/`mhtml`/`nav_history`/profile-data commands) | D2, browser-state archive -- capture browser state at a chosen depth (L0-L5), write payloads to disk, return a MANIFEST (never the payload) -- see "Browser-state archive" below | both |
+| `browser_archive_convert` | (no wire command -- pure local conversion over an existing archive on disk) | Convert a `browser_archive` output's captured MHTML pages into markdown, AFTER THE FACT -- see "Browser-state archive: MHTML -> markdown conversion" below | both |
 | `browser_update_extension` | (composed: restage + `reload` + polled `list_devices`) | verify-or-guide extension update -- see "Extension update (Tier 0/1/2)" below | both |
 | `browser_setup` | (native, in-process `init` equivalent) | first-run/re-run setup, no CLI on PATH required | **native module only** |
 | `browser_setup_status` | (native, in-process `doctor` equivalent) | diagnose the setup chain | **native module only** |
@@ -274,6 +277,65 @@ it (a vanished tab was never actually attempted), and `manifest["status"]` becom
 `"ok_with_skips"` -- the same bucket `"skipped"` tabs use, since both are benign,
 non-failure gaps. The top-level `manifest["requested_tab_ids_not_found"]` list is a
 convenience summary of the same ids.
+
+## Browser-state archive: MHTML -> markdown conversion
+
+`browser_archive_convert` is the ONE agent-facing tool for converting an existing
+`browser_archive` output's captured MHTML pages into markdown, AFTER THE FACT
+(`mhtml_convert.py`, `archive_convert.py`'s `run_archive_convert`). It does no
+browser interaction at all -- pure local CPU work over `.mhtml` files a prior
+`browser_archive` call (at depth L4 or deeper) already wrote to disk. This is a
+distinct, later, OPT-IN step: it never runs automatically as part of
+`browser_archive`, mirroring the mechanism/policy split `browser_vision_read`
+already establishes for calling an external vision model.
+
+**Why MHTML, not `outer_html`**: measured live, on the same real tabs, the
+JS-injection capture route (`read`/`page_state`) failed on 7 of 7 real tabs
+(including a browser error page it could not touch at all), timing out at both
+90s and 120s budgets; the CDP-based route (`mhtml`/`screenshot`/`nav_history`)
+succeeded 3 of 3 on those same tabs. MHTML is the only reliably obtainable
+full-page capture in this system, so it is the only conversion source.
+
+**Two outputs, never one**: every converted tab gets BOTH `page.extracted.md`
+(trafilatura's main-content extraction -- scores F1 0.924 on trafilatura's own
+published benchmark, vs. 0.667 for a raw-HTML do-nothing baseline) and
+`page.full_page.md` (a deliberately unfiltered whole-page conversion via
+html2text). Main-content extraction quality swings 0.42-0.93 by page type
+(WCXB benchmark), and 47% of real pages are non-articles where an extractor can
+silently delete the content a caller wanted -- the full-page output makes a bad
+extraction recoverable rather than lossy.
+
+**Assets are content-addressed sidecars, never inlined**: every non-HTML MIME
+part (images/CSS/fonts) is written to a SHARED `archive_dir/assets/` directory,
+named `<sha256-of-bytes><ext>` -- shared across every tab converted into the
+same archive, so identical assets (a shared logo/icon/font) dedupe rather than
+duplicating per page. The HTML's own `Content-Location`/`cid:` asset references
+are rewritten to the sidecar's relative path BEFORE conversion.
+
+**Known limitations, never silently mangled**: a table with merged cells
+(`colspan`/`rowspan`) cannot be expressed as a markdown pipe table -- a FORMAT
+limitation, not a tooling gap. Affected tables are named explicitly in
+`result["tabs"][tab_id]["tables_with_merged_cells"]` (table index + a short text
+preview) rather than silently producing wrong-looking output with no
+explanation. A page containing more than one `text/html` body (an
+`<iframe>`-heavy page captured as separate frame documents) is the documented
+hard case this converter does not attempt to merge -- that tab's entry reports
+`{"status": "failed", "error": ...}` naming every frame found, rather than
+silently converting only the first frame as if it were the whole page.
+
+**Not-captured accounting mirrors `browser_archive`'s own fix**: a `tab_ids` id
+with no `page.mhtml` on disk (archived below L4, or a typo) gets a
+`{"status": "not_captured", ...}` entry -- counted in
+`summary["tabs_not_captured"]`, moving `manifest["status"]` to `"ok_with_skips"`
+-- rather than silently absent from `manifest["tabs"]`, the same discipline
+`browser_archive`'s own `"not_found"` per-tab state applies to a vanished
+`tab_id`.
+
+**Manifest, never the payload**: like `browser_archive`, this returns only
+paths, byte counts, per-tab status, and warnings -- never the markdown text
+itself. A converted page can be many KB of markdown; returning it as this
+tool's return value would recreate the exact context-truncation failure
+`browser_archive` itself exists to avoid.
 
 ## Extension update (Tier 0/1/2)
 

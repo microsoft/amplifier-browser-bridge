@@ -1422,6 +1422,59 @@ actually attempted), and `manifest["status"]` becomes `"ok_with_skips"`, the sam
 `"skipped"` tabs use since both are benign, non-failure gaps. The top-level
 `manifest["requested_tab_ids_not_found"]` list remains a convenience summary of the same ids.
 
+## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
+
+Like the archive capability itself, converting a captured page's MHTML into markdown --
+`amplifier_browser_bridge.mhtml_convert.convert_mhtml`, composed by `archive_convert.run_archive_convert`
+-- is not a wire command; it does no browser interaction at all, and runs entirely against
+`.mhtml` files a prior `run_archive` (at depth L4+) already wrote to disk. It is exposed as
+exactly one agent-facing tool, `browser_archive_convert` (`docs/AGENT_SURFACES.md`'s "Browser-state
+archive: MHTML -> markdown conversion" section), invoked as a distinct, later, OPT-IN step -- never
+automatically as part of `run_archive`/`browser_archive` itself, the same mechanism/policy split
+`vision_read`/`vision.py` establish for the vision-extraction feature.
+
+**Why MHTML, not `outer_html`**: measured live, on the same real tabs, the JS-injection capture
+route (`read`/`page_state` -> `outer_html`) failed on 7 of 7 real tabs -- including a browser
+error page it could not touch at all -- timing out at both 90s and 120s budgets; the CDP-based
+route (`mhtml`/`screenshot`/`nav_history`) succeeded 3 of 3 on those same tabs. Published
+extraction-research benchmarks recommend converting from live-rendered `outer_html`, not a saved
+MHTML snapshot -- but every one of those benchmarks measured server-rendered HTML, not a
+post-hydration DOM fetched over a websocket from a remote browser (a configuration nobody has
+benchmarked), and in THIS system `outer_html` is not reliably obtainable at all. MHTML is the
+only full-page capture this converter can depend on.
+
+`convert_mhtml` parses the MHTML document as ordinary MIME (Python's own `email` module -- MHTML
+is RFC 2557 multipart/related, no custom parser needed) and produces, for each archived tab, TWO
+markdown files: `page.extracted.md` (trafilatura's main-content extraction -- its own published
+benchmark scores F1 0.924 against a raw-HTML do-nothing baseline of 0.667, and it emits markdown
+directly, so this is an extract-then-convert pipeline, not convert-then-clean) and
+`page.full_page.md` (a deliberately unfiltered whole-page conversion via html2text, so a bad
+extraction -- main-content quality swings 0.42-0.93 by page type per the WCXB benchmark, and 47%
+of real pages are non-articles -- is recoverable rather than lossy). Every non-HTML MIME part
+(images/CSS/fonts) is written as a content-addressed sidecar (`<sha256-of-bytes><ext>`) under a
+SHARED `archive_dir/assets/` directory -- shared across every tab converted into the same
+archive, so identical assets dedupe -- and the HTML's own `Content-Location`/`cid:` asset
+references are rewritten to the sidecar's relative path BEFORE conversion, never base64-inlined.
+
+A table with merged cells (`colspan`/`rowspan`) cannot be expressed as a markdown pipe table -- a
+FORMAT limitation, not a tooling gap this converter tries to work around. Affected tables are
+named explicitly in the result's `tables_with_merged_cells` list (table index + a short text
+preview) rather than silently producing wrong-looking output. A page containing more than one
+`text/html` body (an `<iframe>`-heavy page captured as separate frame documents) is the documented
+hard case this converter does not attempt to merge -- `convert_mhtml` raises `ConversionError`
+naming every frame's `Content-Location` rather than silently converting only the first body as if
+it were the whole page; `run_archive_convert` catches this per tab (recorded as that tab's
+`{"status": "failed", "error": ...}`) so one unconvertible tab does not abort the whole archive's
+conversion run, mirroring `run_archive`'s own no-abort-on-one-bad-tab behavior.
+
+Like `browser_archive`, `browser_archive_convert` returns only a MANIFEST -- paths, byte counts,
+per-tab status, warnings -- never the markdown text itself, written to
+`archive_dir/conversion_manifest.json` as well as returned. A `tab_ids` id with no `page.mhtml` on
+disk gets a `{"status": "not_captured", ...}` entry (counted in `summary["tabs_not_captured"]`,
+moving `manifest["status"]` to `"ok_with_skips"`) rather than being silently absent from
+`manifest["tabs"]` -- the same discipline `run_archive`'s own `"not_found"` per-tab state applies
+to a vanished `tab_id` (see above).
+
 ## The three-tier connectivity model
 
 | Tier | Meaning | Agent-visible behavior |

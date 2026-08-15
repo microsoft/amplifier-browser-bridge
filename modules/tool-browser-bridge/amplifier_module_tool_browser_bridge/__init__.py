@@ -50,6 +50,8 @@ except ImportError as _import_exc:
 
 from amplifier_browser_bridge.archive import DEFAULT_DEPTH, ArchiveError
 from amplifier_browser_bridge.archive import run_archive as _run_archive
+from amplifier_browser_bridge.archive_convert import ConversionError
+from amplifier_browser_bridge.archive_convert import run_archive_convert as _run_archive_convert
 from amplifier_browser_bridge.auth import resolve_default_token
 from amplifier_browser_bridge.auto_setup import DEFAULT_WAIT_REACHABLE_S, run_auto_setup
 from amplifier_browser_bridge.doctor import run_doctor
@@ -394,6 +396,15 @@ def _build_tools() -> list[_HubTool]:
                 timeout_s=input_data.get("timeout_s"),
             )
         except ArchiveError as e:
+            return {"ok": False, "error": str(e)}
+
+    async def archive_convert_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return _run_archive_convert(
+                input_data["archive_dir"],
+                tab_ids=input_data.get("tab_ids"),
+            )
+        except ConversionError as e:
             return {"ok": False, "error": str(e)}
 
     return [
@@ -1095,6 +1106,53 @@ def _build_tools() -> list[_HubTool]:
                 "required": ["device_id", "dest_dir"],
             },
             archive_runner,
+        ),
+        _HubTool(
+            "browser_archive_convert",
+            "Convert an existing browser_archive output's captured MHTML pages into markdown, AFTER "
+            "THE FACT, from what is already on disk. archive_dir is the same directory browser_archive's "
+            "own manifest reported (manifest['archive_dir']), not an individual tab directory. This is a "
+            "distinct, later, OPT-IN step: it never runs automatically as part of browser_archive itself, "
+            "and does no browser interaction at all -- pure local CPU work over MHTML files already "
+            "captured.\n\n"
+            "For each tab with a page.mhtml on disk (written by browser_archive at depth L4 or deeper), "
+            "this writes TWO markdown files -- page.extracted.md (trafilatura's best-effort main-content "
+            "extraction) and page.full_page.md (a deliberately unfiltered whole-page conversion, so a bad "
+            "extraction is recoverable rather than lossy) -- plus content-addressed asset sidecars "
+            "(images/CSS/fonts) under a SHARED archive_dir/assets/ directory, so identical assets across "
+            "pages (a shared logo/icon/font) dedupe rather than being duplicated per tab.\n\n"
+            "Like browser_archive, this returns only a MANIFEST -- paths, byte counts, per-tab status, "
+            "warnings -- NEVER the markdown text itself; a converted page can be many KB of markdown, and "
+            "returning it as this tool's return value would recreate the exact context-truncation failure "
+            "browser_archive itself exists to avoid.\n\n"
+            "tab_ids, if given, restricts conversion to that subset -- a requested id with no page.mhtml "
+            "on disk (never captured at MHTML depth, or a typo) gets a {'status': 'not_captured', ...} "
+            "entry rather than being silently dropped, mirroring browser_archive's own 'not_found' "
+            "per-tab state. If omitted, every tab directory under archive_dir/tabs/ with a page.mhtml is "
+            "converted.\n\n"
+            "A table with merged cells (colspan/rowspan) cannot be represented as a markdown pipe table "
+            "-- a format limitation, not a tooling gap. Affected tables are named explicitly in each tab's "
+            "result['tabs'][tab_id]['tables_with_merged_cells'] list rather than silently mangled with no "
+            "trace. A page containing more than one text/html body (an iframe-heavy page captured as "
+            "separate frame documents) is the documented hard case this converter does not attempt to "
+            "merge -- that tab's entry reports {'status': 'failed', 'error': ...} naming every frame "
+            "found, rather than silently converting only the first frame as if it were the whole page.",
+            {
+                "type": "object",
+                "properties": {
+                    "archive_dir": {
+                        "type": "string",
+                        "description": "The archive directory browser_archive's manifest reported.",
+                    },
+                    "tab_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Restrict conversion to this subset. Omit to convert every captured tab.",
+                    },
+                },
+                "required": ["archive_dir"],
+            },
+            archive_convert_runner,
         ),
         _HubTool(
             "browser_update_extension",

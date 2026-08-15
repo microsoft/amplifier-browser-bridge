@@ -75,6 +75,7 @@ def test_all_expected_tools_are_registered():
         "browser_download",
         "browser_wait_download",
         "browser_archive",
+        "browser_archive_convert",
         "browser_update_extension",
     }
     registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
@@ -538,3 +539,49 @@ async def test_browser_archive_hub_error_surfaces_as_ok_false(monkeypatch: pytes
     result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path))
 
     assert result == {"ok": False, "error": "unauthorized"}
+
+
+# ---------------------------------------------------------------------------
+# browser_archive_convert -- proves this surface actually routes through
+# archive_convert.py's run_archive_convert (not just fetches). See
+# tests/test_archive_convert.py and tests/test_mhtml_convert.py for the
+# conversion pipeline's own logic -- this file only proves the MCP adapter
+# wiring, including that the manifest never contains markdown BODY text.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_routes_through_run_archive_convert(tmp_path):
+    archive_dir = tmp_path / "archive_d1_20260815T000000Z"
+    tab_dir = archive_dir / "tabs" / "101"
+    tab_dir.mkdir(parents=True)
+    (tab_dir / "page.mhtml").write_bytes(
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/related; boundary="X"\r\n\r\n'
+        b"--X\r\nContent-Type: text/html\r\nContent-Location: https://example.com/\r\n\r\n"
+        b"<html><body><article><p>Some real synthetic article text for this test.</p>"
+        b"</article></body></html>\r\n--X--\r\n"
+    )
+
+    result = await srv.browser_archive_convert(archive_dir=str(archive_dir))
+
+    assert result["ok"] is True
+    manifest = result["result"]
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    extracted_path = manifest["tabs"]["101"]["extracted_markdown"]["path"]
+    assert tmp_path.__class__(extracted_path).is_file()
+    # Load-bearing: the manifest itself must never carry the converted markdown
+    # TEXT -- only paths/counts, same contract as browser_archive's own manifest.
+    serialized = str(manifest)
+    assert "Some real synthetic article text for this test" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_bad_archive_dir_surfaces_as_ok_false(tmp_path):
+    not_an_archive = tmp_path / "not_an_archive"
+    not_an_archive.mkdir()
+
+    result = await srv.browser_archive_convert(archive_dir=str(not_an_archive))
+
+    assert result["ok"] is False
+    assert "tabs/" in result["error"]

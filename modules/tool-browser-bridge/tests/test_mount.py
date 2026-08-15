@@ -117,6 +117,7 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_establish_session",
         "browser_narrow_scope",
         "browser_archive",
+        "browser_archive_convert",
         "browser_setup",
         "browser_setup_status",
         "browser_update_extension",
@@ -380,6 +381,46 @@ async def test_browser_archive_impossible_depth_returns_ok_false_not_adapter_fai
     assert isinstance(output, dict)
     assert output["ok"] is False
     assert "debugger" in output["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_routes_through_run_archive_convert(tmp_path):
+    archive_dir = tmp_path / "archive_d1_20260815T000000Z"
+    tab_dir = archive_dir / "tabs" / "101"
+    tab_dir.mkdir(parents=True)
+    (tab_dir / "page.mhtml").write_bytes(
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/related; boundary="X"\r\n\r\n'
+        b"--X\r\nContent-Type: text/html\r\nContent-Location: https://example.com/\r\n\r\n"
+        b"<html><body><article><p>Some real synthetic article text for this test.</p>"
+        b"</article></body></html>\r\n--X--\r\n"
+    )
+
+    tool = _tool_by_name("browser_archive_convert")
+    result = await tool.execute({"archive_dir": str(archive_dir)})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    assert output["result"]["tabs"]["101"]["status"] == "ok"
+    # Load-bearing: never markdown BODY text through the tool surface.
+    assert "Some real synthetic article text for this test" not in str(output)
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_bad_archive_dir_returns_ok_false_not_adapter_failure(tmp_path):
+    not_an_archive = tmp_path / "not_an_archive"
+    not_an_archive.mkdir()
+
+    tool = _tool_by_name("browser_archive_convert")
+    result = await tool.execute({"archive_dir": str(not_an_archive)})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is False
+    assert "tabs/" in output["error"]
 
 
 @pytest.mark.asyncio
