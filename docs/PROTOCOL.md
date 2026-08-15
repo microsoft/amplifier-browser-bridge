@@ -74,6 +74,8 @@ Sent once, immediately after the WebSocket opens. Establishes device identity an
     "cookies": true
   },
   "protocol_version": 1,
+  "commands": ["snapshot", "click", "type", "...", "reload"],
+  "manifest_version": "0.5.0",
   "token": "shared secret, validated against the hub's TokenStore"
 }
 ```
@@ -93,6 +95,55 @@ device where the API throws.
 **`capture_visible_tab`/`scripting` can under-report `false` here** if no real tab existed yet
 at connect time (a fresh browser launch can have zero tabs). See `capabilities_update` below for
 the correction path -- don't treat a `false` here as final if the device has only just connected.
+
+**`commands` and `manifest_version` (Tier 0 handshake -- the version-skew story).** Before this
+existed, there was zero version awareness of the extension anywhere -- `protocol_version` was a
+hardcoded constant nothing ever compared against anything, and version strings were hand-
+maintained and had already drifted (`pyproject.toml` said `0.1.0`, `manifest.json` said `0.4.0`,
+same repo, same day, no CI). `commands` fixes this by making the extension self-describe *what
+it can actually do*, rather than a version number that can lie or decay: it is the literal,
+current contents of `extension/background.js`'s `SUPPORTED_COMMANDS` set -- mirrored by hand
+from this file's own `COMMANDS`, guarded against drift by
+`tests/test_extension_command_parity.py`, the same discipline already applied to
+`PAGE_WORLD_COMMANDS`.
+
+The hub (`skew.py`) diffs a device's self-reported `commands` against its own `COMMANDS`
+**bidirectionally**: `device_behind` (the extension is missing commands the hub knows -- the
+common case, an unupdated install) and `hub_behind` (the device reports commands the hub
+doesn't recognize -- the hub itself is older than the extension) are reported separately,
+because they need different fixes. A device that omits `commands` entirely -- every extension
+shipped before this feature, including whatever is connected to a hub the moment it's upgraded
+-- is not treated as "supports nothing"; it is a distinct, definitively-stale state
+(`SkewReport.known = False`), surfaced in every `devices`/`browser_devices` listing (see
+"Reporting command-set skew to an agent" below) so an agent can see staleness *before* ever
+failing a command. See `update_extension.py`'s module docstring for how the
+`browser_update_extension` tool uses this to verify-or-guide an update.
+
+`manifest_version` (`chrome.runtime.getManifest().version`) travels alongside `commands` purely
+as **diagnostic color** -- useful for a human glancing at a `devices` listing -- and is **never**
+consulted for skew detection; only the self-reported command set is authoritative, for exactly
+the reason above (it cannot drift the way a version string already has).
+
+A command the hub's own `COMMANDS` recognizes but a device has **positively** reported it
+doesn't support (`known=True`, command absent from `commands`) now fails **fast, at the hub**,
+before ever reaching the device:
+
+```json
+{
+  "ok": false,
+  "error": "'some_new_command' is not in this device's reported command set -- the EXTENSION is behind this hub. Update the extension (browser_update_extension tool, or see INSTALL.md's \"Updating\" section), then retry.",
+  "reason_code": "device_command_unsupported"
+}
+```
+
+This replaces the previous, useless failure mode: dispatching the command anyway and letting
+`background.js`'s own if-chain fall through to a bare `{"ok": false, "error": "unsupported
+command: X"}` with no hint the extension was stale. **Deliberately, this fast-fail does NOT
+apply when a device's command set is unknown** (`known=False`, every currently-connected
+pre-Tier-0 extension the moment this ships) -- see `skew.py`'s module docstring for why: it
+would also block `reload` itself for every one of those devices, breaking the very mechanism
+the automatic-update path depends on. An unknown-command-set device dispatches exactly as
+before this feature existed.
 
 ### `capabilities_update` (ext -> hub)
 
@@ -219,7 +270,15 @@ Response:
       "platform": "MacIntel",
       "capabilities": {"...": "..."},
       "protocol_version": 1,
+      "commands": ["snapshot", "click", "...", "reload"],
+      "manifest_version": "0.5.0",
+      "skew": {
+        "known": true, "in_sync": false,
+        "device_behind": ["a_new_command"], "hub_behind": [],
+        "summary": "the EXTENSION is behind this hub -- missing ['a_new_command']; update the extension (browser_update_extension)"
+      },
       "connected": true,
+      "connected_at": "2026-07-25T18:03:11.480+00:00",
       "tier": "live",
       "last_seen": "2026-07-25T18:03:11.482+00:00",
       "queue_length": 0
@@ -227,6 +286,21 @@ Response:
   ]
 }
 ```
+
+### Reporting command-set skew to an agent (Tier 0 handshake)
+
+Every `devices`/`browser_devices` entry above carries `commands` (the device's raw
+self-reported set, or `null` if it has never reported one -- see the `hello` section's
+"`commands` and `manifest_version`"), `manifest_version` (diagnostic only), `connected_at`
+(the moment THIS connection was established -- distinct from `last_seen`, which a mere
+heartbeat on an already-live connection also bumps), and `skew` (`skew.py`'s
+`SkewReport.to_summary()`) -- the hub's own comparison of that device against its current
+`COMMANDS`. `skew.known = false` means the device has never reported a command set at all: a
+definitively stale extension, not a crash and not "unknown." `skew.summary` is `null` only when
+`in_sync` is `true`; otherwise it is a one-line, human-readable message naming exactly which
+side is behind and what to do about it. This is deliberately surfaced in the device listing
+itself -- an agent (or a human running `amplifier-browser-bridge devices`) can see staleness
+*before* ever failing a command against it, not only after.
 
 ### `command` (agent -> hub) / `result` (hub -> agent)
 

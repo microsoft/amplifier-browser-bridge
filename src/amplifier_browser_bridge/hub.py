@@ -82,6 +82,8 @@ from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .scope import SCOPE_FIELDS, ScopeError, SessionScope
 from .setup import ExtensionSourceNotFoundError
 from .setup import generate_token as generate_device_token
+from .skew import capability_error as _skew_capability_error
+from .skew import compute_skew as _skew_compute
 from .tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
@@ -1391,6 +1393,20 @@ class Hub:
         if record is None:
             return {"ok": False, "error": f"unknown device: {target.device_id!r}"}
 
+        # Tier 0 handshake fast-fail (skew.py): refuse a command this device
+        # has POSITIVELY reported it cannot execute, before it is ever
+        # dispatched -- instead of letting `background.js`'s own if-chain
+        # fall through to a bare "unsupported command: X" with no hint the
+        # extension is stale (the common, useless case this feature exists
+        # to fix). Deliberately a no-op (returns `None`) when the device's
+        # command set isn't known yet (pre-Tier-0 extension) -- see
+        # skew.py's module docstring for why blocking dispatch on unknown
+        # commands would also block `reload` itself for every
+        # currently-connected browser the moment this ships.
+        skew_error = _skew_capability_error(command, record.commands)
+        if skew_error is not None:
+            return skew_error
+
         cmd = QueuedCommand(
             id=new_id(),
             target=target,
@@ -1908,4 +1924,16 @@ class Hub:
         summaries = self.registry.snapshot()
         for summary in summaries:
             summary["cdp"] = self.cdp.snapshot(summary["device_id"])
+            # Tier 0 handshake (skew.py): compare THIS device's self-reported
+            # `commands` against the hub's own vocabulary (`COMMANDS`) and
+            # attach the result -- surfaced in every `devices`/
+            # `browser_devices` listing so an agent (or `update_extension.py`,
+            # over the same wire response) can see a stale device BEFORE
+            # ever failing a command against it. Comparison lives here, not
+            # on `DeviceRecord`, for the same reason `cdp` is enriched here:
+            # both compare a device against HUB-owned state (registry.py's
+            # module docstring pattern).
+            raw_commands = summary["commands"]
+            device_commands = frozenset(raw_commands) if raw_commands is not None else None
+            summary["skew"] = _skew_compute(device_commands, COMMANDS).to_summary()
         return summaries

@@ -691,6 +691,21 @@ function sendHello() {
     platform: navigator.platform || "unknown",
     capabilities,
     protocol_version: PROTOCOL_VERSION,
+    // Tier 0 handshake (version-skew story): the actual, current set of
+    // commands this build can execute -- see SUPPORTED_COMMANDS above. This
+    // is what the hub diffs against its OWN command vocabulary
+    // (protocol.py's COMMANDS, via skew.py) to detect version skew in either
+    // direction, instead of trusting a hand-maintained version string that's
+    // already measured to drift. An extension too old to know about this
+    // field simply omits it -- the hub treats a missing `commands` as
+    // "capability set not yet known" (registry.py's DeviceRecord.commands is
+    // `None`), not as "supports nothing."
+    commands: Array.from(SUPPORTED_COMMANDS),
+    // Diagnostic color ONLY -- see docs/PROTOCOL.md's "hello" section and
+    // skew.py's module docstring for why this is never itself the
+    // authoritative skew signal (manifest.json's version is hand-maintained
+    // and has already been observed to drift from pyproject.toml's).
+    manifest_version: chrome.runtime.getManifest().version,
     token: hubToken,
   });
 }
@@ -786,6 +801,55 @@ async function onMessage(raw) {
     send({ v: PROTOCOL_VERSION, id: msg.id, type: "result", device_id: deviceId, ...result });
   }
 }
+
+// Tier 0 handshake (version-skew story): every command this BUILD actually
+// implements, self-reported in `hello.commands` -- see sendHello() below and
+// docs/PROTOCOL.md's "hello" section. This is the mechanism that replaces
+// hand-maintained version strings (pyproject.toml said 0.1.0, manifest.json
+// said 0.4.0, same repo, same day -- version strings drift and nobody
+// notices) with something that CANNOT lie or decay: the literal set of
+// commands executeCommand() below can dispatch. Mirrors protocol.py's
+// COMMANDS by hand, same "keep the two protocol implementations in sync by
+// hand" convention as PAGE_WORLD_COMMANDS above (CONTRIBUTING.md) --
+// tests/test_extension_command_parity.py guards against drift the same way
+// it already does for PAGE_WORLD_COMMANDS.
+const SUPPORTED_COMMANDS = new Set([
+  "snapshot",
+  "click",
+  "type",
+  "key",
+  "scroll",
+  "navigate",
+  "back",
+  "forward",
+  "read",
+  "describe",
+  "tabs",
+  "tab_open",
+  "tab_close",
+  "tab_activate",
+  "screenshot",
+  "wait_for",
+  "wait_text",
+  "attach",
+  "detach",
+  "reload",
+  "fetch_bytes",
+  "grab_image",
+  "downloads_list",
+  "download",
+  "wait_download",
+  "windows",
+  "page_state",
+  "mhtml",
+  "nav_history",
+  "history_list",
+  "bookmarks_list",
+  "sessions_list",
+  "top_sites",
+  "reading_list",
+  "cookies_list",
+]);
 
 const PAGE_WORLD_COMMANDS = new Set([
   "snapshot",
