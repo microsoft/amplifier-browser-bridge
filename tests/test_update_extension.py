@@ -37,19 +37,37 @@ def _device(
     connected: bool = True,
     connected_at: str = "2026-08-15T00:00:00+00:00",
     in_sync: bool = False,
+    build_stamp: str | None = "UNSET",  # type: ignore[assignment]
+    build_current: bool | None = None,
 ) -> dict[str, Any]:
     if commands == "UNSET":
         commands = ["snapshot", "click"] if not in_sync else ["snapshot", "click", "reload"]
+    # Defaults keep every PRE-EXISTING test (written before the build-stamp axis
+    # existed) passing unchanged: unless a test explicitly says otherwise, the
+    # build axis moves in lockstep with the command axis. Tests that need to
+    # prove the two axes are checked INDEPENDENTLY pass `build_current`
+    # explicitly (see the "command-complete but stale build" tests below).
+    if build_current is None:
+        build_current = in_sync
+    if build_stamp == "UNSET":
+        build_stamp = "current-stamp" if build_current else "stale-stamp"
     return {
         "device_id": _DEVICE_ID,
         "label": "edge-macos",
         "platform": "MacIntel",
         "commands": commands,
         "manifest_version": "0.5.0",
+        "build_stamp": build_stamp,
         "connected": connected,
         "tier": tier,
         "connected_at": connected_at,
         "skew": {"known": commands is not None, "in_sync": in_sync, "device_behind": [], "hub_behind": []},
+        "build_freshness": {
+            "known": build_stamp is not None,
+            "current": build_current,
+            "device_stamp": build_stamp,
+            "hub_stamp": "current-stamp",
+        },
     }
 
 
@@ -112,8 +130,8 @@ def test_unknown_device_id_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_already_current_is_a_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Non-negotiable: if already current, do nothing and say so -- no
-    restage, no reload, no churn."""
+    """Non-negotiable: if already current on BOTH axes, do nothing and say
+    so -- no restage, no reload, no churn."""
     _assert_stage_extension_never_called(monkeypatch)
     before = _device(in_sync=True)
     client = _FakeClient(devices_sequence=[[before]])
@@ -122,7 +140,112 @@ def test_already_current_is_a_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert result["ok"] is True
     assert result["already_current"] is True
     assert result["updated"] is False
+    assert result["build_stamp"] == "current-stamp"
     assert client.commands_sent == []  # no reload sent
+
+
+def test_command_complete_but_stale_build_is_not_reported_already_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact gap proven live against a real browser: a device that is
+    command-complete (skew.in_sync) but running a stale build (a bug/UI/
+    security fix that touched zero commands -- e.g. this repo's own commits
+    6175ce4/cc140c5) must NOT be reported `already_current`. A non-live tier
+    isolates the property under test: if the already-current shortcut had
+    (incorrectly) fired, this would return `ok: true` instead of the
+    `device_not_live` failure below -- it must not have fired."""
+    _assert_stage_extension_never_called(monkeypatch)
+    before = _device(tier="intermittent", connected=False, in_sync=True, build_current=False)
+    client = _FakeClient(devices_sequence=[[before]])
+
+    result = _run(client, _DEVICE_ID)
+    assert result["ok"] is False
+    assert result["reason"] == "device_not_live"
+    assert "already_current" not in result
+
+
+def test_command_incomplete_but_current_build_is_not_reported_already_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction of the same requirement: a device running the
+    hub's exact current build but still missing a command (skew.in_sync is
+    False) must also not be reported already_current."""
+    _assert_stage_extension_never_called(monkeypatch)
+    before = _device(tier="intermittent", connected=False, in_sync=False, build_current=True)
+    client = _FakeClient(devices_sequence=[[before]])
+
+    result = _run(client, _DEVICE_ID)
+    assert result["ok"] is False
+    assert result["reason"] == "device_not_live"
+    assert "already_current" not in result
+
+
+def test_reload_then_verify_success_via_build_stamp_only_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exact incident this closes: a bug/UI fix that adds/removes zero
+    commands must still be detected as a genuine, verified update via the
+    build stamp changing -- the command set is IDENTICAL before and after."""
+    _fake_stage_extension(monkeypatch, staged_dir=tmp_path)
+    before = _device(
+        commands=["snapshot", "click", "reload"],
+        connected_at="2026-08-15T00:00:00+00:00",
+        in_sync=True,
+        build_stamp="stale-stamp",
+        build_current=False,
+    )
+    after = _device(
+        commands=["snapshot", "click", "reload"],  # UNCHANGED
+        connected_at="2026-08-15T00:00:05+00:00",  # NEW connection
+        in_sync=True,
+        build_stamp="fresh-stamp",  # CHANGED -- this is the only signal that moved
+        build_current=True,
+    )
+    client = _FakeClient(
+        devices_sequence=[[before], [after]],
+        command_responses={"reload": {"ok": True, "result": {"reloading": True}}},
+    )
+
+    result = _run(client, _DEVICE_ID, poll_interval_s=0.01)
+    assert result["ok"] is True
+    assert result["updated"] is True
+    assert result["before_build_stamp"] == "stale-stamp"
+    assert result["after_build_stamp"] == "fresh-stamp"
+    assert result["now_build_current"] is True
+    assert "build stamp changed" in result["message"]
+
+
+def test_reload_then_verify_failure_when_neither_commands_nor_build_stamp_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Broadened failure mode: the automatic path is unverifiable only when
+    NEITHER axis moved -- proving the restage genuinely never reached this
+    device's real extension files."""
+    _fake_stage_extension(monkeypatch, staged_dir=tmp_path)
+    before = _device(
+        commands=["snapshot", "click"],
+        connected_at="2026-08-15T00:00:00+00:00",
+        in_sync=False,
+        build_stamp="same-stamp",
+        build_current=False,
+    )
+    after = _device(
+        commands=["snapshot", "click"],  # UNCHANGED
+        connected_at="2026-08-15T00:00:05+00:00",  # genuinely reconnected
+        in_sync=False,
+        build_stamp="same-stamp",  # ALSO UNCHANGED
+        build_current=False,
+    )
+    client = _FakeClient(
+        devices_sequence=[[before], [after]],
+        command_responses={"reload": {"ok": True, "result": {"reloading": True}}},
+    )
+
+    result = _run(client, _DEVICE_ID, poll_interval_s=0.01)
+    assert result["ok"] is False
+    assert result["reason"] == "no_verified_change"
+    assert "UNCHANGED" in result["error"]
+    assert result["before_build_stamp"] == "same-stamp"
 
 
 def test_device_not_live_fails_loud_without_restaging(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -213,7 +336,7 @@ def test_reload_then_verify_failure_produces_guided_instructions(
 
     result = _run(client, _DEVICE_ID, poll_interval_s=0.01)
     assert result["ok"] is False
-    assert result["reason"] == "no_capability_change"
+    assert result["reason"] == "no_verified_change"
     assert "UNCHANGED" in result["error"]
     assert result["guided"]["download_url"] == "http://100.64.1.2:8900/setup/extension.zip"
     assert "edge://extensions" in result["guided"]["instructions"]

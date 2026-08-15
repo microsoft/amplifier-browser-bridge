@@ -247,28 +247,38 @@ was skipped -- `"ok_with_skips"` or `"ok_with_failures"` otherwise, and
 
 `browser_update_extension` is the ONE agent-facing tool for the version-skew story
 (`docs/PROTOCOL.md`'s "Tier 0 handshake"/"Extension self-reload" sections,
-`update_extension.py`'s `run_update_extension`). It never guesses whether this
-device's unpacked extension lives on the same machine as the hub or a genuinely
-remote one (unreliable to detect -- a network mount can look local); instead it
-always restages a fresh build (the same `setup.stage_extension` function
-`amplifier-browser-bridge init` uses) and sends `reload`, then VERIFIES the result
-by re-reading the device's self-reported command set after it reconnects:
+`update_extension.py`'s `run_update_extension`, `skew.py`, `build_stamp.py`). It
+never guesses whether this device's unpacked extension lives on the same machine
+as the hub or a genuinely remote one (unreliable to detect -- a network mount can
+look local); instead it always restages a fresh build (the same
+`setup.stage_extension` function `amplifier-browser-bridge init` uses) and sends
+`reload`, then VERIFIES the result by re-reading the device's self-reported
+command set AND build stamp after it reconnects:
 
 - **Already current**: the device already reports every command this hub knows
-  (`skew.SkewReport.in_sync`) -- a no-op, `{"ok": true, "already_current": true,
-  "updated": false}`.
+  (`skew.SkewReport.in_sync`) **AND** its build stamp matches this hub's current
+  build (`build_stamp.BuildFreshness.current`) -- a no-op, `{"ok": true,
+  "already_current": true, "updated": false}`. Requiring BOTH closes a real gap:
+  a device can be command-complete and still stale -- a bug/UI/security fix that
+  adds or removes zero commands (this repo's own commits `6175ce4`/`cc140c5`) was
+  previously invisible to `skew` alone, and `already_current` was reported as
+  `true` for a genuinely outdated browser. See `build_stamp.py`'s module docstring
+  for the full incident.
 - **Automatic update verified (Tier 1)**: reload succeeded, the device reconnected
   (a NEW `connected_at`, not the stale pre-reload connection), and its command set
-  genuinely changed -- `{"ok": true, "updated": true, ...}`.
+  OR its build stamp genuinely changed -- `{"ok": true, "updated": true, ...}`.
+  Either axis changing is sufficient proof the restage reached this device's real
+  extension files (a command-only change legitimately leaves the build stamp as
+  the only other thing that moved, and vice versa).
 - **Automatic update unverifiable, guided path (Tier 2)**: reload succeeded and the
-  device reconnected, but its command set is UNCHANGED -- this hub's restage did
-  not reach wherever the browser's real extension files live (most likely a
-  different machine). Reported as `{"ok": false, "reason": "no_capability_change",
-  "guided": {"download_url": ..., "instructions": ...}}` -- never a false "done."
-  `download_url` is this hub's own `GET /setup/extension.zip` (`extension_zip.py`),
-  derived from the SAME host the calling client is already using to reach the hub,
-  so it resolves from wherever a human actually needs to open it -- including a
-  different machine than the hub itself.
+  device reconnected, but its command set AND build stamp are BOTH UNCHANGED --
+  this hub's restage did not reach wherever the browser's real extension files
+  live (most likely a different machine). Reported as `{"ok": false, "reason":
+  "no_verified_change", "guided": {"download_url": ..., "instructions": ...}}` --
+  never a false "done." `download_url` is this hub's own `GET /setup/extension.zip`
+  (`extension_zip.py`), derived from the SAME host the calling client is already
+  using to reach the hub, so it resolves from wherever a human actually needs to
+  open it -- including a different machine than the hub itself.
 - **Bootstrap limit**: the device never acknowledges `reload` at all -- its
   extension predates self-service reload entirely, a one-time manual step that
   cannot be routed around. Also guided, `reason: "reload_unsupported"`.
@@ -276,10 +286,10 @@ by re-reading the device's self-reported command set after it reconnects:
   `"reconnect_timeout"`) -- never silently treated as success, and never verified
   against a stale registry record.
 
-A device that has NEVER reported a command set at all (every extension shipped
-before this feature) still gets the automatic path attempted -- seeing its command
-set go from unreported to a real, populated set after reload IS the verification
-signal that the update worked.
+A device that has NEVER reported a command set or a build stamp at all (every
+extension shipped before this feature) still gets the automatic path attempted --
+seeing either go from unreported to a real, populated value after reload IS the
+verification signal that the update worked.
 
 ### Adding the bundle
 

@@ -1,5 +1,5 @@
 """`browser_update_extension` -- the ONE agent-facing tool for the version-skew
-story (Tier 1 + Tier 2, docs/PROTOCOL.md's "hello" section, skew.py).
+story (Tier 1 + Tier 2, docs/PROTOCOL.md's "hello" section, skew.py, build_stamp.py).
 
 ## The design insight this implements
 
@@ -46,10 +46,19 @@ guided remote instructions instead of a false "done."
   detects it (the `reload` command itself comes back `ok: false`) and
   reports it honestly as the reason the guided path is needed, rather than
   retrying or pretending it can route around a structural limit.
-- **Already current means do nothing.** Checked via the hub's own
-  `skew.SkewReport.in_sync` (already computed server-side and attached to
-  every `devices` entry -- this module never recomputes skew itself; it
-  reads what `Hub._devices_snapshot()` already sent).
+- **Already current means BOTH axes check out.** `skew.SkewReport.in_sync`
+  answers "what can this device DO" (command-complete); `build_stamp.py`'s
+  `BuildFreshness.current` answers "IS this device running the CURRENT
+  build" (content-identical to what this hub would install). Both are
+  computed server-side and attached to every `devices` entry -- this module
+  never recomputes either itself; it reads what `Hub._devices_snapshot()`
+  already sent. A device can be command-complete and still stale: a change
+  that touches zero commands (a bug fix, a UI fix, a security fix -- e.g.
+  commits 6175ce4/cc140c5 in this repo's own history) is invisible to
+  `skew` alone. Proven live: pointing this tool at a real, genuinely-
+  outdated browser that had already caught up on commands returned
+  `already_current: true` before this fix -- false. See build_stamp.py's
+  module docstring for the full incident.
 
 ## Why this doesn't try to be clever about WHERE the device is
 
@@ -156,6 +165,7 @@ def _guided_result(
         "reason": reason,
         "error": error,
         "before_commands_count": (len(before["commands"]) if before.get("commands") is not None else None),
+        "before_build_stamp": (before.get("build_freshness") or {}).get("device_stamp"),
         "guided": _guided_block(client.url),
     }
 
@@ -203,14 +213,26 @@ async def run_update_extension(
         }
 
     skew_before = before.get("skew") or {}
-    if skew_before.get("in_sync"):
+    freshness_before = before.get("build_freshness") or {}
+    # Already current means BOTH axes check out: command-complete (skew.py --
+    # "what can this device DO") AND running the hub's current build
+    # (build_stamp.py -- "IS this device running the CURRENT build"). A
+    # device can be command-complete and still stale (a bug/UI/security fix
+    # that touched zero commands -- see build_stamp.py's module docstring
+    # for the real incident this closes); checking `skew` alone here used to
+    # report exactly that case as `already_current: true`, which was false.
+    if skew_before.get("in_sync") and freshness_before.get("current"):
         return {
             "ok": True,
             "device_id": device_id,
             "already_current": True,
             "updated": False,
-            "message": "this device already reports every command this hub knows -- nothing to do.",
+            "message": (
+                "this device already reports every command this hub knows AND its build stamp "
+                "matches this hub's current build -- nothing to do."
+            ),
             "commands_count": (len(before["commands"]) if before.get("commands") is not None else None),
+            "build_stamp": freshness_before.get("device_stamp"),
         }
 
     if before.get("tier") != "live":
@@ -286,18 +308,27 @@ async def run_update_extension(
 
     before_commands = before.get("commands")
     after_commands = after.get("commands")
-    if after_commands == before_commands:
+    before_stamp = freshness_before.get("device_stamp")
+    after_stamp = (after.get("build_freshness") or {}).get("device_stamp")
+    # Verified change on EITHER axis is proof the restage reached this
+    # device's real extension files -- commands (the common case: a new/
+    # removed command) OR build stamp (a bug/UI/security fix that changed
+    # zero commands, e.g. commits 6175ce4/cc140c5). Requiring BOTH to change
+    # would be wrong the other direction: a command-only change legitimately
+    # leaves the build stamp as the only thing that moved, and vice versa.
+    # Only when NEITHER changed is the automatic path genuinely unverifiable.
+    if after_commands == before_commands and after_stamp == before_stamp:
         return _guided_result(
             client,
             device_id,
-            reason="no_capability_change",
+            reason="no_verified_change",
             error=(
-                "reload succeeded and the device reconnected, but its reported command set is "
-                "UNCHANGED -- this hub's restage did not reach wherever this browser's unpacked "
-                "extension actually loads its files from (most likely a different machine, or a "
-                "custom path this hub does not know about). The automatic path cannot be verified, "
-                "so it is not reported as success -- follow the guided steps below on the machine "
-                "actually running this browser."
+                "reload succeeded and the device reconnected, but its reported command set AND "
+                "build stamp are both UNCHANGED -- this hub's restage did not reach wherever this "
+                "browser's unpacked extension actually loads its files from (most likely a "
+                "different machine, or a custom path this hub does not know about). The automatic "
+                "path cannot be verified, so it is not reported as success -- follow the guided "
+                "steps below on the machine actually running this browser."
             ),
             before=before,
         )
@@ -308,13 +339,23 @@ async def run_update_extension(
         "already_current": False,
         "updated": True,
         "message": (
-            f"restaged {staged_dir} and reloaded the extension -- VERIFIED: its reported command "
-            "set changed after reconnecting, so the automatic update genuinely reached this "
-            "device's real extension files."
+            f"restaged {staged_dir} and reloaded the extension -- VERIFIED: its reported "
+            + (
+                "command set and build stamp both changed"
+                if after_commands != before_commands and after_stamp != before_stamp
+                else "command set changed"
+                if after_commands != before_commands
+                else "build stamp changed"
+            )
+            + " after reconnecting, so the automatic update genuinely reached this device's real "
+            "extension files."
         ),
         "before_commands_count": len(before_commands) if before_commands is not None else None,
         "after_commands_count": len(after_commands) if after_commands is not None else None,
+        "before_build_stamp": before_stamp,
+        "after_build_stamp": after_stamp,
         "now_in_sync": (after.get("skew") or {}).get("in_sync"),
+        "now_build_current": (after.get("build_freshness") or {}).get("current"),
     }
 
 
