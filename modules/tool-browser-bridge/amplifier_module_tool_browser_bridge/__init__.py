@@ -55,6 +55,8 @@ from amplifier_browser_bridge.auto_setup import DEFAULT_WAIT_REACHABLE_S, run_au
 from amplifier_browser_bridge.doctor import run_doctor
 from amplifier_browser_bridge.hub_location import DEFAULT_PORT, resolve_hub_url
 from amplifier_browser_bridge.paging import DEFAULT_LIMIT, shape_tabs_response
+from amplifier_browser_bridge.update_extension import DEFAULT_RECONNECT_TIMEOUT_S
+from amplifier_browser_bridge.update_extension import run_update_extension as _run_update_extension
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 
@@ -370,6 +372,13 @@ def _build_tools() -> list[_HubTool]:
                 {"name": c.name, "status": c.status, "message": c.message, "detail": c.detail} for c in checks
             ],
         }
+
+    async def update_extension_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        return await _run_update_extension(
+            _client(),
+            input_data["device_id"],
+            reconnect_timeout_s=input_data.get("reconnect_timeout_s", DEFAULT_RECONNECT_TIMEOUT_S),
+        )
 
     async def archive_runner(input_data: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1064,6 +1073,55 @@ def _build_tools() -> list[_HubTool]:
                 "required": ["device_id", "dest_dir"],
             },
             archive_runner,
+        ),
+        _HubTool(
+            "browser_update_extension",
+            "Verify-or-guide update for one device's extension (the version-skew story). ALWAYS "
+            "attempts the automatic path first, then VERIFIES it actually worked by re-reading the "
+            "device's reported command set after it reconnects -- this tool never reports success "
+            "without that proof. Detecting up front whether this browser's unpacked extension lives "
+            "on THIS machine or a genuinely remote one is unreliable (a network mount can look "
+            "local), so this tool does not try: it restages a fresh build from this hub's own "
+            "source (the same mechanism `amplifier-browser-bridge init` uses) and sends the device "
+            "a `reload` command, which drops its websocket -- chrome.runtime.reload() re-reads "
+            "files from disk close to immediately. It then polls (never a bare sleep) for the "
+            "device to reconnect with a NEW connection (not the stale pre-reload one) within "
+            "reconnect_timeout_s, and compares its command set before and after.\n\n"
+            "If the device was already reporting every command this hub knows, this is a "
+            "no-op (already_current: true, updated: false). If the command set genuinely "
+            "changed after reload, the automatic update reached this device's real extension "
+            "files (updated: true). If reload succeeded and the device reconnected but its "
+            "set is UNCHANGED, this hub's restage did not reach wherever the browser actually loads "
+            "its extension from (most likely a different machine) -- reported plainly, with a "
+            "`guided` block: a real `download_url` (this hub's own GET /setup/extension.zip, "
+            "resolvable from wherever this tool is being called from) plus the manual unzip/reload "
+            "steps to follow on the machine actually running that browser. If the device never "
+            "acknowledges `reload` at all, its extension predates self-service reload entirely (a "
+            "one-time bootstrap limit, not a bug) -- also guided, with that reason named "
+            "explicitly. If the device isn't currently connected, or never reconnects within "
+            "reconnect_timeout_s, this fails loud naming exactly which of those happened -- never "
+            "silently treated as success.\n\n"
+            "A device that has NEVER reported a command set at all (every extension shipped before "
+            'this feature) is not a crash and not "unknown" -- it is a definitively stale '
+            "extension, and this tool still attempts the automatic path for it: seeing its command "
+            "set go from unreported to a real, populated set after reload IS the proof the "
+            "automatic update worked.",
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "reconnect_timeout_s": {
+                        "type": "number",
+                        "default": DEFAULT_RECONNECT_TIMEOUT_S,
+                        "description": (
+                            "How long to wait for the device to reconnect after sending reload "
+                            "before failing loud, in seconds."
+                        ),
+                    },
+                },
+                "required": ["device_id"],
+            },
+            update_extension_runner,
         ),
     ]
 

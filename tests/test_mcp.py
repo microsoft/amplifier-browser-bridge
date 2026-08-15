@@ -75,6 +75,7 @@ def test_all_expected_tools_are_registered():
         "browser_download",
         "browser_wait_download",
         "browser_archive",
+        "browser_update_extension",
     }
     registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert registered == expected

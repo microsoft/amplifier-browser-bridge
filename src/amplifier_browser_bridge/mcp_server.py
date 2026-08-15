@@ -41,6 +41,8 @@ from .auth import resolve_default_token
 from .client import HubClient, HubError
 from .hub_location import resolve_hub_url
 from .paging import DEFAULT_LIMIT, shape_tabs_response
+from .update_extension import DEFAULT_RECONNECT_TIMEOUT_S
+from .update_extension import run_update_extension as _run_update_extension
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
@@ -1056,6 +1058,52 @@ async def browser_archive(
         )
     except (ArchiveError, HubError) as e:
         return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_update_extension(
+    device_id: str,
+    reconnect_timeout_s: float = DEFAULT_RECONNECT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Verify-or-guide update for one device's extension (the version-skew story).
+    ALWAYS attempts the automatic path first, then VERIFIES it actually worked by
+    re-reading the device's reported command set after it reconnects -- this tool never
+    reports success without that proof.
+
+    Detecting up front whether this browser's unpacked extension lives on THIS machine
+    or a genuinely remote one is unreliable (a network mount can look local) -- so this
+    tool does not try. It restages a fresh build from this hub's own source (the same
+    mechanism `amplifier-browser-bridge init` uses) and sends the device a `reload`
+    command, which drops its websocket -- `chrome.runtime.reload()` re-reads files from
+    disk close to immediately. It then polls (never a bare sleep) for the device to
+    reconnect with a NEW connection (not the stale pre-reload one) within
+    reconnect_timeout_s, and compares its command set before and after:
+
+    - If the device was already reporting every command this hub knows, this is a
+      no-op: `{"ok": true, "already_current": true, "updated": false, ...}`.
+    - If the command set genuinely changed after reload, the automatic update reached
+      this device's real extension files: `{"ok": true, "updated": true, ...}`.
+    - If reload succeeded and the device reconnected but its command set is UNCHANGED,
+      this hub's restage did not reach wherever the browser actually loads its
+      extension from (most likely a different machine) -- reported plainly, with a
+      `guided` block: a real `download_url` (this hub's own `GET /setup/extension.zip`,
+      resolvable from wherever this tool is being called from) plus the manual
+      unzip/reload steps to follow on the machine actually running that browser.
+    - If the device never acknowledges `reload` at all, its extension predates
+      self-service reload entirely (a one-time bootstrap limit, not a bug) -- also
+      guided, with that reason named explicitly.
+    - If the device isn't currently connected, or never reconnects within
+      reconnect_timeout_s, this fails loud naming exactly which of those happened --
+      never silently treated as success.
+
+    Call browser_devices() first (or read this tool's own error) to get a valid
+    device_id. A pre-existing device that has NEVER reported a command set at all
+    (every extension shipped before this feature) is not a crash and not "unknown" --
+    it is a definitively stale extension, and this tool still attempts the automatic
+    path for it: seeing its command set go from unreported to a real, populated set
+    after reload IS the proof the automatic update worked.
+    """
+    return await _run_update_extension(_client(), device_id, reconnect_timeout_s=reconnect_timeout_s)
 
 
 def main() -> None:

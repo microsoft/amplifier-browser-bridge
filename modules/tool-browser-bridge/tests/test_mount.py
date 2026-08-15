@@ -119,6 +119,7 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_archive",
         "browser_setup",
         "browser_setup_status",
+        "browser_update_extension",
     }
     assert names == expected
 

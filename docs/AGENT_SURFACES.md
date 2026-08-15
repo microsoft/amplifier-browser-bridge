@@ -5,19 +5,22 @@ Phase 1. This doc covers the two Phase 2 surfaces -- both are thin adapters over
 the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
-**Verified 2026-08-14 (grep-counted directly against the code, not assumed):**
-the native Amplifier tool module registers **26** tools; the MCP server also
-registers **26**. They are not byte-identical sets -- they differ by exactly
-one tool each: the native module has `browser_reload` (the MCP server does
-not), and the MCP server has `browser_confirm` (the native module does not).
-Every other name below is shared by both, named `browser_<command>`
-(mirroring Playwright MCP's vocabulary, design doc section 9), including the
-new `browser_archive` (D2, browser-state archive -- see below). Earlier
-revisions of this doc claimed "twenty-five" tools -- stale as of this
-correction (adding `browser_archive` moved both counts from 25 to 26); see
-`amplifier_module_tool_browser_bridge/__init__.py`'s `_build_tools()` and
-`mcp_server.py`'s `@mcp.tool()` decorators for the authoritative, current
-lists.
+**Hand-verified 2026-08-15 (counted directly against the code, not assumed):**
+the native Amplifier tool module registers **29** tools; the MCP server
+registers **27**. They are not byte-identical sets -- the native module has
+three the MCP server does not (`browser_reload`, `browser_setup`,
+`browser_setup_status`), and the MCP server has one the native module does
+not (`browser_confirm`). Every other name below is shared by both, named
+`browser_<command>` (mirroring Playwright MCP's vocabulary, design doc
+section 9), including `browser_archive` (D2, browser-state archive) and the
+new `browser_update_extension` (the version-skew story -- see "Extension
+update (Tier 0/1/2)" below). A prior revision of this doc claimed "26 and
+26" -- that count was already stale before this update (it predated
+`browser_setup`/`browser_setup_status` being added to the native module) as
+well as missing this change's own addition; both numbers here were
+re-counted directly from `amplifier_module_tool_browser_bridge/__init__.py`'s
+`_build_tools()` and `mcp_server.py`'s `@mcp.tool()` decorators, the
+authoritative, current lists, not carried forward from the prior claim.
 
 | Tool | Command | Notes | Surface |
 |---|---|---|---|
@@ -48,6 +51,9 @@ lists.
 | `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) | **native module only** |
 | `browser_confirm` | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
 | `browser_archive` | (composed: `windows`/`tabs`/`page_state`/`mhtml`/`nav_history`/profile-data commands) | D2, browser-state archive -- capture browser state at a chosen depth (L0-L5), write payloads to disk, return a MANIFEST (never the payload) -- see "Browser-state archive" below | both |
+| `browser_update_extension` | (composed: restage + `reload` + polled `list_devices`) | verify-or-guide extension update -- see "Extension update (Tier 0/1/2)" below | both |
+| `browser_setup` | (native, in-process `init` equivalent) | first-run/re-run setup, no CLI on PATH required | **native module only** |
+| `browser_setup_status` | (native, in-process `doctor` equivalent) | diagnose the setup chain | **native module only** |
 
 See `docs/PROTOCOL.md` for the exact command semantics and `docs/designs/browser-bridge.md`
 for the addressing model (`device_id` -> `window_id`/`tab_id` -> `ref`) and the
@@ -236,6 +242,44 @@ maximum archive depth (`docs/permission-justifications.md` section 6).
 **Manifest honesty**: `manifest["status"]` is `"ok"` only when nothing failed or
 was skipped -- `"ok_with_skips"` or `"ok_with_failures"` otherwise, and
 `manifest["failures"]` lists every failure/skip at the top level, never buried.
+
+## Extension update (Tier 0/1/2)
+
+`browser_update_extension` is the ONE agent-facing tool for the version-skew story
+(`docs/PROTOCOL.md`'s "Tier 0 handshake"/"Extension self-reload" sections,
+`update_extension.py`'s `run_update_extension`). It never guesses whether this
+device's unpacked extension lives on the same machine as the hub or a genuinely
+remote one (unreliable to detect -- a network mount can look local); instead it
+always restages a fresh build (the same `setup.stage_extension` function
+`amplifier-browser-bridge init` uses) and sends `reload`, then VERIFIES the result
+by re-reading the device's self-reported command set after it reconnects:
+
+- **Already current**: the device already reports every command this hub knows
+  (`skew.SkewReport.in_sync`) -- a no-op, `{"ok": true, "already_current": true,
+  "updated": false}`.
+- **Automatic update verified (Tier 1)**: reload succeeded, the device reconnected
+  (a NEW `connected_at`, not the stale pre-reload connection), and its command set
+  genuinely changed -- `{"ok": true, "updated": true, ...}`.
+- **Automatic update unverifiable, guided path (Tier 2)**: reload succeeded and the
+  device reconnected, but its command set is UNCHANGED -- this hub's restage did
+  not reach wherever the browser's real extension files live (most likely a
+  different machine). Reported as `{"ok": false, "reason": "no_capability_change",
+  "guided": {"download_url": ..., "instructions": ...}}` -- never a false "done."
+  `download_url` is this hub's own `GET /setup/extension.zip` (`extension_zip.py`),
+  derived from the SAME host the calling client is already using to reach the hub,
+  so it resolves from wherever a human actually needs to open it -- including a
+  different machine than the hub itself.
+- **Bootstrap limit**: the device never acknowledges `reload` at all -- its
+  extension predates self-service reload entirely, a one-time manual step that
+  cannot be routed around. Also guided, `reason: "reload_unsupported"`.
+- **Not live / never reconnected**: fails loud (`reason: "device_not_live"` or
+  `"reconnect_timeout"`) -- never silently treated as success, and never verified
+  against a stale registry record.
+
+A device that has NEVER reported a command set at all (every extension shipped
+before this feature) still gets the automatic path attempted -- seeing its command
+set go from unreported to a real, populated set after reload IS the verification
+signal that the update worked.
 
 ### Adding the bundle
 

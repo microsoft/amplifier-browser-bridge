@@ -1112,6 +1112,21 @@ already be running code that understands the `reload` command before it can relo
 version that understands it -- there is no way around that single bootstrap step. Every subsequent
 iteration is self-service via `amplifier-browser-bridge reload <device_id>`.
 
+**`browser_update_extension` (Tier 1 + Tier 2, `update_extension.py`) -- composed, not a wire
+command**, the same way `vision_read`/`browser_archive` compose wire commands without being one
+themselves. It restages a fresh build (`setup.stage_extension`, the same function
+`amplifier-browser-bridge init` uses) and sends this `reload` command, but never reports success
+on the ack alone -- `chrome.runtime.reload()` drops the websocket, so it polls `list_devices`
+until this device reconnects with a NEW `connected_at` (a real, bounded timeout, never a bare
+sleep-and-hope) and only then compares its self-reported `commands` (see the `hello` section's
+"Tier 0 handshake") before and after. If the set changed, the automatic update reached this
+device's real extension files -- verified, not assumed. If reload succeeded and the device
+reconnected but its command set is unchanged, this hub's restage did not reach wherever that
+browser actually loads its extension from (most likely a different machine) -- reported plainly,
+with guided manual instructions and a real `GET /setup/extension.zip` download URL (see
+`extension_zip.py`) rather than a false "done." See `update_extension.py`'s module docstring for
+the full design and docs/AGENT_SURFACES.md for the tool's exact shape.
+
 Commands are partitioned into `PAGE_WORLD_COMMANDS` (dispatched into `injected.js` running in
 the page's isolated world) and `BROWSER_LEVEL_COMMANDS` (handled directly by
 `background.js` against `chrome.tabs`/`chrome.windows`/`chrome.debugger`, which are not
