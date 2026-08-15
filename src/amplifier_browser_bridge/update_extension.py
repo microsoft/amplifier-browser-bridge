@@ -106,15 +106,44 @@ def _find_device(devices: list[dict[str, Any]], device_id: str) -> dict[str, Any
     return None
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"})
+
+
 def _download_url(hub_agent_url: str) -> str:
     """Derive the hub's `GET /setup/extension.zip` URL from its `/agent`
     WebSocket URL -- same host, resolvable from wherever the CALLER of this
     tool is running (the same place that's already reaching the hub to ask
-    this question), never a hub-local `127.0.0.1` unless that's genuinely
-    all `hub_agent_url` itself resolves to."""
+    this question).
+
+    This can still yield a loopback URL, and that case is NOT benign here --
+    see `_loopback_warning`."""
     parts = urlsplit(hub_agent_url)
     scheme = "https" if parts.scheme == "wss" else "http"
     return urlunsplit((scheme, parts.netloc, "/setup/extension.zip", "", ""))
+
+
+def _loopback_warning(download_url: str) -> str | None:
+    """The guided path exists precisely because the browser is on a DIFFERENT
+    machine than this hub -- and a loopback download URL is unreachable from
+    there. The hub's own default bind is `127.0.0.1` (see `cli.py`'s `hub
+    --host` default), so this is the likely case, not the exotic one: handing
+    the user `http://127.0.0.1:.../setup/extension.zip` to open on their
+    laptop sends them to their laptop's own machine, where nothing is
+    listening.
+
+    Returning the URL with no warning would be a silent dead end, so this
+    names the cause and the fix instead."""
+    host = urlsplit(download_url).hostname
+    if host is None or host.lower() not in _LOOPBACK_HOSTS:
+        return None
+    return (
+        f"WARNING: this hub is reachable at {download_url!r}, which is a LOOPBACK address -- "
+        "it resolves to whatever machine opens it, so it will NOT work from the machine running "
+        "the browser. Restart the hub bound to an address that machine can reach (e.g. this "
+        "machine's Tailscale IP: `tailscale ip -4`, then `amplifier-browser-bridge hub --host "
+        "<that-ip>`), or copy the downloaded zip across by hand. Everything else below still "
+        "applies."
+    )
 
 
 def _guided_result(
@@ -127,11 +156,20 @@ def _guided_result(
         "reason": reason,
         "error": error,
         "before_commands_count": (len(before["commands"]) if before.get("commands") is not None else None),
-        "guided": {
-            "download_url": _download_url(client.url),
-            "instructions": _GUIDED_INSTRUCTIONS,
-        },
+        "guided": _guided_block(client.url),
     }
+
+
+def _guided_block(hub_agent_url: str) -> dict[str, Any]:
+    download_url = _download_url(hub_agent_url)
+    block: dict[str, Any] = {
+        "download_url": download_url,
+        "instructions": _GUIDED_INSTRUCTIONS,
+    }
+    warning = _loopback_warning(download_url)
+    if warning is not None:
+        block["warning"] = warning
+    return block
 
 
 async def run_update_extension(

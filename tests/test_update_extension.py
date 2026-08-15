@@ -269,3 +269,34 @@ def _run(client: _FakeClient, device_id: str, **kwargs: Any) -> dict[str, Any]:
     import asyncio
 
     return asyncio.run(run_update_extension(client, device_id, **kwargs))  # type: ignore[arg-type]
+
+
+def test_loopback_download_url_warns_it_is_unreachable_remotely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guided path exists BECAUSE the browser is on another machine, and the
+    hub's own default bind is 127.0.0.1 -- so handing over a loopback URL with no
+    warning is the likely case, not the exotic one, and is a silent dead end."""
+
+    def _boom(dest: Any = None, source: Any = None) -> Path:
+        raise ExtensionSourceNotFoundError("boom")
+
+    monkeypatch.setattr("amplifier_browser_bridge.update_extension.stage_extension", _boom)
+    client = _FakeClient(devices_sequence=[[_device(in_sync=False)]], url="ws://127.0.0.1:8900/agent")
+
+    guided = _run(client, _DEVICE_ID)["guided"]
+    assert guided["download_url"] == "http://127.0.0.1:8900/setup/extension.zip"
+    assert "LOOPBACK" in guided["warning"]
+    assert "tailscale" in guided["warning"].lower()
+
+
+def test_routable_download_url_carries_no_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(dest: Any = None, source: Any = None) -> Path:
+        raise ExtensionSourceNotFoundError("boom")
+
+    monkeypatch.setattr("amplifier_browser_bridge.update_extension.stage_extension", _boom)
+    client = _FakeClient(devices_sequence=[[_device(in_sync=False)]], url="ws://100.64.1.2:8900/agent")
+
+    guided = _run(client, _DEVICE_ID)["guided"]
+    assert guided["download_url"] == "http://100.64.1.2:8900/setup/extension.zip"
+    assert "warning" not in guided
