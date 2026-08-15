@@ -188,6 +188,170 @@ test("pollStatusUntilKnown lands on the honest state when sendMessage resolves w
   assert.match(elements["step-3-line"].textContent, /returned no status/);
 });
 
+// --- Transient vs terminal: the sustained watch (bug report, 2026-08) ----------
+// A hub restart can put background.js's own reconnect/backoff loop into a state that
+// legitimately takes minutes to resolve (one real run measured about six). Before this
+// fix, `result.ok` from queryStatusOnce -- "the background script answered" -- was
+// mistaken for "the connection settled": pollStatusUntilKnown returned on the FIRST
+// real response even when it was "configured, not connected, no error yet" (exactly the
+// shape of "still reconnecting"), leaving the page frozen on "Connecting... / Give it a
+// moment." for the rest of the six minutes while the device was, underneath, perfectly
+// healthy again. These tests exercise the fix: a transient response keeps the watch
+// going, a connected/error/unconfigured response still settles immediately (unchanged
+// from before), and a connection that never settles at all renders an honest, actionable
+// message once the sustained watch's ceiling elapses -- never a repeated "Give it a
+// moment."
+
+test("isTerminalStatus: connected, each concrete error, never-configured, and legacy-config are all terminal", async () => {
+  installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = defaultFakeChrome();
+  const mod = await importOptionsFresh();
+
+  assert.equal(mod.isTerminalStatus({ configured: true, connected: true }), true);
+  assert.equal(
+    mod.isTerminalStatus({ configured: true, connected: false, lastError: { code: "auth_rejected" } }),
+    true
+  );
+  assert.equal(
+    mod.isTerminalStatus({ configured: true, connected: false, lastError: { code: "unreachable" } }),
+    true
+  );
+  assert.equal(mod.isTerminalStatus({ configured: true, connected: false, lastError: { code: "hub_error" } }), true);
+  assert.equal(mod.isTerminalStatus({ configured: false, connected: false }), true);
+  assert.equal(mod.isTerminalStatus({ configured: false, connected: false, legacyConfigDetected: true }), true);
+});
+
+test("isTerminalStatus: configured + not connected + no error yet is the ONE transient shape", async () => {
+  installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = defaultFakeChrome();
+  const mod = await importOptionsFresh();
+
+  assert.equal(mod.isTerminalStatus({ configured: true, connected: false, lastError: null }), false);
+});
+
+test("pollStatusUntilKnown keeps watching a transient status instead of settling on the first real response", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  let calls = 0;
+  globalThis.chrome = defaultFakeChrome({
+    runtime: {
+      sendMessage: async () => {
+        calls += 1;
+        // First call: still connecting -- exactly the shape that used to end the poll
+        // early. Every call after: the reconnect finally succeeded.
+        if (calls === 1) {
+          return { configured: true, connected: false, hubUrl: "ws://100.1.2.3:8900/device", lastError: null };
+        }
+        return { configured: true, connected: true, hubUrl: "ws://100.1.2.3:8900/device", deviceId: "d1" };
+      },
+    },
+  });
+
+  const mod = await importOptionsFresh();
+  // Burst schedule of one immediate attempt (the transient response above); the
+  // sustained watch (interval 0, for a fast test) then picks up the real settle.
+  await mod.pollStatusUntilKnown([0], { sustainedIntervalMs: 0, sustainedCeilingMs: 5000 });
+
+  assert.ok(calls >= 2, "must have queried again instead of settling on the first (transient) response");
+  assert.equal(elements["step-3-title"].textContent, "You're ready");
+  assert.equal(elements["step-3"].attributes["data-marker-class"], "ok");
+});
+
+test("pollStatusUntilKnown settles immediately (no sustained watch) once a concrete error is known", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  let calls = 0;
+  globalThis.chrome = defaultFakeChrome({
+    runtime: {
+      sendMessage: async () => {
+        calls += 1;
+        return {
+          configured: true,
+          connected: false,
+          hubUrl: "ws://100.1.2.3:8900/device",
+          lastError: { code: "unreachable", message: "Could not reach the hub -- is it running?" },
+        };
+      },
+    },
+  });
+
+  const mod = await importOptionsFresh();
+  await mod.pollStatusUntilKnown([0], { sustainedIntervalMs: 0, sustainedCeilingMs: 5000 });
+
+  assert.equal(calls, 1, "a concrete error is terminal -- must not enter the sustained watch at all");
+  assert.match(elements["step-3-title"].textContent, /Can't reach 100\.1\.2\.3:8900/);
+});
+
+test("pollStatusUntilKnown's sustained watch renders an honest, actionable message once its ceiling elapses -- never repeating 'Give it a moment'", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = defaultFakeChrome({
+    runtime: {
+      // Never resolves, ever -- a connection that never settles and never produces a
+      // concrete named error either (the real reconnect-after-minutes scenario, taken
+      // to its unbounded extreme).
+      sendMessage: async () => ({
+        configured: true,
+        connected: false,
+        hubUrl: "ws://100.124.126.19:8900/device",
+        lastError: null,
+      }),
+    },
+  });
+
+  const mod = await importOptionsFresh();
+  // Ceiling of 0ms: the sustained watch's `while` loop never runs a single iteration,
+  // exercising "ceiling already elapsed" deterministically and fast.
+  await mod.pollStatusUntilKnown([0], { sustainedIntervalMs: 0, sustainedCeilingMs: 0 });
+
+  assert.equal(elements["step-3"].attributes["data-marker-class"], "alert");
+  assert.equal(elements["step-3-title"].textContent, "Still not connected");
+  assert.notEqual(elements["step-3-title"].textContent, "Connecting\u2026");
+  assert.doesNotMatch(elements["step-3-line"].textContent, /give it a moment/i);
+  assert.match(elements["step-3-line"].textContent, /100\.124\.126\.19:8900/);
+  assert.match(elements["step-3-line"].textContent, /doctor/);
+});
+
+test("pollStatusUntilKnown's sustained watch stops cleanly (no further polling, no ceiling message) once the page is hidden", async () => {
+  const elements = installFakeDom();
+  globalThis.document.visibilityState = "hidden";
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  let calls = 0;
+  globalThis.chrome = defaultFakeChrome({
+    runtime: {
+      sendMessage: async () => {
+        calls += 1;
+        return { configured: true, connected: false, hubUrl: "ws://100.1.2.3:8900/device", lastError: null };
+      },
+    },
+  });
+
+  const mod = await importOptionsFresh();
+  await mod.pollStatusUntilKnown([0], { sustainedIntervalMs: 0, sustainedCeilingMs: 60000 });
+
+  assert.equal(calls, 1, "must not poll again once the page is hidden");
+  assert.equal(
+    elements["step-3-title"].textContent,
+    "Connecting\u2026",
+    "still shows the last real (transient) answer, not a ceiling message nobody can see"
+  );
+});
+
+test("pageIsVisible defaults true when document has no visibilityState (the test harness's flat fake DOM)", async () => {
+  installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = defaultFakeChrome();
+  const mod = await importOptionsFresh();
+
+  assert.equal(mod.pageIsVisible(), true);
+  globalThis.document.visibilityState = "hidden";
+  assert.equal(mod.pageIsVisible(), false);
+  globalThis.document.visibilityState = "visible";
+  assert.equal(mod.pageIsVisible(), true);
+});
+
 // --- Connection-status detail: distinguishing "unreachable" / "token rejected" /
 // "connected" (craft-inspector / human-advocate review) ---
 
