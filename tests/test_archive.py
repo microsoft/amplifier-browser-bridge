@@ -422,6 +422,7 @@ async def test_overall_status_is_plain_ok_when_everything_succeeds(tmp_path: Pat
         "tabs_partial": 0,
         "tabs_skipped": 0,
         "tabs_failed": 0,
+        "tabs_not_found": 0,
         "profile": None,
         "has_failures": False,
     }
@@ -866,6 +867,116 @@ async def test_tab_ids_filter_reports_ids_that_were_not_found(tmp_path: Path) ->
     result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", tab_ids=[101, 999])
     manifest = result["result"]
     assert manifest["requested_tab_ids_not_found"] == [999]
+
+
+# ---------------------------------------------------------------------------
+# A requested-but-vanished tab_id must never be invisible: it is a FIFTH
+# per-tab state ("not_found"), distinct from ok/partial/failed/skipped, and
+# `summary` must account for every id the caller passed. Observed live: an
+# archive requesting 4 tab_ids reported `tabs_capture_attempted: 3` with
+# entries for only 3 of the 4 -- the 4th (closed between inventory and
+# capture) appeared in no `tabs` entry, no `failures` entry, no `skipped`
+# record, nothing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_not_found_tab_id_gets_its_own_manifest_tabs_entry(tmp_path: Path) -> None:
+    """The load-bearing assertion: a tab_id absent from the live inventory is
+    NOT simply missing from `manifest["tabs"]` -- it gets a real entry there,
+    the same dict every other tab's outcome lives in, so a caller scanning
+    `manifest["tabs"]` sees all four requested ids accounted for."""
+    client = _basic_client(tabs=[_tab(101), _tab(102), _tab(103)])
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", tab_ids=[101, 102, 103, 999])
+    manifest = result["result"]
+
+    assert set(manifest["tabs"]) == {"101", "102", "103", "999"}
+    assert manifest["tabs"]["999"]["status"] == "not_found"
+    assert "reason" in manifest["tabs"]["999"]
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["status"] == "ok"
+    assert manifest["tabs"]["103"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_summary_accounts_for_every_requested_tab_id(tmp_path: Path) -> None:
+    """`tabs_capture_attempted` (the tabs actually found and contacted) plus
+    `tabs_not_found` (the ones that vanished) must equal the total number of
+    ids the caller passed in `tab_ids` -- none may fall through the cracks."""
+    client = _basic_client(tabs=[_tab(101), _tab(102), _tab(103)])
+    requested = [101, 102, 103, 999]
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", tab_ids=requested)
+    summary = result["result"]["summary"]
+
+    assert summary["tabs_not_found"] == 1
+    assert summary["tabs_capture_attempted"] == 3
+    assert summary["tabs_capture_attempted"] + summary["tabs_not_found"] == len(requested)
+
+
+@pytest.mark.asyncio
+async def test_not_found_tab_is_benign_not_a_failure_but_not_plain_ok_either(
+    tmp_path: Path,
+) -> None:
+    """A vanished tab is not a capture failure -- "closed before we got to it" is a
+    legitimate, expected outcome, so it must never add an entry to
+    `manifest["failures"]` nor push `manifest["status"]` to `"ok_with_failures"`.
+    But it must also never be silently absorbed into a plain `"ok"` run -- the
+    same non-negotiable already established for `"skipped"` tabs (no-wake
+    guarantee), the other benign-but-not-clean outcome."""
+    client = _basic_client(tabs=[_tab(101)])
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", tab_ids=[101, 999])
+    manifest = result["result"]
+
+    assert not any(f.get("tab_id") == 999 for f in manifest["failures"])
+    assert manifest["status"] == "ok_with_skips"
+    assert manifest["status"] != "ok"
+    assert manifest["status"] != "ok_with_failures"
+    assert manifest["summary"]["has_failures"] is False
+
+
+@pytest.mark.asyncio
+async def test_not_found_is_distinct_from_ok_partial_failed_and_skipped(tmp_path: Path) -> None:
+    """All five per-tab states in one run: a clean capture, a discarded/skipped
+    tab, a totally-failed tab, and a requested-but-vanished tab_id -- each must
+    report its own distinct status and be counted in its own summary bucket,
+    never conflated with any of the others."""
+    client = _basic_client(
+        tabs=[_tab(101), _tab(102, discarded=True), _tab(103)],
+        extra_commands={
+            "read": [
+                {"ok": True, "result": {"url": "https://example.com", "title": "Test Page", "text": "hi"}},
+                {"ok": False, "error": "boom"},
+            ],
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", tab_ids=[101, 102, 103, 999])
+    manifest = result["result"]
+
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["status"] == "skipped"
+    assert manifest["tabs"]["103"]["status"] == "failed"
+    assert manifest["tabs"]["999"]["status"] == "not_found"
+
+    summary = manifest["summary"]
+    assert summary["tabs_captured"] == 1
+    assert summary["tabs_skipped"] == 1
+    assert summary["tabs_failed"] == 1
+    assert summary["tabs_not_found"] == 1
+    assert summary["tabs_capture_attempted"] == 3  # 101, 102, 103 -- not 999
+
+
+@pytest.mark.asyncio
+async def test_no_tab_ids_means_no_not_found_accounting(tmp_path: Path) -> None:
+    """When the caller doesn't restrict to specific tab_ids, there is nothing to
+    report as "not found" -- `tabs_not_found` stays 0 and no synthetic entries
+    are added to `manifest["tabs"]`."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)])
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1")
+    manifest = result["result"]
+
+    assert manifest["summary"]["tabs_not_found"] == 0
+    assert "requested_tab_ids_not_found" not in manifest
+    assert set(manifest["tabs"]) == {"101", "102"}
 
 
 @pytest.mark.asyncio

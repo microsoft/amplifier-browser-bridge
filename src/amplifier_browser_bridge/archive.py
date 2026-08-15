@@ -101,6 +101,30 @@ archive. But the manifest is built so a failure is impossible to miss:
   `_capture_tab`'s `record`), so a run containing any partial tab is never reported as
   plain `"ok"`.
 
+- A `tab_id` explicitly named in `tab_ids` can vanish between when the caller read the
+  tab inventory and when this archive ran (the tab was closed) -- it is then absent
+  from the live `tabs` list entirely, with nothing to capture. This is a FIFTH per-tab
+  state, `"not_found"`, distinct from `"ok"`/`"partial"`/`"failed"`/`"skipped"`: those
+  four all describe a tab that existed at capture time; `"not_found"` means it didn't.
+  Observed live: an archive requesting 4 tab_ids got capture entries for only 3 -- the
+  4th (already closed) appeared in no `tabs` entry, no `failures` entry, and no
+  `skipped` record, so nothing in the manifest told the caller their fourth tab was
+  ever requested. `_capture_tab` never runs for a not-found id (there is no tab to
+  target); instead `manifest["tabs"][tab_id]` gets a synthetic `{"status":
+  "not_found", "reason": ...}` entry so every id in `tab_ids` is accounted for one way
+  or another. This is a BENIGN outcome (closed-before-we-got-to-it is not a capture
+  failure) so it does not add an entry to `manifest["failures"]`, mirroring how a
+  `"skipped"` tab (also benign, also not a failure) is handled -- but, also like
+  `"skipped"`, it is never silently folded into a plain `"ok"` run:
+  `summary["tabs_not_found"]` counts it explicitly, and the run-level `status` becomes
+  `"ok_with_skips"` (the existing "something benign didn't get captured" bucket)
+  rather than plain `"ok"`. The top-level `manifest["requested_tab_ids_not_found"]`
+  list (present whenever `tab_ids` names at least one id absent from the live
+  inventory, at any depth including L0) remains a convenience summary of the same
+  ids; the per-tab `"not_found"` entries are the load-bearing fix, since they live in
+  the same `manifest["tabs"]` dict a caller already scans for every other tab's
+  outcome.
+
 ## Impossible depth: fail loud, never silently degrade
 
 `mhtml` (L4) and `nav_history` (L5) are unconditionally CDP-requiring -- see
@@ -386,6 +410,26 @@ def _tab_status(captures: dict[str, Any]) -> str:
     return "partial"
 
 
+_NOT_FOUND_REASON = (
+    "tab_id was explicitly requested (via tab_ids) but is absent from the live tabs "
+    "inventory -- most likely closed between when the caller read the inventory and "
+    "when this archive ran. This is a benign, expected outcome, not a capture failure "
+    "(there is no tab left to capture), but it must not be invisible: every id in "
+    "tab_ids gets an entry in manifest['tabs'], one way or another."
+)
+
+
+def _not_found_tab_entry() -> dict[str, Any]:
+    """Synthetic `manifest["tabs"][tab_id]` entry for a `tab_ids` id that no longer
+    exists in the live inventory -- the FIFTH per-tab state (module docstring's "No
+    silent partial success" section), distinct from `"ok"`/`"partial"`/`"failed"`/
+    `"skipped"`. Unlike those four, there is no tab record to pull `url`/`title`/
+    `window_id` from and no `captures` dict to populate -- the tab was never found in
+    the first place, so this entry carries only `status` and `reason`.
+    """
+    return {"status": "not_found", "reason": _NOT_FOUND_REASON}
+
+
 _SKIP_ASLEEP_REASON = (
     "tab is discarded/asleep; the archive orchestrator never wakes a tab implicitly -- pass "
     "wake=True to allow this (reloading a discarded tab to satisfy read/page_state destroys "
@@ -533,7 +577,11 @@ async def run_archive(
 
     `tab_ids`, if given, restricts per-tab capture (L1+) to that subset -- the L0
     windows/groups/tabs inventory is always captured in full regardless (it is
-    already cheap and has no per-tab cost). `wake`, if True, allows per-tab
+    already cheap and has no per-tab cost). A requested id absent from the live
+    inventory (e.g. the tab was closed between the caller reading it and this
+    call) gets its own `manifest["tabs"][tab_id] = {"status": "not_found", ...}`
+    entry -- see module docstring's "No silent partial success" section -- so
+    every id in `tab_ids` is accounted for, never silently dropped. `wake`, if True, allows per-tab
     capture to reload/attach-wake a discarded or asleep tab -- see module
     docstring's "no-wake guarantee" section; the DEFAULT is to skip such tabs
     entirely rather than disturb them. `all_frames`, if True, is forwarded to the
@@ -625,6 +673,7 @@ async def run_archive(
         tab_list = []
 
     all_tabs = [t for t in tab_list if isinstance(t, dict)]
+    missing: list[int] = []
     if tab_ids is not None:
         selected_tabs = [t for t in all_tabs if t.get("tab_id") in tab_ids]
         found_ids = {t.get("tab_id") for t in selected_tabs}
@@ -653,6 +702,13 @@ async def run_archive(
                 timeout_s=timeout_s,
                 failures=failures,
             )
+        # A requested tab_id that vanished (closed) between inventory and capture is
+        # NEVER just absent -- see module docstring's "not_found" bullet under "No
+        # silent partial success". It gets its own entry here, alongside every other
+        # tab this run touched, rather than living only in the top-level
+        # `requested_tab_ids_not_found` convenience list.
+        for tab_id in missing:
+            tab_manifest[str(tab_id)] = _not_found_tab_entry()
     manifest["tabs"] = tab_manifest
 
     profile_result: dict[str, Any] | None
@@ -673,6 +729,7 @@ async def run_archive(
     tabs_failed = sum(1 for t in tab_manifest.values() if t.get("status") == "failed")
     tabs_partial = sum(1 for t in tab_manifest.values() if t.get("status") == "partial")
     tabs_captured = sum(1 for t in tab_manifest.values() if t.get("status") == "ok")
+    tabs_not_found = sum(1 for t in tab_manifest.values() if t.get("status") == "not_found")
 
     # See module docstring's "No silent partial success" section: the INVENTORY axis
     # (what actually exists in the browser -- populated at every depth, including L0)
@@ -688,15 +745,23 @@ async def run_archive(
     # would hide the real failures) or into `tabs_failed` (which would discard the
     # real artifacts already on disk for it -- observed live, a tab with 3 of 5
     # captures succeeding was previously counted as zero captures).
+    #
+    # `tabs_not_found` counts requested-but-vanished tab_ids (see `_not_found_tab_entry`).
+    # `tabs_capture_attempted` is computed as the sum of the four outcomes a real
+    # capture attempt can produce -- NOT `len(tab_manifest)` -- specifically so it
+    # excludes `tabs_not_found`: a tab_id that no longer exists was never actually
+    # attempted, and folding it into "attempted" would just recreate this same bug in
+    # a new shape (claiming an attempt happened when there was nothing to attempt).
     manifest["summary"] = {
         "windows_inventoried": _inventoried_count(manifest["windows"]),
         "tab_groups_inventoried": _inventoried_count(manifest["tab_groups"]),
         "tabs_inventoried": _inventoried_count(manifest["tabs_inventory"]),
-        "tabs_capture_attempted": len(tab_manifest),
+        "tabs_capture_attempted": tabs_captured + tabs_partial + tabs_failed + tabs_skipped,
         "tabs_captured": tabs_captured,
         "tabs_partial": tabs_partial,
         "tabs_skipped": tabs_skipped,
         "tabs_failed": tabs_failed,
+        "tabs_not_found": tabs_not_found,
         "profile": _profile_summary(profile_result),
         "has_failures": bool(failures),
     }
@@ -708,10 +773,13 @@ async def run_archive(
     # success" section). A tab counted in `tabs_partial` (or `tabs_failed`)
     # always contributed at least one entry to `failures` via `_capture_tab`'s
     # `record`, so a run containing any partial tab lands in the `failures`
-    # branch below, never the plain-"ok" branch.
+    # branch below, never the plain-"ok" branch. A `tabs_not_found` tab never adds
+    # to `failures` (it is benign, not a failure -- see `_NOT_FOUND_REASON`), so it
+    # is checked alongside `tabs_skipped` here: both are "something benign didn't
+    # get captured" outcomes, and neither is ever silently absorbed into plain "ok".
     if failures:
         manifest["status"] = "ok_with_failures"
-    elif tabs_skipped > 0:
+    elif tabs_skipped > 0 or tabs_not_found > 0:
         manifest["status"] = "ok_with_skips"
     else:
         manifest["status"] = "ok"

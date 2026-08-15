@@ -1407,6 +1407,21 @@ prior, binary behavior) discarded that fact. A `"partial"` (or `"failed"`) tab a
 contributes at least one entry to `manifest["failures"]`, so a run containing any partial tab
 is never reported as plain `"ok"`.
 
+A `tab_id` named in `tab_ids` can also vanish (tab closed) between when the caller read the
+tab inventory and when the archive ran -- a FIFTH per-tab state, `"not_found"`, distinct from
+`"ok"`/`"partial"`/`"failed"`/`"skipped"`. Observed live: a caller requesting 4 tab_ids got
+manifest entries for only 3 -- the vanished tab appeared in no `manifest["tabs"]` entry, no
+`manifest["failures"]` entry, and no `"skipped"` record, so nothing told the caller their
+fourth tab was ever requested. `manifest["tabs"][tab_id]` now always gets a
+`{"status": "not_found", "reason": ...}` entry for a vanished id, so every id in `tab_ids` is
+accounted for one way or another. This is benign (there is no tab left to capture, so it is
+not a capture failure) and never adds to `manifest["failures"]`, but -- like `"skipped"`
+tabs -- it is never silently folded into a plain `"ok"` run either: `summary["tabs_not_found"]`
+counts it explicitly, `summary["tabs_capture_attempted"]` excludes it (a vanished tab was never
+actually attempted), and `manifest["status"]` becomes `"ok_with_skips"`, the same bucket
+`"skipped"` tabs use since both are benign, non-failure gaps. The top-level
+`manifest["requested_tab_ids_not_found"]` list remains a convenience summary of the same ids.
+
 ## The three-tier connectivity model
 
 | Tier | Meaning | Agent-visible behavior |

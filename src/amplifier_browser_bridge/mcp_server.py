@@ -1061,6 +1061,16 @@ async def browser_archive(
     `"skipped"` (no-wake guarantee) stays a distinct fourth state.
     `manifest["summary"]["tabs_partial"]` counts partial tabs explicitly, and
     a run containing any partial tab is never reported as plain `"ok"`.
+
+    A tab_id named in `tab_ids` that no longer exists in the live inventory
+    (closed between the caller reading it and this call) is a FIFTH state,
+    `"not_found"` -- `manifest["tabs"][tab_id]` gets a `{"status":
+    "not_found", "reason": ...}` entry so every requested id is accounted
+    for, never silently dropped. This is benign (nothing failed -- there was
+    just nothing left to capture) so it never adds to `manifest["failures"]`,
+    but it still moves `manifest["status"]` away from plain `"ok"` (to
+    `"ok_with_skips"`, the same bucket `"skipped"` tabs use) and is counted
+    explicitly in `manifest["summary"]["tabs_not_found"]`.
     """
     try:
         return await _run_archive(
