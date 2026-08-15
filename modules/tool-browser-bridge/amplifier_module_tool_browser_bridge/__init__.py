@@ -1031,7 +1031,14 @@ def _build_tools() -> list[_HubTool]:
             "(from the always-run inventory); tabs_captured/tabs_skipped/tabs_failed describe "
             "per-tab CONTENT capture and are honestly all 0 at L0 -- that is success, not an empty "
             "archive. An L0 run of 735 tabs reports tabs_inventoried: 735 alongside "
-            "tabs_captured: 0; it never reports tabs_inventoried: 0.",
+            "tabs_captured: 0; it never reports tabs_inventoried: 0.\n\n"
+            "Per-tab status is likewise not binary: 'ok' only when every attempted capture "
+            "succeeded, 'failed' only when every attempted capture failed, and 'partial' when "
+            "some succeeded and some failed (e.g. a browser error page where CDP-based captures "
+            "-- mhtml/screenshot/nav_history -- succeed even though JS-injection captures -- "
+            "text/dom -- cannot run at all). 'skipped' (no-wake guarantee) stays a distinct "
+            "fourth state. manifest['summary']['tabs_partial'] counts partial tabs explicitly, "
+            "and a run containing any partial tab is never reported as plain 'ok'.",
             {
                 "type": "object",
                 "properties": {

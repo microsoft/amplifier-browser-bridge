@@ -251,6 +251,15 @@ An L0 archive of 735 real tabs reports `tabs_inventoried: 735` alongside
 `tabs_captured: 0` -- never `tabs_inventoried: 0`, which would misread as "nothing
 was archived" when 735 tabs are sitting on disk.
 
+Per-tab status is likewise not binary: `"ok"` (every attempted capture succeeded),
+`"partial"` (some succeeded, some failed -- e.g. a browser error page where
+CDP-based captures like `mhtml`/`screenshot`/`nav_history` succeed even though
+JS-injection captures like `text`/`dom` cannot run at all), or `"failed"` (every
+attempted capture failed); `"skipped"` (no-wake guarantee) remains a distinct
+fourth state. `summary["tabs_partial"]` counts partial tabs explicitly, and a run
+containing any partial tab is never reported as plain `"ok"` -- a partial tab
+always adds at least one entry to `manifest["failures"]`.
+
 ## Extension update (Tier 0/1/2)
 
 `browser_update_extension` is the ONE agent-facing tool for the version-skew story

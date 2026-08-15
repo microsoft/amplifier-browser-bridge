@@ -1394,6 +1394,19 @@ L0 by design; `profile`, `None` below L5). An L0 archive of 735 real tabs report
 `tabs_inventoried: 735` alongside `tabs_captured: 0` -- a caller must never read the latter as
 "nothing was archived" when the former says otherwise.
 
+Per-tab status is not binary either: `manifest["tabs"][tab_id]["status"]` is `"ok"` only when
+every attempted capture (`text`/`dom`/`screenshot`/`mhtml`/`nav_history`, whichever ran at this
+depth) succeeded, `"failed"` only when every attempted capture failed, and `"partial"` -- a
+third, middle state -- when some succeeded and some failed; `"skipped"` (no-wake guarantee)
+remains a separate, fourth state. `summary["tabs_partial"]` counts partial tabs explicitly,
+alongside `tabs_captured`/`tabs_skipped`/`tabs_failed`. Observed live: a tab on a browser error
+page failed `text`/`dom` (JS injection cannot run on an error page) while `mhtml`/`screenshot`/
+`nav_history` (CDP-based, an independent capture route -- see `archive.py`'s module docstring)
+all succeeded, landing ~147KB of real artifacts on disk; reporting that tab `"failed"` (the
+prior, binary behavior) discarded that fact. A `"partial"` (or `"failed"`) tab always
+contributes at least one entry to `manifest["failures"]`, so a run containing any partial tab
+is never reported as plain `"ok"`.
+
 ## The three-tier connectivity model
 
 | Tier | Meaning | Agent-visible behavior |

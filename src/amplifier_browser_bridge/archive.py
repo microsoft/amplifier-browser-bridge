@@ -34,6 +34,16 @@ Cheapest to deepest, each level a strict superset of the level below:
           included at L5 (or any level) unless `include_cookies=True` is passed
           explicitly -- see "Cookies are opt-in" below.
 
+`mhtml`/`screenshot`/`nav_history` (CDP-based) and `text`/`dom` (JS injection) are
+independent capture ROUTES, not a fallback ladder of one over the other -- a page can
+be fully archivable via one route while being completely dead to the other. Observed
+live: a tab showing a browser error page failed `text`/`dom` outright ("Frame with ID
+0 is showing error page" -- JS injection cannot run on an error page at all), while
+`mhtml`/`screenshot`/`nav_history` all succeeded on the same tab, landing ~147KB of
+real artifacts on disk. A page that refuses all injected script is not necessarily
+unarchivable: the CDP path reaches it regardless. This is why per-tab status has a
+`"partial"` state (see "No silent partial success" below) rather than a binary one.
+
 ## The no-wake guarantee
 
 At real-world scale (700+ tabs), most tabs are discarded (Edge unloaded their
@@ -73,6 +83,23 @@ archive. But the manifest is built so a failure is impossible to miss:
   is `None` below L5, otherwise item-level capture counts. An L0 archive of 735 tabs
   reports `tabs_inventoried: 735` even though `tabs_captured` is `0`: the summary
   must never read as "nothing was archived" when the inventory says otherwise.
+- Per-tab status is not binary either. A tab's `captures` dict holds one entry per
+  attempted capture (`text`/`dom`/`screenshot`/`mhtml`/`nav_history`, whichever ran
+  at this depth); the tab's own `status` rolls those up into exactly one of three
+  outcomes (see `_tab_status`): `"ok"` ONLY when every attempted capture succeeded,
+  `"failed"` ONLY when every attempted capture failed, and `"partial"` -- the middle
+  state -- when some succeeded and some failed. A tab that is intentionally
+  `"skipped"` (no-wake guarantee, above) never contacts the browser at all and is a
+  distinct fourth state, never confused with any of the three capture outcomes.
+  `summary["tabs_partial"]` counts these explicitly alongside `tabs_captured`/
+  `tabs_skipped`/`tabs_failed`. This is the direct fix for the bug where a tab with
+  3 of 5 captures succeeding (mhtml/nav_history/screenshot ok, text/dom failed on a
+  browser error page -- see the depth-ladder note on CDP vs. JS-injection routes,
+  above) was reported `"failed"` and counted as zero captures in `summary`, discarding
+  the ~147KB of real artifacts already written to disk for that tab. A `"partial"` (or
+  `"failed"`) tab always contributes at least one entry to `manifest["failures"]` (see
+  `_capture_tab`'s `record`), so a run containing any partial tab is never reported as
+  plain `"ok"`.
 
 ## Impossible depth: fail loud, never silently degrade
 
@@ -336,6 +363,29 @@ def _record_mhtml_capture(tab_dir: Path, result: Any) -> dict[str, Any]:
     return {"status": "ok", "path": str(path), "bytes": len(mhtml_text.encode("utf-8"))}
 
 
+def _tab_status(captures: dict[str, Any]) -> str:
+    """Rolls up a tab's per-capture statuses (`text`/`dom`/`screenshot`/`mhtml`/
+    `nav_history`, whichever ran at this depth) into ONE tab-level status --
+    never binary. `"ok"` only when every attempted capture succeeded, `"failed"`
+    only when every attempted capture failed, and `"partial"` -- the middle
+    state neither of the other two can honestly claim -- when some succeeded and
+    some failed (module docstring's "No silent partial success" section). This
+    is the direct fix for the bug observed live: a tab on a browser error page
+    had `text`/`dom` (JS injection) fail outright while `mhtml`/`screenshot`/
+    `nav_history` (CDP-based, see the depth-ladder note on independent capture
+    routes) all succeeded -- reporting that tab `"failed"` (the prior, binary
+    behavior) discarded the ~147KB of real artifacts already on disk for it.
+    Assumes at least one capture was attempted; `_capture_tab` never calls this
+    for a `"skipped"` tab, which returns before any capture runs.
+    """
+    ok_count = sum(1 for c in captures.values() if c.get("status") == "ok")
+    if ok_count == len(captures):
+        return "ok"
+    if ok_count == 0:
+        return "failed"
+    return "partial"
+
+
 _SKIP_ASLEEP_REASON = (
     "tab is discarded/asleep; the archive orchestrator never wakes a tab implicitly -- pass "
     "wake=True to allow this (reloading a discarded tab to satisfy read/page_state destroys "
@@ -379,13 +429,9 @@ async def _capture_tab(
     if timeout_s is not None:
         base_args["timeout_s"] = timeout_s
 
-    any_failed = False
-
     def record(name: str, capture_entry: dict[str, Any]) -> None:
-        nonlocal any_failed
         entry["captures"][name] = capture_entry
         if capture_entry.get("status") != "ok":
-            any_failed = True
             failures.append(
                 {"scope": "tab", "tab_id": tab_id, "capture": name, "error": capture_entry.get("error")}
             )
@@ -416,7 +462,7 @@ async def _capture_tab(
         result = await client.command(target, "nav_history", dict(base_args))
         record("nav_history", _record_json_capture(tab_dir, "nav_history.json", result))
 
-    entry["status"] = "failed" if any_failed else "ok"
+    entry["status"] = _tab_status(entry["captures"])
     return entry
 
 
@@ -625,6 +671,7 @@ async def run_archive(
 
     tabs_skipped = sum(1 for t in tab_manifest.values() if t.get("status") == "skipped")
     tabs_failed = sum(1 for t in tab_manifest.values() if t.get("status") == "failed")
+    tabs_partial = sum(1 for t in tab_manifest.values() if t.get("status") == "partial")
     tabs_captured = sum(1 for t in tab_manifest.values() if t.get("status") == "ok")
 
     # See module docstring's "No silent partial success" section: the INVENTORY axis
@@ -634,12 +681,20 @@ async def run_archive(
     # where an L0 archive of 735 real tabs reported `tabs_total: 0`: that field was
     # silently reading `len(tab_manifest)` (a capture count) where a caller expected
     # a true inventory count.
+    #
+    # `tabs_partial` is the same fix one level down: a tab's own status is not
+    # binary (see `_tab_status`), so a tab where SOME captures succeeded and some
+    # failed must be counted on its own, never folded into `tabs_captured` (which
+    # would hide the real failures) or into `tabs_failed` (which would discard the
+    # real artifacts already on disk for it -- observed live, a tab with 3 of 5
+    # captures succeeding was previously counted as zero captures).
     manifest["summary"] = {
         "windows_inventoried": _inventoried_count(manifest["windows"]),
         "tab_groups_inventoried": _inventoried_count(manifest["tab_groups"]),
         "tabs_inventoried": _inventoried_count(manifest["tabs_inventory"]),
         "tabs_capture_attempted": len(tab_manifest),
         "tabs_captured": tabs_captured,
+        "tabs_partial": tabs_partial,
         "tabs_skipped": tabs_skipped,
         "tabs_failed": tabs_failed,
         "profile": _profile_summary(profile_result),
@@ -650,7 +705,10 @@ async def run_archive(
     # reserved for a run with zero failures AND zero skips; a degraded run (any
     # failure, or any tab intentionally skipped to honor the no-wake guarantee)
     # is never reported as plain "ok" (module docstring's "No silent partial
-    # success" section).
+    # success" section). A tab counted in `tabs_partial` (or `tabs_failed`)
+    # always contributed at least one entry to `failures` via `_capture_tab`'s
+    # `record`, so a run containing any partial tab lands in the `failures`
+    # branch below, never the plain-"ok" branch.
     if failures:
         manifest["status"] = "ok_with_failures"
     elif tabs_skipped > 0:

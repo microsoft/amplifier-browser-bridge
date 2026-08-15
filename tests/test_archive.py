@@ -419,11 +419,155 @@ async def test_overall_status_is_plain_ok_when_everything_succeeds(tmp_path: Pat
         "tabs_inventoried": 1,
         "tabs_capture_attempted": 1,
         "tabs_captured": 1,
+        "tabs_partial": 0,
         "tabs_skipped": 0,
         "tabs_failed": 0,
         "profile": None,
         "has_failures": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-tab status is not binary: "partial" is the middle state between "ok"
+# and "failed" -- the bug ff5bc16 fixed one level up (run-level summary),
+# missed one level down (per-tab status).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tab_with_mixed_success_and_failure_reports_partial_not_ok_or_failed(
+    tmp_path: Path,
+) -> None:
+    """The bug, observed live against a real tab whose page was a browser error
+    page: `text`/`dom` (JS injection) failed outright ("Frame with ID 0 is
+    showing error page") while `mhtml`/`screenshot`/`nav_history` (CDP-based)
+    all succeeded, landing ~147KB of real artifacts on disk. That tab is
+    neither a clean success nor a total loss -- it must report `"partial"`,
+    and `summary` must count it as neither a captured tab nor a failed one."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "read": {"ok": False, "error": "Frame with ID 0 is showing error page"},
+            "page_state": {"ok": False, "error": "Frame with ID 0 is showing error page"},
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L5")
+    manifest = result["result"]
+    entry = manifest["tabs"]["101"]
+
+    assert entry["status"] == "partial"
+    assert entry["captures"]["text"]["status"] == "failed"
+    assert entry["captures"]["dom"]["status"] == "failed"
+    assert entry["captures"]["screenshot"]["status"] == "ok"
+    assert entry["captures"]["mhtml"]["status"] == "ok"
+    assert entry["captures"]["nav_history"]["status"] == "ok"
+
+    # The load-bearing assertions: not a clean capture, not a total failure.
+    assert manifest["summary"]["tabs_captured"] == 0
+    assert manifest["summary"]["tabs_failed"] == 0
+    assert manifest["summary"]["tabs_partial"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tab_with_every_capture_failing_still_reports_failed(tmp_path: Path) -> None:
+    """The other end of the same axis: a tab where NOTHING succeeded must still
+    report `"failed"`, not `"partial"` -- `"partial"` is reserved for the
+    genuine middle ground, not a synonym for any failure at all."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "read": {"ok": False, "error": "boom-text"},
+            "page_state": {"ok": False, "error": "boom-dom"},
+            "screenshot": {"ok": False, "error": "boom-screenshot"},
+            "mhtml": {"ok": False, "error": "boom-mhtml"},
+            "nav_history": {"ok": False, "error": "boom-nav"},
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L5")
+    manifest = result["result"]
+    entry = manifest["tabs"]["101"]
+
+    assert entry["status"] == "failed"
+    assert manifest["summary"]["tabs_failed"] == 1
+    assert manifest["summary"]["tabs_partial"] == 0
+    assert manifest["summary"]["tabs_captured"] == 0
+
+
+@pytest.mark.asyncio
+async def test_skipped_tab_is_distinct_from_ok_partial_and_failed_tabs(tmp_path: Path) -> None:
+    """A tab intentionally skipped (no-wake guarantee) is a FOURTH state, never
+    confused with any of the three capture outcomes -- exercised here
+    alongside a fully-ok tab and a fully-failed tab in the same run."""
+    client = _basic_client(
+        tabs=[_tab(101, discarded=True), _tab(102), _tab(103)],
+        extra_commands={
+            "read": [
+                {"ok": True, "result": {"url": "https://example.com", "title": "Test Page", "text": "hi"}},
+                {"ok": False, "error": "boom"},
+            ],
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1")
+    manifest = result["result"]
+
+    assert manifest["tabs"]["101"]["status"] == "skipped"
+    assert manifest["tabs"]["102"]["status"] == "ok"
+    assert manifest["tabs"]["103"]["status"] == "failed"
+
+    summary = manifest["summary"]
+    assert summary["tabs_skipped"] == 1
+    assert summary["tabs_captured"] == 1
+    assert summary["tabs_failed"] == 1
+    assert summary["tabs_partial"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_level_status_is_not_plain_ok_when_a_tab_is_partial(tmp_path: Path) -> None:
+    """A run containing a partial tab must not be reported as plain `"ok"` --
+    the per-tab capture failures underlying the partial status always land in
+    the top-level `failures` list (via `_capture_tab`'s `record`), which forces
+    the already-existing degraded-status branch. Verified explicitly rather
+    than assumed, since this is the caller-visible guarantee from the bug
+    report ("keep manifest['status'] honest")."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={"read": {"ok": False, "error": "boom-text"}},
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L5")
+    manifest = result["result"]
+
+    assert manifest["tabs"]["101"]["status"] == "partial"
+    assert manifest["status"] == "ok_with_failures"
+    assert manifest["status"] != "ok"
+
+
+@pytest.mark.asyncio
+async def test_partial_tab_failures_still_carry_original_error_text(tmp_path: Path) -> None:
+    """`manifest["failures"]` is what told the reporter the real cause of the
+    live bug ("Frame with ID 0 is showing error page") -- it must not get
+    quieter just because the tab's rolled-up status is now `"partial"` instead
+    of `"failed"`."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "read": {"ok": False, "error": "Frame with ID 0 is showing error page"},
+            "page_state": {"ok": False, "error": "Frame with ID 0 is showing error page"},
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L5")
+    manifest = result["result"]
+
+    assert manifest["tabs"]["101"]["status"] == "partial"
+    text_failures = [f for f in manifest["failures"] if f["capture"] == "text"]
+    dom_failures = [f for f in manifest["failures"] if f["capture"] == "dom"]
+    assert len(text_failures) == 1
+    assert text_failures[0]["error"] == "Frame with ID 0 is showing error page"
+    assert len(dom_failures) == 1
+    assert dom_failures[0]["error"] == "Frame with ID 0 is showing error page"
 
 
 # ---------------------------------------------------------------------------
