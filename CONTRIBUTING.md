@@ -132,6 +132,7 @@ node --input-type=module --check < extension/combine_frames.mjs
 node --input-type=module --check < extension/download_claim.mjs
 node --input-type=module --check < extension/fetch_utils.mjs
 node --input-type=module --check < extension/flatten_bookmarks.mjs
+node --input-type=module --check < extension/build_stamp.mjs
 ```
 
 (`--input-type=module` is required because these files use ES module `import`/`export` syntax

@@ -67,6 +67,15 @@ class DeviceRecord:
     # (pyproject.toml said 0.1.0, manifest.json said 0.4.0, same repo, same
     # day). Never consulted for skew detection -- see skew.py.
     manifest_version: str | None = None
+    # Build-freshness handshake (build_stamp.py's module docstring): the
+    # content-derived hash of this device's CURRENT build's shipped files,
+    # self-reported in `hello.build_stamp` (extension/background.js's
+    # `computeBuildStamp()`). `None` -- not an empty string -- means this
+    # device has never reported one at all: every extension shipped before
+    # this feature, exactly the same distinct "never reported" state
+    # `commands` already carries (`build_stamp.py`'s
+    # `BuildFreshness.known = False`), not "reports an empty build."
+    build_stamp: str | None = None
 
     ws: DeviceConnection | None = None
     connected_at: datetime | None = None
@@ -117,6 +126,13 @@ class DeviceRecord:
         manifest_version = hello.get("manifest_version")
         if isinstance(manifest_version, str):
             self.manifest_version = manifest_version
+        # Build-freshness handshake -- see this class's `build_stamp` field
+        # docstring and build_stamp.py's module docstring. Same "absent
+        # leaves it None, never an empty/guessed value" discipline as
+        # `commands` above.
+        build_stamp = hello.get("build_stamp")
+        if isinstance(build_stamp, str):
+            self.build_stamp = build_stamp
         now = datetime.now(UTC)
         self.connected_at = now
         self.last_seen = now
@@ -151,6 +167,13 @@ class DeviceRecord:
             # because both are comparisons against HUB-owned state.
             "commands": sorted(self.commands) if self.commands is not None else None,
             "manifest_version": self.manifest_version,
+            # Build-freshness handshake -- `None` means this device has
+            # never reported a build stamp at all (build_stamp.py's
+            # `BuildFreshness.known = False`). See `hub.py`'s
+            # `_devices_snapshot` for the "build_freshness" key computed FROM
+            # this against the hub's own currently-expected stamp -- kept out
+            # of this class deliberately, same reasoning as "skew" above.
+            "build_stamp": self.build_stamp,
             "connected": self.connected,
             "tier": self.tier.value,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,

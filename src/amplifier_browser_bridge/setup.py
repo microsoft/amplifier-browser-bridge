@@ -77,6 +77,15 @@ _EXTENSION_FILES = (
     # 87ce68d whitelist-omission failure mode as every other entry above
     # applies if this is ever omitted here.
     "flatten_bookmarks.mjs",
+    # Build-freshness handshake (build_stamp.py's module docstring):
+    # background.js statically imports this at module top level for
+    # computeBuildStamp()'s pure hashing logic. Same 87ce68d
+    # whitelist-omission failure mode as every other entry above applies if
+    # this is ever omitted here. Also (unlike every other reason in this
+    # list) itself one of the files whose bytes get hashed -- an ordinary,
+    # tracked source file, not a generated one; see build_stamp.py's "No
+    # generated file, no circularity" for why that distinction matters.
+    "build_stamp.mjs",
     "manifest.json",
     # Toolbar/store icons. Referenced by manifest.json's `icons` and
     # `action.default_icon`, so `verify_extension_integrity` (which reads those

@@ -24,6 +24,7 @@ import { EffectsCollector, EFFECTS_WINDOW_MS, emptyEffectsReport } from "./effec
 import { resolveBundledConfigAdoption, CONFIG_SOURCE_BUNDLED, BUNDLED_CONFIG_RESOURCE } from "./bundled_config.mjs";
 import { classifyHubErrorMessage, classifyCloseEvent, badgeTitleForErrorCode } from "./connection_error.mjs";
 import { flattenBookmarks } from "./flatten_bookmarks.mjs";
+import { digestShippedEntries } from "./build_stamp.mjs";
 
 const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 15000; // measured to hold a desktop MV3 worker alive
@@ -48,6 +49,15 @@ let heartbeatSeq = 0;
 // invocation, never a typeof check -- same discipline as probeCapabilities()).
 // "none" until probed.
 let effectsTier = "none";
+// Build-freshness handshake (build_stamp.py): this build's content-derived
+// stamp, computed once via computeBuildStamp() and cached here for the
+// lifetime of this service-worker instance -- the shipped files cannot
+// change without a full extension reload (which restarts this whole
+// script), so re-fetching/re-hashing on every reconnect would be pure
+// waste. `null` until first computed, and re-attempted (not permanently
+// stuck at `null`) on every connect attempt that finds it still unset --
+// see connectLocked() below.
+let buildStamp = null;
 // Last classified connection failure reason (connection_error.mjs), or `null` if
 // either never attempted yet or the most recent attempt is currently in flight /
 // succeeded. Reset at the START of every new connect attempt (connectLocked())
@@ -637,6 +647,7 @@ async function connectLocked() {
   await ensureIdentity();
   if (!capabilities) capabilities = await probeCapabilities();
   effectsTier = await probeEffectsTier();
+  if (!buildStamp) buildStamp = await computeBuildStamp();
 
   try {
     ws = new WebSocket(hubUrl);
@@ -706,6 +717,18 @@ function sendHello() {
     // authoritative skew signal (manifest.json's version is hand-maintained
     // and has already been observed to drift from pyproject.toml's).
     manifest_version: chrome.runtime.getManifest().version,
+    // Build-freshness handshake (build_stamp.py's module docstring): a
+    // content-derived hash of this build's actual shipped files -- see
+    // computeBuildStamp() above. Answers "IS this device running the
+    // CURRENT build", a DIFFERENT question from `commands` above ("what can
+    // this device DO"): a device can be command-complete and still stale
+    // (a bug/UI/security fix that adds/removes no command). `null` if the
+    // computation itself failed (see computeBuildStamp()) -- the hub treats
+    // a missing/null `build_stamp` as "build not yet known" (registry.py's
+    // DeviceRecord.build_stamp is `None`), the same definitively-stale
+    // treatment `commands` being absent already gets, never "assume
+    // current."
+    build_stamp: buildStamp,
     token: hubToken,
   });
 }
@@ -865,6 +888,73 @@ const PAGE_WORLD_COMMANDS = new Set([
   "wait_text",
   "page_state",
 ]);
+
+// Build-freshness handshake (build_stamp.py's module docstring): the exact
+// same file set setup.py's `_EXTENSION_FILES` stages/zips/hashes -- mirrored
+// BY HAND, same "keep the two protocol implementations in sync by hand"
+// convention as SUPPORTED_COMMANDS/PAGE_WORLD_COMMANDS above, guarded
+// against drift by tests/test_extension_command_parity.py's build-stamp
+// file-list parity test. This is what answers "is this device running the
+// CURRENT build" -- a DIFFERENT question from "what can this device DO"
+// (SUPPORTED_COMMANDS above): a bug/UI/security fix that adds or removes no
+// command (e.g. this repo's own commits 6175ce4/cc140c5) is invisible to
+// the command-set handshake but changes every byte this list hashes.
+const SHIPPED_FILES = [
+  "background.js",
+  "injected.js",
+  "options.html",
+  "options.js",
+  "config_validate.mjs",
+  "frame_refs.mjs",
+  "combine_frames.mjs",
+  "ref_registry.mjs",
+  "args_bool.mjs",
+  "fetch_utils.mjs",
+  "download_claim.mjs",
+  "pairing_code.mjs",
+  "pair_discovery.mjs",
+  "connection_error.mjs",
+  "bundled_config.mjs",
+  "effects_collector.mjs",
+  "flatten_bookmarks.mjs",
+  "build_stamp.mjs",
+  "manifest.json",
+  "icons/icon-16.png",
+  "icons/icon-32.png",
+  "icons/icon-48.png",
+  "icons/icon-128.png",
+];
+
+// Computes this build's content-derived stamp: SHA-256 over the bytes of
+// every file in SHIPPED_FILES (sorted, for a fixed order), read from this
+// extension's OWN already-loaded resources via chrome.runtime.getURL --
+// never a generated/bundled stamp file, so there is nothing new to keep in
+// sync with a staging whitelist and no risk of hashing a file that embeds
+// its own hash (see build_stamp.py's module docstring, "No generated file,
+// no circularity"). Each file's contribution is its name (UTF-8 bytes) + a
+// NUL separator + its raw bytes + a NUL separator -- the exact byte layout
+// `amplifier_browser_bridge.build_stamp.compute_build_stamp` reproduces on
+// the hub side, so the two can never disagree over encoding or ordering.
+//
+// Returns `null` (never throws) on any failure to fetch/hash a shipped
+// file -- an extension that cannot compute its own stamp is treated
+// identically to one that has never reported one at all (see sendHello()
+// below and build_stamp.py's "pre-stamp case"): definitively stale, not
+// "unknown, assume current."
+async function computeBuildStamp() {
+  try {
+    const entries = [];
+    for (const name of SHIPPED_FILES) {
+      const response = await fetch(chrome.runtime.getURL(name));
+      if (!response.ok) throw new Error(`fetch(${name}) -> HTTP ${response.status}`);
+      entries.push({ name, bytes: new Uint8Array(await response.arrayBuffer()) });
+    }
+    return await digestShippedEntries(entries);
+  } catch (err) {
+    console.error("amplifier-browser-bridge: failed to compute build stamp", err);
+    return null;
+  }
+}
 
 // Commands that gather results across EVERY frame of the tab (Bug 2, real-profile
 // hardening: injection was top-frame-only, so any document rendered in an embedded

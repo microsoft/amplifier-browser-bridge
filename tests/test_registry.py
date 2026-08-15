@@ -156,6 +156,50 @@ def test_to_summary_reports_sorted_commands_list() -> None:
     assert summary["commands"] == ["click", "reload", "snapshot"]
 
 
+# ---------------------------------------------------------------------------
+# Build-freshness handshake -- self-reported content hash (build_stamp.py)
+# ---------------------------------------------------------------------------
+
+
+def test_bind_without_build_stamp_field_leaves_build_stamp_none() -> None:
+    """A pre-stamp `hello` (every extension shipped before this feature)
+    omits `build_stamp` entirely -- this must leave `record.build_stamp` as
+    `None`, the same distinct 'never reported' state `commands` already
+    carries (see registry.py's field docstring and build_stamp.py's
+    'pre-stamp case')."""
+    registry = DeviceRegistry()
+    record = registry.get_or_create("device-a")
+    record.bind(_FakeWebSocket(), {"label": "edge-macos", "platform": "macOS", "capabilities": {}})
+    assert record.build_stamp is None
+
+
+def test_bind_with_build_stamp_field_stores_it() -> None:
+    registry = DeviceRegistry()
+    record = registry.get_or_create("device-a")
+    record.bind(
+        _FakeWebSocket(),
+        {"label": "edge-macos", "platform": "macOS", "capabilities": {}, "build_stamp": "a" * 64},
+    )
+    assert record.build_stamp == "a" * 64
+
+
+def test_to_summary_reports_build_stamp_none_when_never_reported() -> None:
+    registry = DeviceRegistry()
+    record = registry.get_or_create("device-a")
+    record.bind(_FakeWebSocket(), {"label": "edge-macos", "platform": "macOS", "capabilities": {}})
+    assert record.to_summary()["build_stamp"] is None
+
+
+def test_to_summary_reports_the_reported_build_stamp() -> None:
+    registry = DeviceRegistry()
+    record = registry.get_or_create("device-a")
+    record.bind(
+        _FakeWebSocket(),
+        {"label": "edge-macos", "platform": "macOS", "capabilities": {}, "build_stamp": "b" * 64},
+    )
+    assert record.to_summary()["build_stamp"] == "b" * 64
+
+
 def test_reconnecting_rebind_changes_connected_at() -> None:
     """A fresh `bind()` (e.g. a reload-triggered reconnect) must produce a NEW
     `connected_at` -- this is the exact signal `update_extension.py`'s

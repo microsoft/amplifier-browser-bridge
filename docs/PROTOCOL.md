@@ -76,6 +76,7 @@ Sent once, immediately after the WebSocket opens. Establishes device identity an
   "protocol_version": 1,
   "commands": ["snapshot", "click", "type", "...", "reload"],
   "manifest_version": "0.5.0",
+  "build_stamp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "token": "shared secret, validated against the hub's TokenStore"
 }
 ```
@@ -123,6 +124,27 @@ failing a command. See `update_extension.py`'s module docstring for how the
 as **diagnostic color** -- useful for a human glancing at a `devices` listing -- and is **never**
 consulted for skew detection; only the self-reported command set is authoritative, for exactly
 the reason above (it cannot drift the way a version string already has).
+
+**`build_stamp` (build-freshness handshake -- the sibling story `commands` does NOT cover).**
+`commands` answers "what can this device DO" -- capability skew. It does NOT answer "IS this
+device running the CURRENT build": a change that adds or removes zero commands (a bug fix, a UI
+fix, a security fix -- this repo's own commits `6175ce4`/`cc140c5` touched only `options.js`) is
+completely invisible to it. Proven live: pointing `browser_update_extension` at a real,
+genuinely-outdated browser that had already caught up on commands returned `already_current:
+true` -- false. `build_stamp` closes this gap: it is a SHA-256 over the bytes of every file this
+build actually ships (`extension/background.js`'s `computeBuildStamp()`, hashing the same file
+set `setup.py`'s `_EXTENSION_FILES` stages/zips -- see `build_stamp.py`'s module docstring for the
+exact byte layout). Nobody has to remember to bump it, and unlike `manifest_version`, it cannot
+lie: if a single byte of a single shipped file changes, the stamp changes.
+
+The hub (`build_stamp.py`) compares a device's self-reported `build_stamp` against
+`current_build_stamp()` -- this hub's own currently-loaded extension source, hashed the same way.
+A device that omits `build_stamp` entirely -- every extension shipped before this feature -- is
+not treated as "unknown, assume current"; it is a distinct, definitively-stale state
+(`BuildFreshness.known = False`), the same discipline `commands` already applies. See "Reporting
+build freshness to an agent" below, and `update_extension.py`'s module docstring for how
+`browser_update_extension` now requires BOTH `commands` and `build_stamp` to check out before
+reporting `already_current`.
 
 A command the hub's own `COMMANDS` recognizes but a device has **positively** reported it
 doesn't support (`known=True`, command absent from `commands`) now fails **fast, at the hub**,
@@ -272,10 +294,17 @@ Response:
       "protocol_version": 1,
       "commands": ["snapshot", "click", "...", "reload"],
       "manifest_version": "0.5.0",
+      "build_stamp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "skew": {
         "known": true, "in_sync": false,
         "device_behind": ["a_new_command"], "hub_behind": [],
         "summary": "the EXTENSION is behind this hub -- missing ['a_new_command']; update the extension (browser_update_extension)"
+      },
+      "build_freshness": {
+        "known": true, "current": false,
+        "device_stamp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "hub_stamp": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "summary": "this extension's build stamp does not match the hub's current build -- the shipped files differ from what this hub would install (a bug fix, UI change, or other update not reflected in the command set). Update the extension (browser_update_extension)."
       },
       "connected": true,
       "connected_at": "2026-07-25T18:03:11.480+00:00",
@@ -287,20 +316,34 @@ Response:
 }
 ```
 
-### Reporting command-set skew to an agent (Tier 0 handshake)
+### Reporting command-set skew and build freshness to an agent (Tier 0 handshake)
 
 Every `devices`/`browser_devices` entry above carries `commands` (the device's raw
 self-reported set, or `null` if it has never reported one -- see the `hello` section's
-"`commands` and `manifest_version`"), `manifest_version` (diagnostic only), `connected_at`
-(the moment THIS connection was established -- distinct from `last_seen`, which a mere
-heartbeat on an already-live connection also bumps), and `skew` (`skew.py`'s
-`SkewReport.to_summary()`) -- the hub's own comparison of that device against its current
-`COMMANDS`. `skew.known = false` means the device has never reported a command set at all: a
-definitively stale extension, not a crash and not "unknown." `skew.summary` is `null` only when
-`in_sync` is `true`; otherwise it is a one-line, human-readable message naming exactly which
-side is behind and what to do about it. This is deliberately surfaced in the device listing
-itself -- an agent (or a human running `amplifier-browser-bridge devices`) can see staleness
-*before* ever failing a command against it, not only after.
+"`commands` and `manifest_version`"), `manifest_version` (diagnostic only), `build_stamp` (the
+device's raw self-reported content hash, or `null` if it has never reported one -- see the
+`hello` section's "`build_stamp`"), `connected_at` (the moment THIS connection was established --
+distinct from `last_seen`, which a mere heartbeat on an already-live connection also bumps), and
+TWO comparisons against this hub's own current state:
+
+- `skew` (`skew.py`'s `SkewReport.to_summary()`) -- the hub's own comparison of that device's
+  `commands` against its current `COMMANDS`. `skew.known = false` means the device has never
+  reported a command set at all: a definitively stale extension, not a crash and not "unknown."
+  `skew.summary` is `null` only when `in_sync` is `true`; otherwise it is a one-line,
+  human-readable message naming exactly which side is behind and what to do about it. Answers
+  "what can this device DO."
+- `build_freshness` (`build_stamp.py`'s `BuildFreshness.to_summary()`) -- the hub's own
+  comparison of that device's `build_stamp` against `current_build_stamp()` (this hub's own
+  currently-loaded extension source, hashed the same way). `build_freshness.known = false` means
+  the device has never reported a build stamp at all: a definitively stale build, the same
+  discipline `skew.known` already applies. `build_freshness.current` can be `false` even when
+  `skew.in_sync` is `true` -- a device can be command-complete and still running a stale build (a
+  bug/UI/security fix that touched zero commands). Answers "IS this device running the CURRENT
+  build."
+
+Both are deliberately surfaced in the device listing itself -- an agent (or a human running
+`amplifier-browser-bridge devices`) can see staleness on EITHER axis *before* ever failing a
+command against it, not only after.
 
 ### `command` (agent -> hub) / `result` (hub -> agent)
 

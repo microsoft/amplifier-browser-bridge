@@ -27,6 +27,14 @@ detection would report FALSE staleness (a real, implemented command missing from
 `SUPPORTED_COMMANDS`) or FALSE currency (a command in `SUPPORTED_COMMANDS` that
 `executeCommand()` doesn't actually implement) -- exactly the kind of silent drift
 this whole feature exists to make impossible to miss.
+
+The third parity test below guards `SHIPPED_FILES` -- the build-freshness handshake's
+(build_stamp.py) file list, hand-mirrored in `background.js` from `setup.py`'s
+`_EXTENSION_FILES`. If these two ever drifted, the hub and the device would hash
+DIFFERENT file sets for what's supposedly the same build, and `build_stamp.py`'s
+comparison would be worthless -- every device would look permanently stale (or,
+worse, permanently "current" while genuinely different) for a reason that has
+nothing to do with the actual shipped bytes.
 """
 
 from __future__ import annotations
@@ -35,12 +43,14 @@ import re
 from pathlib import Path
 
 from amplifier_browser_bridge.protocol import COMMANDS, PAGE_WORLD_COMMANDS
+from amplifier_browser_bridge.setup import _EXTENSION_FILES
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _BACKGROUND_JS = _REPO_ROOT / "extension" / "background.js"
 
 _SET_RE = re.compile(r"const PAGE_WORLD_COMMANDS = new Set\(\[(.*?)\]\);", re.DOTALL)
 _SUPPORTED_SET_RE = re.compile(r"const SUPPORTED_COMMANDS = new Set\(\[(.*?)\]\);", re.DOTALL)
+_SHIPPED_FILES_RE = re.compile(r"const SHIPPED_FILES = \[(.*?)\];", re.DOTALL)
 _STRING_RE = re.compile(r'"([^"]+)"')
 
 
@@ -55,6 +65,13 @@ def _extract_background_js_supported_commands() -> set[str]:
     text = _BACKGROUND_JS.read_text(encoding="utf-8")
     match = _SUPPORTED_SET_RE.search(text)
     assert match is not None, "could not find `const SUPPORTED_COMMANDS = new Set([...])` in background.js"
+    return set(_STRING_RE.findall(match.group(1)))
+
+
+def _extract_background_js_shipped_files() -> set[str]:
+    text = _BACKGROUND_JS.read_text(encoding="utf-8")
+    match = _SHIPPED_FILES_RE.search(text)
+    assert match is not None, "could not find `const SHIPPED_FILES = [...]` in background.js"
     return set(_STRING_RE.findall(match.group(1)))
 
 
@@ -97,4 +114,28 @@ def test_background_js_supported_commands_matches_protocol_py() -> None:
         "hub_behind) for a command that was never real.\n"
         f"protocol.py only: {sorted(py_commands - js_commands)}\n"
         f"background.js only: {sorted(js_commands - py_commands)}"
+    )
+
+
+def test_background_js_declares_a_nonempty_shipped_files_list() -> None:
+    """Same extraction-sanity guard as above, for the build-freshness handshake's
+    file list."""
+    assert len(_extract_background_js_shipped_files()) > 0
+
+
+def test_background_js_shipped_files_matches_setup_py_extension_files() -> None:
+    js_files = _extract_background_js_shipped_files()
+    py_files = set(_EXTENSION_FILES)
+    assert js_files == py_files, (
+        "extension/background.js's SHIPPED_FILES list (hashed by computeBuildStamp(), "
+        'the build-freshness handshake -- docs/PROTOCOL.md\'s "hello" section, '
+        "build_stamp.py) has drifted from setup.py's _EXTENSION_FILES (the authoritative "
+        '"what actually ships" list `stage_extension`/`extension_zip.py` materialize). '
+        "A file in one but not the other means the hub and the device hash DIFFERENT "
+        "file sets for what's supposedly the same build -- build_stamp.py's comparison "
+        "would be worthless, and every device would look permanently stale (or, worse, "
+        'permanently "current" while genuinely different) for a reason unrelated to the '
+        "actual shipped bytes.\n"
+        f"setup.py only: {sorted(py_files - js_files)}\n"
+        f"background.js only: {sorted(js_files - py_files)}"
     )

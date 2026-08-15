@@ -68,6 +68,8 @@ from .android_pack import AndroidPackError, PackerUnavailableError, build_androi
 from .args_bool import truthy
 from .audit import AuditLog
 from .auth import TokenStore, persist_device_token
+from .build_stamp import BuildStampError, current_build_stamp
+from .build_stamp import compute_freshness as _freshness_compute
 from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .effects import EffectsReport
 from .extension_integrity import ExtensionIntegrityError
@@ -1921,6 +1923,24 @@ class Hub:
     # ------------------------------------------------------------------
 
     def _devices_snapshot(self) -> list[dict[str, Any]]:
+        # Build-freshness handshake (build_stamp.py): this hub's own currently
+        # expected stamp is the SAME value for every device in this snapshot
+        # (it depends only on this hub's own extension source, never on any
+        # one device), so it's computed once per call rather than once per
+        # device. Computed fresh each call (see `current_build_stamp`'s
+        # docstring) -- cheap (a couple dozen small file reads), and never
+        # allowed to take down the whole listing: a hub-side source problem
+        # is named via `hub_error` on every entry instead of raising out of
+        # `_devices_snapshot` (which previously had zero filesystem
+        # dependency -- `browser_devices` must keep working even when this
+        # hub's own extension source is broken).
+        try:
+            hub_stamp: str | None = current_build_stamp()
+            hub_stamp_error: str | None = None
+        except (ExtensionSourceNotFoundError, BuildStampError) as e:
+            hub_stamp = None
+            hub_stamp_error = str(e)
+
         summaries = self.registry.snapshot()
         for summary in summaries:
             summary["cdp"] = self.cdp.snapshot(summary["device_id"])
@@ -1936,4 +1956,14 @@ class Hub:
             raw_commands = summary["commands"]
             device_commands = frozenset(raw_commands) if raw_commands is not None else None
             summary["skew"] = _skew_compute(device_commands, COMMANDS).to_summary()
+            # Build-freshness handshake (build_stamp.py) -- the sibling of
+            # `skew` above: "is this device running the CURRENT build" is a
+            # DIFFERENT question from "what can this device DO", and a
+            # device can be command-complete (skew.in_sync) while still
+            # running a stale build (a bug/UI/security fix that touched zero
+            # commands -- see build_stamp.py's module docstring for the real
+            # incident that motivated this).
+            summary["build_freshness"] = _freshness_compute(
+                summary["build_stamp"], hub_stamp, hub_error=hub_stamp_error
+            ).to_summary()
         return summaries
