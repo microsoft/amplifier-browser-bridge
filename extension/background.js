@@ -738,6 +738,7 @@ async function onMessage(raw) {
 
 const PAGE_WORLD_COMMANDS = new Set([
   "snapshot",
+  "describe",
   "read",
   "click",
   "type",
