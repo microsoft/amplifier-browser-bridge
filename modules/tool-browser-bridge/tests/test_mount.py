@@ -116,6 +116,7 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_wait_download",
         "browser_establish_session",
         "browser_narrow_scope",
+        "browser_archive",
         "browser_setup",
         "browser_setup_status",
     }
@@ -316,6 +317,68 @@ async def test_hub_error_surfaces_as_adapter_failure(monkeypatch: pytest.MonkeyP
 
     assert result.success is False
     assert "unauthorized" in str(result.output)
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_routes_through_run_archive(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Proves this surface actually routes through archive.py's run_archive
+    (not just a stub) -- tests/test_archive.py covers run_archive's own logic
+    (depth ladder, no-wake guarantee, failure recording, impossible-depth)."""
+
+    class _ScriptedClient:
+        def __init__(self) -> None:
+            self.command_calls: list[tuple[Any, str, dict[str, Any]]] = []
+
+        async def list_devices(self):
+            return [{"device_id": "d1", "capabilities": {"debugger": False, "scripting": True}}]
+
+        async def command(self, target, command, args):
+            self.command_calls.append((target, command, args))
+            if command == "windows":
+                return {"ok": True, "result": {"windows": [], "tab_groups": []}}
+            if command == "tabs":
+                return {"ok": True, "result": []}
+            return {"ok": True, "result": {}}
+
+    fake = _ScriptedClient()
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_archive")
+    result = await tool.execute({"device_id": "d1", "dest_dir": str(tmp_path), "depth": "L0"})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    assert output["result"]["device_id"] == "d1"
+    assert output["result"]["depth"] == "L0"
+    called_commands = {c for (_t, c, _a) in fake.command_calls}
+    assert called_commands == {"windows", "tabs"}
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_impossible_depth_returns_ok_false_not_adapter_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    class _NoDebuggerClient:
+        async def list_devices(self):
+            return [{"device_id": "d1", "capabilities": {"debugger": False}}]
+
+        async def command(self, target, command, args):
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: _NoDebuggerClient())
+
+    tool = _tool_by_name("browser_archive")
+    result = await tool.execute({"device_id": "d1", "dest_dir": str(tmp_path), "depth": "L4"})
+
+    # An ArchiveError is a legitimate, actionable RESULT (like ok: false for
+    # any other tool) -- not an adapter-level failure.
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is False
+    assert "debugger" in output["error"]
 
 
 @pytest.mark.asyncio

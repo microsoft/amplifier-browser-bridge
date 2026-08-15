@@ -5,15 +5,16 @@ Phase 1. This doc covers the two Phase 2 surfaces -- both are thin adapters over
 the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
-**Verified 2026-08-08 (grep-counted directly against the code, not assumed):**
-the native Amplifier tool module registers **25** tools; the MCP server also
-registers **25**. They are not byte-identical sets -- they differ by exactly
+**Verified 2026-08-14 (grep-counted directly against the code, not assumed):**
+the native Amplifier tool module registers **26** tools; the MCP server also
+registers **26**. They are not byte-identical sets -- they differ by exactly
 one tool each: the native module has `browser_reload` (the MCP server does
 not), and the MCP server has `browser_confirm` (the native module does not).
 Every other name below is shared by both, named `browser_<command>`
-(mirroring Playwright MCP's vocabulary, design doc section 9). Earlier
-revisions of this doc claimed "twenty-two" tools and this repo's `bundle.md`
-claimed "sixteen" -- both were stale as of this correction; see
+(mirroring Playwright MCP's vocabulary, design doc section 9), including the
+new `browser_archive` (D2, browser-state archive -- see below). Earlier
+revisions of this doc claimed "twenty-five" tools -- stale as of this
+correction (adding `browser_archive` moved both counts from 25 to 26); see
 `amplifier_module_tool_browser_bridge/__init__.py`'s `_build_tools()` and
 `mcp_server.py`'s `@mcp.tool()` decorators for the authoritative, current
 lists.
@@ -46,6 +47,7 @@ lists.
 | `browser_narrow_scope` | (agent-only) | narrow an existing session's scope -- never widens | both |
 | `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) | **native module only** |
 | `browser_confirm` | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
+| `browser_archive` | (composed: `windows`/`tabs`/`page_state`/`mhtml`/`nav_history`/profile-data commands) | D2, browser-state archive -- capture browser state at a chosen depth (L0-L5), write payloads to disk, return a MANIFEST (never the payload) -- see "Browser-state archive" below | both |
 
 See `docs/PROTOCOL.md` for the exact command semantics and `docs/designs/browser-bridge.md`
 for the addressing model (`device_id` -> `window_id`/`tab_id` -> `ref`) and the
@@ -193,12 +195,47 @@ not block, and it was not reported as an error.
 
 ## Amplifier tool module
 
-`modules/tool-browser-bridge/` wraps the same lib as 27 Amplifier tools: the 25 in the
+`modules/tool-browser-bridge/` wraps the same lib as 28 Amplifier tools: the 26 in the
 table above, plus `browser_setup` and `browser_setup_status` (native-module-only --
 in-process first-run/re-run setup and diagnostics, no CLI on PATH required; see
 `auto_setup.py` and the README's "Recommended: install via the Amplifier bundle").
 Every tool follows the `mount()` Iron Law (`creating-amplifier-modules`
 skill): each tool is registered via `await coordinator.mount("tools", tool, name=tool.name)`.
+
+## Browser-state archive (D2)
+
+`browser_archive` is the ONE agent-facing tool for the browser-state archive
+capability (`docs/PROTOCOL.md`'s "Browser-state archive" section, `archive.py`'s
+`run_archive`). It composes ten wire commands (`windows`, `page_state`, `mhtml`,
+`nav_history`, `history_list`, `bookmarks_list`, `sessions_list`, `top_sites`,
+`reading_list`, `cookies_list`) into a depth ladder (L0 through L5, cheapest to
+deepest), writes every captured payload straight to a timestamped directory on
+disk, and returns a MANIFEST -- paths, counts, byte sizes, per-tab/profile status,
+failures -- never the payloads themselves. None of the ten wire commands it
+composes is its own agent-facing tool in this phase; adding one that returned a
+raw MHTML document or a full `outerHTML` dump would recreate the exact
+context-truncation failure `browser_tabs` hit (see "browser_tabs: pagination,
+filtering, and summary mode" above).
+
+**Depth ladder** (each level a strict superset of the one below): `L0` windows/
+tab-groups/tabs inventory (no tab wake, no page contact) -> `L1` + visible text
+per tab -> `L2` + DOM/forms/storage/scroll per tab -> `L3` + screenshots per tab
+-> `L4` + MHTML per tab (requires the `debugger` capability; requesting L4/L5 on
+a device without it fails loud immediately, never silently degrading to a lower
+depth) -> `L5` + navigation history per tab, and browser-wide profile data.
+
+**No-wake guarantee**: a tab flagged `discarded`/`asleep` in the L0 inventory is
+SKIPPED for L1+ capture (recorded in the manifest, not silently dropped) unless
+`wake=true` is explicitly passed -- at real-world scale (hundreds of tabs) most
+are discarded, and waking one destroys real, unsaved in-page state.
+
+**Cookies are opt-in**: `include_cookies` defaults to `False` and is never implied
+by requesting L5 (or any depth) -- a caller must explicitly opt in even at
+maximum archive depth (`docs/permission-justifications.md` section 6).
+
+**Manifest honesty**: `manifest["status"]` is `"ok"` only when nothing failed or
+was skipped -- `"ok_with_skips"` or `"ok_with_failures"` otherwise, and
+`manifest["failures"]` lists every failure/skip at the top level, never buried.
 
 ### Adding the bundle
 

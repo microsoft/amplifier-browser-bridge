@@ -74,6 +74,7 @@ def test_all_expected_tools_are_registered():
         "browser_downloads_list",
         "browser_download",
         "browser_wait_download",
+        "browser_archive",
     }
     registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert registered == expected
@@ -450,3 +451,89 @@ async def test_browser_vision_read_surfaces_config_error_as_ok_false(monkeypatch
 
     assert result["ok"] is False
     assert "No vision provider is configured" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# browser_archive -- D2, browser-state archive: proves this surface actually
+# routes through archive.py's run_archive (not just fetches). See
+# tests/test_archive.py for the orchestrator's own logic (depth ladder,
+# no-wake guarantee, failure recording, impossible-depth) -- this file only
+# proves the MCP adapter wiring.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedHubClient:
+    """Same shape as _FakeHubClient but with per-command scripted responses --
+    a plain constant response (_FakeHubClient) can't stand in for run_archive,
+    which needs `windows` and `tabs` to return different shapes."""
+
+    def __init__(self, devices: list[dict[str, Any]], by_command: dict[str, Any]) -> None:
+        self._devices = devices
+        self._by_command = by_command
+        self.command_calls: list[tuple[Target, str, dict[str, Any]]] = []
+
+    async def list_devices(self) -> list[dict[str, Any]]:
+        return self._devices
+
+    async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]:
+        self.command_calls.append((target, command, args))
+        return self._by_command.get(command, {"ok": True, "result": {}})
+
+
+def _archive_device(**capabilities: bool) -> dict[str, Any]:
+    return {
+        "device_id": "d1",
+        "capabilities": {"debugger": False, "scripting": True, **capabilities},
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_routes_through_run_archive(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    fake = _ScriptedHubClient(
+        [_archive_device()],
+        {
+            "windows": {"ok": True, "result": {"windows": [], "tab_groups": []}},
+            "tabs": {"ok": True, "result": []},
+        },
+    )
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path), depth="L0")
+
+    assert result["ok"] is True
+    manifest = result["result"]
+    assert manifest["device_id"] == "d1"
+    assert manifest["depth"] == "L0"
+    assert (tmp_path.__class__(manifest["archive_dir"]) / "manifest.json").is_file()
+    # Actually went through run_archive's own command sequence, not a stub.
+    called_commands = {c for (_t, c, _a) in fake.command_calls}
+    assert called_commands == {"windows", "tabs"}
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_impossible_depth_surfaces_as_ok_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    fake = _ScriptedHubClient([_archive_device(debugger=False)], {})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path), depth="L4")
+
+    assert result["ok"] is False
+    assert "debugger" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_hub_error_surfaces_as_ok_false(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    class _RaisingArchiveClient:
+        async def list_devices(self):
+            raise HubError("unauthorized")
+
+        async def command(self, *a, **k):
+            raise HubError("unauthorized")
+
+    monkeypatch.setattr(srv, "_client", lambda: _RaisingArchiveClient())
+
+    result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path))
+
+    assert result == {"ok": False, "error": "unauthorized"}

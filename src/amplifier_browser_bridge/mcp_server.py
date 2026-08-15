@@ -35,6 +35,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from .addressing import Target
+from .archive import DEFAULT_DEPTH, ArchiveError
+from .archive import run_archive as _run_archive
 from .auth import resolve_default_token
 from .client import HubClient, HubError
 from .hub_location import resolve_hub_url
@@ -984,6 +986,75 @@ async def browser_narrow_scope(
     try:
         return await _client().narrow_scope(session_id, **kwargs)
     except HubError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_archive(
+    device_id: str,
+    dest_dir: str,
+    depth: str = DEFAULT_DEPTH,
+    tab_ids: list[int] | None = None,
+    include_cookies: bool = False,
+    wake: bool = False,
+    all_frames: bool = False,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Archive the state of a browser at a chosen depth -- from 'just the URLs' to
+    'everything we can physically get' -- and get back a MANIFEST, never the
+    payload. Every captured page/profile payload (DOM, screenshots, MHTML,
+    history, ...) is written straight to disk under a fresh timestamped
+    directory inside `dest_dir`; this tool's own return value is only paths,
+    counts, byte sizes, and per-tab/profile status -- the same reason
+    browser_tabs is paged by default (a raw payload this size would truncate
+    mid-response before it ever reached your context).
+
+    DEPTH LADDER (each level is a strict superset of the one below):
+        L0 -- windows/tab-groups/tabs inventory. NO tab wake, NO page contact.
+        L1 -- L0 + visible text per tab.
+        L2 -- L1 + DOM/forms/localStorage/sessionStorage/scroll per tab.
+        L3 -- L2 + screenshots per tab.
+        L4 -- L3 + MHTML per tab. Requires the 'debugger' capability (CDP-only,
+              no fallback) -- requesting L4/L5 on a device without it fails
+              loud immediately, before anything is captured, rather than
+              silently degrading to a lower depth.
+        L5 -- L4 + navigation history per tab, AND browser-wide profile data
+              (history/bookmarks/sessions/top_sites/reading_list).
+
+    NO-WAKE GUARANTEE: at real-world scale (hundreds of tabs) most are
+    discarded/asleep -- waking one destroys real, unsaved in-page state. Every
+    tab flagged discarded/asleep in the L0 inventory is SKIPPED for L1+
+    capture (recorded in the manifest, not silently dropped) unless wake=True
+    is explicitly passed.
+
+    tab_ids, if given, restricts L1+ per-tab capture to that subset -- the L0
+    inventory itself always covers every tab regardless. all_frames, if True,
+    is forwarded to the L1 text capture only (page_state/L2 does not support
+    multi-frame gathering in this phase). include_cookies gates cookie
+    collection at L5 -- defaults to False and is NEVER implied by requesting a
+    deeper archive; a caller must opt in explicitly even at maximum depth,
+    because a default that silently captures session tokens is a bad default
+    regardless of what's permitted.
+
+    The returned manifest's `status` field is the one key to check: `"ok"` only
+    if nothing failed or was skipped; `"ok_with_skips"` if some tabs were
+    skipped (no-wake guarantee); `"ok_with_failures"` if any capture actually
+    failed. `manifest["failures"]` lists every failure/skip explicitly -- never
+    buried, never silently absorbed into a clean-looking result.
+    """
+    try:
+        return await _run_archive(
+            _client(),
+            device_id,
+            dest_dir,
+            depth=depth,
+            tab_ids=tab_ids,
+            include_cookies=include_cookies,
+            wake=wake,
+            all_frames=all_frames,
+            timeout_s=timeout_s,
+        )
+    except (ArchiveError, HubError) as e:
         return {"ok": False, "error": str(e)}
 
 

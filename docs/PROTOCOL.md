@@ -1232,6 +1232,28 @@ Two places (design doc §7: "report CDP attach state per tab so an agent can rea
   str|null}}` for every tab this hub has ever attached to on that device.
 - `tabs`: each entry in the result gains `"cdp_attached": bool` for its current state.
 
+### Browser-state archive (D2) -- composed, not a wire command
+
+The ten commands above this section (`windows`, `page_state`, `mhtml`, `nav_history`,
+`history_list`, `bookmarks_list`, `sessions_list`, `top_sites`, `reading_list`,
+`cookies_list`) are real wire-protocol commands, individually. But the agent-facing
+**archive** capability -- "capture the state of a browser at a chosen depth, get back a
+manifest" -- is not itself a wire command, the same way `vision_read` composes
+`screenshot` + a vision-model call without being a wire command of its own (see "Vision-based
+extraction" above).
+
+`amplifier_browser_bridge.archive.run_archive` (hub-side Python, no extension changes) composes
+these ten commands into a depth ladder (L0 windows/groups/tabs inventory through L5 MHTML +
+navigation history + browser-wide profile data), writes every captured payload straight to a
+timestamped directory on disk, and returns a **manifest** -- paths, counts, byte sizes, per-tab
+status, failures -- never the payloads themselves. This is the direct fix for the same class of
+bug the tabs-pagination fix (above) addressed: a raw MHTML document, a full outerHTML dump, or a
+browser's entire history can each individually be many megabytes, and returning any of them as an
+agent tool's return value would recreate the exact context-truncation failure `browser_tabs`
+hit. See `archive.py`'s module docstring for the full depth-ladder contract (no-wake guarantee,
+per-tab failure recording, impossible-depth fail-loud behavior) and `docs/AGENT_SURFACES.md` for
+the single agent-facing tool (`browser_archive`) both surfaces expose for it.
+
 ## The three-tier connectivity model
 
 | Tier | Meaning | Agent-visible behavior |

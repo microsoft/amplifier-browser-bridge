@@ -48,6 +48,8 @@ try:
 except ImportError as _import_exc:
     reraise_with_diagnosis(_import_exc)
 
+from amplifier_browser_bridge.archive import DEFAULT_DEPTH, ArchiveError
+from amplifier_browser_bridge.archive import run_archive as _run_archive
 from amplifier_browser_bridge.auth import resolve_default_token
 from amplifier_browser_bridge.auto_setup import DEFAULT_WAIT_REACHABLE_S, run_auto_setup
 from amplifier_browser_bridge.doctor import run_doctor
@@ -368,6 +370,22 @@ def _build_tools() -> list[_HubTool]:
                 {"name": c.name, "status": c.status, "message": c.message, "detail": c.detail} for c in checks
             ],
         }
+
+    async def archive_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await _run_archive(
+                _client(),
+                input_data["device_id"],
+                input_data["dest_dir"],
+                depth=input_data.get("depth", DEFAULT_DEPTH),
+                tab_ids=input_data.get("tab_ids"),
+                include_cookies=bool(input_data.get("include_cookies", False)),
+                wake=bool(input_data.get("wake", False)),
+                all_frames=bool(input_data.get("all_frames", False)),
+                timeout_s=input_data.get("timeout_s"),
+            )
+        except ArchiveError as e:
+            return {"ok": False, "error": str(e)}
 
     return [
         _HubTool(
@@ -966,6 +984,86 @@ def _build_tools() -> list[_HubTool]:
             "browser has connected, or to see exactly what's still missing if it hasn't.",
             {"type": "object", "properties": {}},
             setup_status_runner,
+        ),
+        _HubTool(
+            "browser_archive",
+            "Archive the state of a browser at a chosen depth -- from 'just the URLs' to "
+            "'everything we can physically get' -- and get back a MANIFEST, never the payload. Every "
+            "captured page/profile payload (DOM, screenshots, MHTML, history, ...) is written straight "
+            "to disk under a fresh timestamped directory inside dest_dir; this tool's own return value "
+            "is only paths, counts, byte sizes, and per-tab/profile status -- the same reason "
+            "browser_tabs is paged by default (a raw payload this size would truncate mid-response "
+            "before it ever reached your context).\n\n"
+            "DEPTH LADDER (each level is a strict superset of the one below): L0 -- windows/tab-groups/"
+            "tabs inventory, NO tab wake, NO page contact. L1 -- L0 + visible text per tab. L2 -- L1 + "
+            "DOM/forms/localStorage/sessionStorage/scroll per tab. L3 -- L2 + screenshots per tab. "
+            "L4 -- L3 + MHTML per tab (requires the 'debugger' capability -- CDP-only, no fallback; "
+            "requesting L4/L5 on a device without it fails loud immediately, before anything is "
+            "captured, rather than silently degrading). L5 -- L4 + navigation history per tab, AND "
+            "browser-wide profile data (history/bookmarks/sessions/top_sites/reading_list).\n\n"
+            "NO-WAKE GUARANTEE: at real-world scale (hundreds of tabs) most are discarded/asleep -- "
+            "waking one destroys real, unsaved in-page state. Every tab flagged discarded/asleep in "
+            "the L0 inventory is SKIPPED for L1+ capture (recorded in the manifest, not silently "
+            "dropped) unless wake=true is explicitly passed.\n\n"
+            "tab_ids, if given, restricts L1+ per-tab capture to that subset -- the L0 inventory "
+            "always covers every tab regardless. all_frames, if true, is forwarded to the L1 text "
+            "capture only. include_cookies gates cookie collection at L5 -- defaults to false and is "
+            "NEVER implied by requesting a deeper archive; a caller must opt in explicitly even at "
+            "maximum depth, because a default that silently captures session tokens is a bad default "
+            "regardless of what's permitted.\n\n"
+            "The returned manifest's `status` field is the one key to check: 'ok' only if nothing "
+            "failed or was skipped; 'ok_with_skips' if some tabs were skipped (no-wake guarantee); "
+            "'ok_with_failures' if any capture actually failed. manifest['failures'] lists every "
+            "failure/skip explicitly -- never buried, never silently absorbed into a clean-looking "
+            "result.",
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "dest_dir": {
+                        "type": "string",
+                        "description": "Base directory to write the timestamped archive directory into.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["L0", "L1", "L2", "L3", "L4", "L5"],
+                        "default": DEFAULT_DEPTH,
+                        "description": "Archive depth -- see the tool description's depth ladder.",
+                    },
+                    "tab_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Restrict L1+ per-tab capture to this subset. Omit for every tab.",
+                    },
+                    "include_cookies": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Opt-in to cookie collection at L5. Never implied by depth alone -- see "
+                            "the tool description."
+                        ),
+                    },
+                    "wake": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Allow waking a discarded/asleep tab to capture it. Default: such tabs are "
+                            "skipped, never woken implicitly."
+                        ),
+                    },
+                    "all_frames": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Forwarded to the L1 text capture only -- gather every frame's text.",
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Optional per-command device-round-trip timeout override, in seconds.",
+                    },
+                },
+                "required": ["device_id", "dest_dir"],
+            },
+            archive_runner,
         ),
     ]
 
