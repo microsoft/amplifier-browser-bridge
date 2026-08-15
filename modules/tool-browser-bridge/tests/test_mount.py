@@ -159,6 +159,93 @@ async def test_browser_type_maps_ref_and_text(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+async def test_browser_tabs_pages_and_reports_filters_and_totals(monkeypatch: pytest.MonkeyPatch):
+    """browser_tabs must run its raw hub response through paging.py -- not just
+    fetch it (see paging.py's own unit tests for the shaping logic itself)."""
+    tabs = [
+        {"tab_id": i, "window_id": 1, "url": "https://example.com/", "title": "Example Page"}
+        for i in range(5)
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_tabs")
+    result = await tool.execute({"device_id": "d1", "limit": 2, "offset": 1})
+
+    assert result.success is True
+    output: Any = result.output
+    r = output["result"]
+    assert r["total"] == 5
+    assert r["matched"] == 5
+    assert r["returned"] == 2
+    assert r["offset"] == 1
+    assert r["limit"] == 2
+    assert r["has_more"] is True
+    assert [t["tab_id"] for t in r["tabs"]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_window_id_is_a_local_filter_not_forwarded_to_the_wire_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """window_id narrows the RESPONSE (paging.py), not the wire-level Target --
+    otherwise the reported `total` could never be the true, device-wide count."""
+    tabs = [
+        {"tab_id": 1, "window_id": 10, "url": "https://example.com/a", "title": "A"},
+        {"tab_id": 2, "window_id": 20, "url": "https://example.com/b", "title": "B"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_tabs")
+    result = await tool.execute({"device_id": "d1", "window_id": 10})
+
+    target, command, _args = fake.command_calls[0]
+    assert command == "tabs"
+    assert target.window_id is None  # NOT forwarded to the hub/device
+    output: Any = result.output
+    r = output["result"]
+    assert r["total"] == 2  # unfiltered grand total across the whole device
+    assert r["matched"] == 1
+    assert [t["tab_id"] for t in r["tabs"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_summary_mode_returns_no_tab_list(monkeypatch: pytest.MonkeyPatch):
+    tabs = [
+        {"tab_id": 1, "window_id": 1, "url": "https://example.com/", "title": "Example", "discarded": True},
+        {"tab_id": 2, "window_id": 2, "url": "https://example.org/", "title": "Other"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_tabs")
+    result = await tool.execute({"device_id": "d1", "summary": True})
+
+    output: Any = result.output
+    r = output["result"]
+    assert "tabs" not in r
+    assert r["summary"] is True
+    assert r["total"] == 2
+
+
+def test_browser_tabs_description_teaches_paging_and_summary():
+    tool = _tool_by_name("browser_tabs")
+    desc = tool.description.lower()
+    assert "paged" in desc or "page" in desc
+    assert "summary" in desc
+    assert "has_more" in desc
+
+
+def test_browser_tabs_schema_declares_new_filter_and_paging_properties():
+    tool = _tool_by_name("browser_tabs")
+    props = tool.input_schema["properties"]
+    for name in ("window_id", "url_contains", "title_contains", "limit", "offset", "summary"):
+        assert name in props, f"browser_tabs schema missing {name!r}"
+    assert tool.input_schema["required"] == ["device_id"]
+
+
+@pytest.mark.asyncio
 async def test_browser_devices_calls_list_devices_not_command(monkeypatch: pytest.MonkeyPatch):
     fake = _FakeHubClient({"devices": [{"device_id": "d1", "tier": "live"}]})
     monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)

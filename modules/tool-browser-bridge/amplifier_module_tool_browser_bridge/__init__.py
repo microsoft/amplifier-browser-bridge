@@ -52,6 +52,7 @@ from amplifier_browser_bridge.auth import resolve_default_token
 from amplifier_browser_bridge.auto_setup import DEFAULT_WAIT_REACHABLE_S, run_auto_setup
 from amplifier_browser_bridge.doctor import run_doctor
 from amplifier_browser_bridge.hub_location import DEFAULT_PORT, resolve_hub_url
+from amplifier_browser_bridge.paging import DEFAULT_LIMIT, shape_tabs_response
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 
@@ -206,8 +207,20 @@ def _build_tools() -> list[_HubTool]:
         return await _client().poll(input_data["device_id"], input_data["command_id"])
 
     async def tabs_runner(input_data: dict[str, Any]) -> dict[str, Any]:
-        return await _client().command(
-            Target(device_id=input_data["device_id"], window_id=input_data.get("window_id")), "tabs", {}
+        # window_id is deliberately NOT forwarded to the Target here -- it is a
+        # post-fetch filter applied by shape_tabs_response below, not a wire-level
+        # scope. The hub still returns every tab on the device (paging.py's module
+        # docstring); this is what lets the shaped response report an honest,
+        # unfiltered `total` alongside the filtered `matched` count.
+        raw = await _client().command(Target(device_id=input_data["device_id"]), "tabs", {})
+        return shape_tabs_response(
+            raw,
+            window_id=input_data.get("window_id"),
+            url_contains=input_data.get("url_contains"),
+            title_contains=input_data.get("title_contains"),
+            limit=input_data.get("limit", DEFAULT_LIMIT),
+            offset=input_data.get("offset", 0),
+            summary=bool(input_data.get("summary", False)),
         )
 
     async def tab_open_runner(input_data: dict[str, Any]) -> dict[str, Any]:
@@ -368,9 +381,59 @@ def _build_tools() -> list[_HubTool]:
         ),
         _HubTool(
             "browser_tabs",
-            "List open tabs on a device, optionally scoped to one window_id. Use this after "
-            "browser_devices() to discover tab_id values for the other tools. " + _QUEUE_NOTE,
-            {"type": "object", "properties": _DEVICE_ID_PROP, "required": ["device_id"]},
+            "List open tabs on a device. Use this after browser_devices() to discover "
+            "tab_id values for the other tools. Results are PAGED by default (limit=100, "
+            "offset=0) -- on a large profile (hundreds of tabs) an unpaged listing can be "
+            "hundreds of KB, enough to truncate before it ever reaches your context. The "
+            "response's `result` always reports `total` (every tab on the device, "
+            "unfiltered), `matched` (how many passed your filters), `returned` (this page's "
+            "size), `offset`, `limit`, and `has_more` -- so you can tell '3 tabs matched my "
+            "filter' from '3 tabs exist' and page correctly without guessing. Pass limit=0 "
+            "to opt back into the old, unpaged full listing. On a large or unknown-size "
+            "profile, call with summary=true FIRST: it returns ONLY per-window tab counts, "
+            "totals, and how many tabs are discarded/asleep -- no tab list at all -- so you "
+            "can decide how to narrow before paying for the full listing. Filter BEFORE "
+            "paging with window_id (exact match), url_contains, and/or title_contains (both "
+            "case-insensitive substrings) -- filters apply before offset/limit, so "
+            "`matched`/`has_more` reflect the filtered set, not the unfiltered device-wide "
+            "total. " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Filter to tabs in this window only (exact match).",
+                    },
+                    "url_contains": {
+                        "type": "string",
+                        "description": "Filter to tabs whose url contains this substring (case-insensitive).",
+                    },
+                    "title_contains": {
+                        "type": "string",
+                        "description": "Filter to tabs whose title contains this substring (case-insensitive).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": DEFAULT_LIMIT,
+                        "description": "Max tabs to return (after filtering). 0 means unlimited.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Skip this many matched tabs before returning a page.",
+                    },
+                    "summary": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Return ONLY per-window counts/totals/discarded/asleep aggregates -- no tab "
+                            "list. Call this first against a large or unknown-size profile."
+                        ),
+                    },
+                },
+                "required": ["device_id"],
+            },
             tabs_runner,
         ),
         _HubTool(

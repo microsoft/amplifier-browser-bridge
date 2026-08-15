@@ -170,6 +170,81 @@ async def test_browser_tab_open_defaults_to_background(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_browser_tabs_pages_and_reports_filters_and_totals(monkeypatch: pytest.MonkeyPatch):
+    """browser_tabs must actually run its raw hub response through paging.py --
+    not just fetch it (see paging.py's own unit tests for the shaping logic
+    itself)."""
+    tabs = [
+        {"tab_id": i, "window_id": 1, "url": "https://example.com/", "title": "Example Page"}
+        for i in range(5)
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="d1", limit=2, offset=1)
+
+    assert result["ok"] is True
+    r = result["result"]
+    assert r["total"] == 5
+    assert r["matched"] == 5
+    assert r["returned"] == 2
+    assert r["offset"] == 1
+    assert r["limit"] == 2
+    assert r["has_more"] is True
+    assert [t["tab_id"] for t in r["tabs"]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_window_id_is_a_local_filter_not_forwarded_to_the_wire_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """window_id narrows the RESPONSE (paging.py), not the wire-level Target --
+    otherwise the reported `total` could never be the true, device-wide count."""
+    tabs = [
+        {"tab_id": 1, "window_id": 10, "url": "https://example.com/a", "title": "A"},
+        {"tab_id": 2, "window_id": 20, "url": "https://example.com/b", "title": "B"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="d1", window_id=10)
+
+    target, command, _args = fake.command_calls[0]
+    assert command == "tabs"
+    assert target.window_id is None  # NOT forwarded to the hub/device
+    r = result["result"]
+    assert r["total"] == 2  # unfiltered grand total across the whole device
+    assert r["matched"] == 1
+    assert [t["tab_id"] for t in r["tabs"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_summary_mode_returns_no_tab_list(monkeypatch: pytest.MonkeyPatch):
+    tabs = [
+        {"tab_id": 1, "window_id": 1, "url": "https://example.com/", "title": "Example", "discarded": True},
+        {"tab_id": 2, "window_id": 2, "url": "https://example.org/", "title": "Other"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="d1", summary=True)
+
+    r = result["result"]
+    assert "tabs" not in r
+    assert r["summary"] is True
+    assert r["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_description_teaches_paging_and_summary():
+    tools = {t.name: t for t in srv.mcp._tool_manager.list_tools()}
+    desc = (tools["browser_tabs"].description or "").lower()
+    assert "paged" in desc or "page" in desc
+    assert "summary" in desc
+    assert "has_more" in desc
+
+
+@pytest.mark.asyncio
 async def test_browser_devices_calls_list_devices_not_command(monkeypatch: pytest.MonkeyPatch):
     fake = _FakeHubClient({"devices": [{"device_id": "d1", "tier": "live"}]})
     monkeypatch.setattr(srv, "_client", lambda: fake)

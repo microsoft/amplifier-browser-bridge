@@ -38,6 +38,7 @@ from .addressing import Target
 from .auth import resolve_default_token
 from .client import HubClient, HubError
 from .hub_location import resolve_hub_url
+from .paging import DEFAULT_LIMIT, shape_tabs_response
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
@@ -162,18 +163,54 @@ async def browser_devices() -> dict[str, Any]:
 
 @mcp.tool()
 async def browser_tabs(
-    device_id: str, window_id: int | None = None, timeout_s: float | None = None
+    device_id: str,
+    window_id: int | None = None,
+    url_contains: str | None = None,
+    title_contains: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+    summary: bool = False,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
-    """List open tabs on a device, optionally scoped to one window_id. Use this
-    after browser_devices() to discover tab_id values for the other tools.
+    """List open tabs on a device. Use this after browser_devices() to discover
+    tab_id values for the other tools.
+
+    Results are PAGED by default (limit=100, offset=0) -- on a large profile
+    (hundreds of tabs) an unpaged listing can be hundreds of KB, enough to
+    truncate before it ever reaches your context. The response's `result`
+    always reports `total` (every tab on the device, unfiltered), `matched`
+    (how many passed your filters), `returned` (this page's size), `offset`,
+    `limit`, and `has_more` -- so you can tell "3 tabs matched my filter" from
+    "3 tabs exist" and page correctly without guessing. Pass limit=0 to opt
+    back into the old, unpaged full listing.
+
+    On a large or unknown-size profile, call with summary=True FIRST: it
+    returns ONLY per-window tab counts, totals, and how many tabs are
+    discarded/asleep -- no tab list at all -- so you can decide how to narrow
+    before paying for the full listing.
+
+    Filter BEFORE paging with window_id (exact match), url_contains, and/or
+    title_contains (both case-insensitive substrings) -- filters apply before
+    offset/limit, so `matched`/`has_more` reflect the filtered set, not the
+    unfiltered device-wide total.
 
     If the device is not 'live', this returns immediately as {"status": "queued",
     "command_id": ..., "tier": ..., "last_seen": ..., "queue_position": ...}
-    instead of {"ok": ...}. That is a normal, actionable result, not an error or a
-    hang -- call browser_poll(device_id, command_id) later to retrieve the
-    eventual result.
+    instead of {"ok": ...} -- that shape is passed through completely
+    untouched, never paged/filtered/summarized. That is a normal, actionable
+    result, not an error or a hang -- call browser_poll(device_id, command_id)
+    later to retrieve the eventual result.
     """
-    return await _run_command(device_id, "tabs", {}, window_id=window_id, timeout_s=timeout_s)
+    raw = await _run_command(device_id, "tabs", {}, timeout_s=timeout_s)
+    return shape_tabs_response(
+        raw,
+        window_id=window_id,
+        url_contains=url_contains,
+        title_contains=title_contains,
+        limit=limit,
+        offset=offset,
+        summary=summary,
+    )
 
 
 @mcp.tool()

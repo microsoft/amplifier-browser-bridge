@@ -538,7 +538,7 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 | `back` / `forward` | injected.js | `history.back()`/`forward()`; top frame only |
 | `wait_for` | injected.js | `args.selector`, `args.timeout_ms`; polls, never sleeps blindly; top frame only -- see "Frames" below |
 | `wait_text` | injected.js | `args.text`, `args.timeout_ms`; polls, never sleeps blindly; top frame only -- see "Frames" below |
-| `tabs` | background.js (`chrome.tabs.query`) | optionally scoped by `target.window_id`; each entry now also carries `discarded`/`status` -- see "Discarded tabs" below |
+| `tabs` | background.js (`chrome.tabs.query`) | optionally scoped by `target.window_id`; each entry now also carries `discarded`/`status` -- see "Discarded tabs" below. **Unchanged by the agent-facing pagination fix below**: the wire-level `result` is still the full, unfiltered list of every tab on the device -- see "Agent-facing tabs pagination (not a wire change)". |
 | `tab_open` | background.js (`chrome.tabs.create`) | target is device-only; `args.url`, `args.active` (default background) |
 | `tab_close` | background.js (`chrome.tabs.remove`) | |
 | `tab_activate` | background.js (`chrome.tabs.update`) | the one command that's explicitly *allowed* to steal focus, because it was asked to |
@@ -556,6 +556,30 @@ Every `PAGE_WORLD_COMMAND` (`snapshot`, `read`, `click`, `type`, `key`, `scroll`
 `wait_for`, `wait_text`) also accepts an optional `args.wake` -- see "Discarded tabs" below -- and
 an optional `args.activate` -- see "Foregrounding a tab for DOM injection (`args.activate`)" below.
 Every command accepts an optional `args.timeout_s` -- see "Command timeout" below.
+
+### Agent-facing tabs pagination (not a wire change)
+
+Real-world finding: on the maintainer's own device (~728 open tabs), an unpaged `tabs` result was
+~640KB -- large enough to truncate mid-response before it ever reached an agent's context window.
+The hub -> agent wire transfer that produces that payload is cheap (machine to machine); what's
+expensive is a payload that size entering an LLM's context.
+
+**This device protocol is deliberately unchanged.** `background.js`'s `listTabs()` still returns
+every tab on the device in one `result` list, exactly as documented in the table above -- there is
+no `args.limit`/`args.offset`/`args.window_id` filtering added to the `tabs` command, and
+`protocol.py`/`extension/background.js` gained no new fields for this. Adding wire-level paging
+would grow the hand-synced `protocol.py` <-> `extension/background.js` surface this document's own
+header warns is kept in sync manually, for no benefit -- the wire transfer was never the expensive
+part.
+
+Instead, pagination, filtering, and a cheap summary mode live entirely in the agent-facing tool
+layer, one level up from this protocol: `amplifier_browser_bridge.paging.shape_tabs_response` (a
+pure function, no I/O) reshapes the hub's full `tabs` response before either agent surface
+(`mcp_server.py`'s `browser_tabs` tool, or the Amplifier tool module's `browser_tabs`) hands
+anything back to the calling agent. See `docs/AGENT_SURFACES.md` for the resulting tool-level
+behavior (paging defaults, filters, summary mode). A `{"status": "queued", ...}` or `{"ok": false,
+...}` `tabs` response is passed through by that layer completely untouched, per this document's
+existing tier pass-through and fail-loud guarantees.
 
 ### Frames
 

@@ -21,7 +21,7 @@ lists.
 | Tool | Command | Notes | Surface |
 |---|---|---|---|
 | `browser_devices` | `list_devices` | Entry point -- call first | both |
-| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status` | both |
+| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status`; PAGED by default (`limit`/`offset`), filterable (`window_id`/`url_contains`/`title_contains`), and has a `summary` mode -- see "browser_tabs: pagination, filtering, and summary mode" below | both |
 | `browser_snapshot` | `snapshot` | Accessibility-style tree with element `ref`s; optional `wake`/`activate` (see Discarded tabs, docs/PROTOCOL.md) | both |
 | `browser_read` | `read` | Full visible text across all frames; optional `wake`/`activate` | both |
 | `browser_click` | `click` | `ref`, optional `session_id` | both |
@@ -63,6 +63,38 @@ adapters below hand this shape to the calling agent completely unmodified --
 never flattened into an error, never blocked on, never silently retried. Every
 tool description says so explicitly (not just the server-level instructions),
 because an MCP client typically shows one tool's description in isolation.
+
+## browser_tabs: pagination, filtering, and summary mode
+
+Real-world finding: on the maintainer's own device (~728 open tabs), an unpaged `browser_tabs`
+result was ~640KB -- large enough to truncate mid-response before it ever reached an agent's
+context window, silently destroying whatever the agent was trying to do with it. The hub still
+returns every tab in one `tabs` command result (see docs/PROTOCOL.md's "Agent-facing tabs
+pagination (not a wire change)" -- this is deliberately NOT a wire-protocol change); both agent
+surfaces shape that full result before handing anything back, via the shared, pure-logic
+`amplifier_browser_bridge.paging.shape_tabs_response` (no I/O, fully unit-tested in isolation --
+see `tests/test_paging.py`). This is the single home for the logic; neither surface reimplements
+it.
+
+**Paged by default.** `limit` (default 100) and `offset` (default 0) -- pass `limit=0` to opt back
+into the old, unpaged full listing. The response's `result` always reports `total` (every tab on
+the device, unfiltered), `matched` (how many passed any filters), `returned` (this page's size),
+`offset`, `limit`, and `has_more`, so a caller can tell "3 tabs matched my filter" from "3 tabs
+exist" and page correctly without guessing.
+
+**Filter before paging** with `window_id` (exact match), `url_contains`, and/or `title_contains`
+(both case-insensitive substrings). These are applied as a POST-FETCH filter over the full,
+unfiltered `tabs` result -- not forwarded to the wire-level `target.window_id` the device sees --
+which is what lets `total` stay an honest, device-wide count even when a filter is in effect.
+
+**Summary mode is the cheap first call against a profile of unknown size.** Pass `summary=true` to
+get ONLY per-window tab counts, totals, and how many tabs are discarded/asleep, with no tab list at
+all -- useful for deciding how to narrow (which window, which url/title substring) before paying
+for a full listing.
+
+A `{"status": "queued", ...}` or `{"ok": false, ...}` `tabs` response is passed through by
+`shape_tabs_response` completely untouched -- never paged, filtered, or reshaped -- consistent with
+this document's tier pass-through guarantee above.
 
 ## MCP server
 
