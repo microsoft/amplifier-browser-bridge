@@ -1024,7 +1024,14 @@ def _build_tools() -> list[_HubTool]:
             "failed or was skipped; 'ok_with_skips' if some tabs were skipped (no-wake guarantee); "
             "'ok_with_failures' if any capture actually failed. manifest['failures'] lists every "
             "failure/skip explicitly -- never buried, never silently absorbed into a clean-looking "
-            "result.",
+            "result.\n\n"
+            "manifest['summary'] never collapses 'how many tabs/windows/tab-groups exist' into "
+            "'how many had page content captured' -- these are different numbers at every depth. "
+            "tabs_inventoried/windows_inventoried/tab_groups_inventoried are populated even at L0 "
+            "(from the always-run inventory); tabs_captured/tabs_skipped/tabs_failed describe "
+            "per-tab CONTENT capture and are honestly all 0 at L0 -- that is success, not an empty "
+            "archive. An L0 run of 735 tabs reports tabs_inventoried: 735 alongside "
+            "tabs_captured: 0; it never reports tabs_inventoried: 0.",
             {
                 "type": "object",
                 "properties": {

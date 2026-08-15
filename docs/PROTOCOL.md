@@ -1386,6 +1386,14 @@ hit. See `archive.py`'s module docstring for the full depth-ladder contract (no-
 per-tab failure recording, impossible-depth fail-loud behavior) and `docs/AGENT_SURFACES.md` for
 the single agent-facing tool (`browser_archive`) both surfaces expose for it.
 
+`manifest["summary"]` never collapses the INVENTORY axis (what actually exists in the browser --
+`windows_inventoried`/`tab_groups_inventoried`/`tabs_inventoried`, populated at every depth
+including L0) into the CAPTURE axis (what had page content pulled down --
+`tabs_capture_attempted`/`tabs_captured`/`tabs_skipped`/`tabs_failed`, legitimately all `0` at
+L0 by design; `profile`, `None` below L5). An L0 archive of 735 real tabs reports
+`tabs_inventoried: 735` alongside `tabs_captured: 0` -- a caller must never read the latter as
+"nothing was archived" when the former says otherwise.
+
 ## The three-tier connectivity model
 
 | Tier | Meaning | Agent-visible behavior |

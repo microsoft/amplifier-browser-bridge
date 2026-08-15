@@ -61,8 +61,18 @@ archive. But the manifest is built so a failure is impossible to miss:
 - `manifest["status"]` is `"ok"` ONLY when there were zero failures and zero skips --
   `"ok_with_failures"` or `"ok_with_skips"` otherwise. A caller scanning just this one
   key can never mistake a degraded run for a clean one.
-- `manifest["summary"]` reports `tabs_total`/`tabs_captured`/`tabs_skipped`/
-  `tabs_failed`/`has_failures` for a quick, honest read.
+- `manifest["summary"]` reports every axis this module inventories or captures, and
+  never collapses the INVENTORY axis (what actually exists in the browser) into the
+  CAPTURE axis (what had its page content pulled down) -- the two are legitimately
+  different numbers, at every depth. `windows_inventoried`/`tab_groups_inventoried`/
+  `tabs_inventoried` are populated at EVERY depth including L0 (`None`, never a
+  misleading bare `0`, if that axis's own capture failed -- see `_inventoried_count`).
+  `tabs_capture_attempted`/`tabs_captured`/`tabs_skipped`/`tabs_failed` describe
+  per-tab CONTENT capture and are honestly all `0` at L0 -- L0 does no page contact
+  by design (see the depth ladder above), and that is success, not failure. `profile`
+  is `None` below L5, otherwise item-level capture counts. An L0 archive of 735 tabs
+  reports `tabs_inventoried: 735` even though `tabs_captured` is `0`: the summary
+  must never read as "nothing was archived" when the inventory says otherwise.
 
 ## Impossible depth: fail loud, never silently degrade
 
@@ -187,6 +197,34 @@ def _command_outcome(result: Any) -> tuple[bool, Any, str | None]:
 
 def _capture_failed(error: str) -> dict[str, Any]:
     return {"status": "failed", "error": error}
+
+
+def _inventoried_count(entry: dict[str, Any]) -> int | None:
+    """Pulls a definitive INVENTORY count out of a manifest capture entry
+    (`manifest["windows"]`/`["tab_groups"]`/`["tabs_inventory"]`) for `summary`.
+    Returns `None` -- never a misleading bare `0` -- when the underlying capture
+    itself failed, so a reader of `summary` can tell "we never learned how many
+    exist" apart from "zero exist" (module docstring's "No silent partial
+    success" section)."""
+    return entry.get("count") if entry.get("status") == "ok" else None
+
+
+def _profile_summary(profile: dict[str, Any] | None) -> dict[str, int] | None:
+    """Item-level capture accounting for the L5-only `profile` axis (history,
+    bookmarks, sessions, top_sites, reading_list, cookies) -- `None` below L5,
+    mirroring `manifest["profile"]` itself, never a misleading `0` standing in
+    for "not attempted". `items_skipped` counts the intentional, non-failure
+    cookies opt-out (see module docstring's "Cookies are opt-in" section), not
+    a degraded run."""
+    if profile is None:
+        return None
+    entries = list(profile.values())
+    return {
+        "items_total": len(entries),
+        "items_captured": sum(1 for e in entries if e.get("status") == "ok"),
+        "items_skipped": sum(1 for e in entries if e.get("status") == "skipped"),
+        "items_failed": sum(1 for e in entries if e.get("status") == "failed"),
+    }
 
 
 def _record_json_capture(
@@ -571,12 +609,14 @@ async def run_archive(
             )
     manifest["tabs"] = tab_manifest
 
+    profile_result: dict[str, Any] | None
     if depth_idx >= _DEPTH_INDEX["L5"]:
-        manifest["profile"] = await _capture_profile(
+        profile_result = await _capture_profile(
             client, device_id, archive_dir, include_cookies=include_cookies, failures=failures
         )
     else:
-        manifest["profile"] = None
+        profile_result = None
+    manifest["profile"] = profile_result
 
     finished_at = datetime.now(UTC)
     manifest["finished_at"] = finished_at.isoformat()
@@ -586,11 +626,23 @@ async def run_archive(
     tabs_skipped = sum(1 for t in tab_manifest.values() if t.get("status") == "skipped")
     tabs_failed = sum(1 for t in tab_manifest.values() if t.get("status") == "failed")
     tabs_captured = sum(1 for t in tab_manifest.values() if t.get("status") == "ok")
+
+    # See module docstring's "No silent partial success" section: the INVENTORY axis
+    # (what actually exists in the browser -- populated at every depth, including L0)
+    # is never collapsed into the CAPTURE axis (what had its page content pulled down
+    # -- legitimately all zero at L0 by design). This is the direct fix for the bug
+    # where an L0 archive of 735 real tabs reported `tabs_total: 0`: that field was
+    # silently reading `len(tab_manifest)` (a capture count) where a caller expected
+    # a true inventory count.
     manifest["summary"] = {
-        "tabs_total": len(tab_manifest),
+        "windows_inventoried": _inventoried_count(manifest["windows"]),
+        "tab_groups_inventoried": _inventoried_count(manifest["tab_groups"]),
+        "tabs_inventoried": _inventoried_count(manifest["tabs_inventory"]),
+        "tabs_capture_attempted": len(tab_manifest),
         "tabs_captured": tabs_captured,
         "tabs_skipped": tabs_skipped,
         "tabs_failed": tabs_failed,
+        "profile": _profile_summary(profile_result),
         "has_failures": bool(failures),
     }
 

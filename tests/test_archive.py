@@ -414,12 +414,159 @@ async def test_overall_status_is_plain_ok_when_everything_succeeds(tmp_path: Pat
     manifest = result["result"]
     assert manifest["status"] == "ok"
     assert manifest["summary"] == {
-        "tabs_total": 1,
+        "windows_inventoried": 1,
+        "tab_groups_inventoried": 1,
+        "tabs_inventoried": 1,
+        "tabs_capture_attempted": 1,
         "tabs_captured": 1,
         "tabs_skipped": 0,
         "tabs_failed": 0,
+        "profile": None,
         "has_failures": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Manifest-accuracy bug: summary must never read as "nothing was archived"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_l0_summary_reports_tabs_inventoried_not_zero(tmp_path: Path) -> None:
+    """The bug, observed live against a real 735-tab profile: an L0 archive
+    wrote every tab to disk successfully, but `summary["tabs_total"]` (computed
+    from the empty per-tab capture manifest) reported `0`, and there was no
+    other unmissable field in `summary` saying otherwise. `tabs_inventoried`
+    must report the real count at L0 -- the depth that, by design, captures
+    zero page content."""
+    n = 735
+    tabs = [_tab(100 + i) for i in range(n)]
+    client = _basic_client(tabs=tabs)
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0")
+    manifest = result["result"]
+
+    assert manifest["status"] == "ok"
+    assert manifest["tabs_inventory"]["count"] == n
+    # The load-bearing assertion: `summary` itself -- not just a sibling key --
+    # must make the real count unmissable, and must never claim zero.
+    assert manifest["summary"]["tabs_inventoried"] == n
+    assert manifest["summary"]["tabs_inventoried"] != 0
+    # L0 legitimately captures no page content -- that is success, not failure,
+    # and must remain distinguishable from the inventory count above.
+    assert manifest["summary"]["tabs_capture_attempted"] == 0
+    assert manifest["summary"]["tabs_captured"] == 0
+    assert manifest["summary"]["tabs_skipped"] == 0
+    assert manifest["summary"]["tabs_failed"] == 0
+    assert manifest["summary"]["has_failures"] is False
+
+
+@pytest.mark.asyncio
+async def test_l0_summary_also_reports_windows_and_tab_groups_inventoried(tmp_path: Path) -> None:
+    """The same under-reporting bug could equally hit the windows/tab-groups
+    axes -- both are captured outside `tab_manifest` too."""
+    client = _basic_client()
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0")
+    manifest = result["result"]
+    assert manifest["summary"]["windows_inventoried"] == manifest["windows"]["count"] == 1
+    assert manifest["summary"]["tab_groups_inventoried"] == manifest["tab_groups"]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_deeper_depth_still_distinguishes_inventoried_from_captured(tmp_path: Path) -> None:
+    """At L2 with every tab capturing successfully, `tabs_inventoried` and
+    `tabs_captured` happen to be equal in VALUE -- but they must remain
+    distinct KEYS reporting distinct axes (inventory vs. content capture),
+    never collapsed into a single number."""
+    tabs = [_tab(101), _tab(102), _tab(103)]
+    client = _basic_client(tabs=tabs)
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L2")
+    summary = result["result"]["summary"]
+    assert summary["tabs_inventoried"] == 3
+    assert summary["tabs_capture_attempted"] == 3
+    assert summary["tabs_captured"] == 3
+    # Distinct keys must both be present and correct, not merged into one.
+    assert "tabs_inventoried" in summary
+    assert "tabs_capture_attempted" in summary
+
+
+@pytest.mark.asyncio
+async def test_tabs_inventoried_is_full_count_even_when_tab_ids_narrows_capture(
+    tmp_path: Path,
+) -> None:
+    """`tab_ids` restricts L1+ per-tab CAPTURE to a subset, but the INVENTORY
+    axis must always report the true total -- never silently narrowed to
+    match the capture subset."""
+    tabs = [_tab(101), _tab(102), _tab(103)]
+    client = _basic_client(tabs=tabs)
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", tab_ids=[101])
+    summary = result["result"]["summary"]
+    assert summary["tabs_inventoried"] == 3
+    assert summary["tabs_capture_attempted"] == 1
+    assert summary["tabs_captured"] == 1
+
+
+@pytest.mark.asyncio
+async def test_windows_inventoried_is_none_not_zero_when_windows_capture_fails(
+    tmp_path: Path,
+) -> None:
+    """A failed `windows` capture must report `None` (unknown), never a bare
+    `0` that could be misread as "zero windows exist" -- and must still push
+    the overall run to a degraded status, never plain `"ok"`."""
+    client = _basic_client(extra_commands={"windows": {"ok": False, "error": "boom"}})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0")
+    manifest = result["result"]
+    assert manifest["status"] == "ok_with_failures"
+    assert manifest["summary"]["has_failures"] is True
+    assert manifest["summary"]["windows_inventoried"] is None
+    assert manifest["summary"]["tab_groups_inventoried"] is None
+    # The inventory failure is not silently absorbed -- it is a real, named
+    # top-level failure.
+    assert any(f["scope"] == "windows" for f in manifest["failures"])
+
+
+@pytest.mark.asyncio
+async def test_tabs_inventoried_is_none_not_zero_when_tabs_capture_fails(tmp_path: Path) -> None:
+    client = _basic_client(extra_commands={"tabs": {"ok": False, "error": "boom"}})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0")
+    manifest = result["result"]
+    assert manifest["status"] == "ok_with_failures"
+    assert manifest["summary"]["tabs_inventoried"] is None
+    assert any(f["scope"] == "tabs_inventory" for f in manifest["failures"])
+
+
+@pytest.mark.asyncio
+async def test_profile_summary_is_none_below_l5_and_populated_at_l5(tmp_path: Path) -> None:
+    client = _basic_client(capabilities={"debugger": True})
+    below = await run_archive(client, _DEVICE_ID, tmp_path / "L2", depth="L2")
+    assert below["result"]["summary"]["profile"] is None
+
+    at_l5 = await run_archive(client, _DEVICE_ID, tmp_path / "L5", depth="L5")
+    profile_summary = at_l5["result"]["summary"]["profile"]
+    assert profile_summary is not None
+    # 5 _PROFILE_SPECS items + cookies (skipped by default, opt-in) == 6.
+    assert profile_summary["items_total"] == 6
+    assert profile_summary["items_captured"] == 5
+    assert profile_summary["items_skipped"] == 1  # cookies, intentional opt-out
+    assert profile_summary["items_failed"] == 0
+    # The intentional cookies opt-out is not a failure and must not push
+    # overall status away from plain "ok".
+    assert at_l5["result"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_profile_summary_counts_a_real_profile_item_failure(tmp_path: Path) -> None:
+    client = _basic_client(
+        capabilities={"debugger": True},
+        extra_commands={"history_list": {"ok": False, "error": "boom"}},
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L5")
+    manifest = result["result"]
+    profile_summary = manifest["summary"]["profile"]
+    assert profile_summary is not None
+    assert profile_summary["items_failed"] == 1
+    assert profile_summary["items_captured"] == 4
+    assert manifest["status"] == "ok_with_failures"
+    assert manifest["summary"]["has_failures"] is True
 
 
 @pytest.mark.asyncio

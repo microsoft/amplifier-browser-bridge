@@ -242,6 +242,14 @@ maximum archive depth (`docs/permission-justifications.md` section 6).
 **Manifest honesty**: `manifest["status"]` is `"ok"` only when nothing failed or
 was skipped -- `"ok_with_skips"` or `"ok_with_failures"` otherwise, and
 `manifest["failures"]` lists every failure/skip at the top level, never buried.
+`manifest["summary"]` never collapses the INVENTORY axis (what actually exists in
+the browser -- `windows_inventoried`/`tab_groups_inventoried`/`tabs_inventoried`,
+populated at every depth including L0) into the CAPTURE axis (what had page
+content pulled down -- `tabs_capture_attempted`/`tabs_captured`/`tabs_skipped`/
+`tabs_failed`, legitimately all `0` at L0 by design; `profile`, `None` below L5).
+An L0 archive of 735 real tabs reports `tabs_inventoried: 735` alongside
+`tabs_captured: 0` -- never `tabs_inventoried: 0`, which would misread as "nothing
+was archived" when 735 tabs are sitting on disk.
 
 ## Extension update (Tier 0/1/2)
 
