@@ -231,7 +231,7 @@ Opening that link (on the browser being paired) shows the same code with a live
 countdown. Usually you don't need to do anything else: the moment the
 extension's options page opens (Step 2 above), it scans open tabs and the
 clipboard for that same code and redeems it on its own -- the options page's
-step 2 flips straight to "Connected" with no paste required. If it doesn't
+step 2 flips straight to "Paired" with no paste required. If it doesn't
 connect within a few seconds, open **"It didn't connect on its own"** on the
 setup page (or **"Enter a code by hand"** on the options page) and paste the
 code manually, then click **Pair**. Either way, the Hub URL and a

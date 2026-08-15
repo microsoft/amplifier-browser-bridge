@@ -9,7 +9,7 @@
 // block (see options.html's <style> and onboarding.py's `_TOKENS_CSS` --
 // tests/test_shared_design_tokens.py guards the two staying byte-identical). Step 1
 // ("Extension installed") is always done -- this page running proves it. Step 2
-// ("Connect it" / "Connected to <host>") collapses to a single done line the moment
+// ("Connect it" / "Paired with <host>") collapses to a single done line the moment
 // this device has ever been paired. Step 3 is the dynamic slot: the same four-class
 // status vocabulary this file has always used (ok/pending/alert), now expressed as
 // this step's own marker/title/context, with its body holding either the pairing
@@ -84,6 +84,12 @@
 // (`pageIsVisible`), or the ceiling is reached -- at which point `renderWatchTimedOut`
 // says so honestly instead of repeating "Give it a moment" past the point that's
 // plausible.
+//
+// Step 2's title used to read "Connected to <host>" (same bug report): that word
+// describes step 3's job (live connectivity), not step 2's (this device has been
+// paired, ever). The two lines could -- and did -- read "Connected" and "Connecting..."
+// at the same time, for the same device. Step 2 now says "Paired with <host>", which is
+// true independent of whatever step 3 is currently reporting.
 
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
 import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
@@ -151,7 +157,7 @@ function platformLabel() {
 }
 
 // Extracts "host:port" from a stored ws://host:port/device URL, for step 2's
-// "Connected to <host>" title -- falls back to the raw URL if parsing fails
+// "Paired with <host>" title -- falls back to the raw URL if parsing fails
 // for any reason (never throws, never shows a blank title).
 function hostPortFromHubUrl(hubUrl) {
   try {
@@ -274,11 +280,14 @@ function renderLadder(response) {
 
   // Step 2 collapses to "done" the moment this device has EVER been paired --
   // independent of whether the LIVE socket is up right now (that's step 3's
-  // job). "Connected to <host>" stays visible even mid-error, since pairing
-  // itself already happened; only the connectivity axis is in question.
+  // job). The title says "Paired with <host>", never "Connected to <host>"
+  // (bug report, 2026-08): step 3 alone owns the live-connectivity claim, and
+  // a user must never be able to read step 2 as contradicting whatever step 3
+  // is currently saying (e.g. "Connected to X" next to step 3's "Connecting...").
+  // Stays visible even mid-error, since pairing itself already happened.
   if (pairedBefore) {
     step2El.setAttribute("data-state", "done");
-    step2TitleEl.textContent = `Connected to ${hostPortFromHubUrl(response.hubUrl)}`;
+    step2TitleEl.textContent = `Paired with ${hostPortFromHubUrl(response.hubUrl)}`;
   } else {
     step2El.setAttribute("data-state", "next");
     step2TitleEl.textContent = "Connect it";

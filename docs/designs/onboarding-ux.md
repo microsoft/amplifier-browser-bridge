@@ -240,7 +240,7 @@ The credential warning cannot be nested. Everything else can.
 Amplifier Browser Bridge                              --t-page
 
 (v)  Extension installed                              step: done
-(v)  Connected to 100.124.126.19                      step: done
+(v)  Paired with 100.124.126.19                        step: done
      Paired automatically — nothing to copy.           --t-sm --ink-dim [conditional]
 
 (3)  You're ready                                     step: now

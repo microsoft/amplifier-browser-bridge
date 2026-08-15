@@ -136,7 +136,7 @@ test("pollStatusUntilKnown renders 'You're ready' + ok marker once connected", a
   assert.equal(elements["step-3-title"].textContent, "You're ready");
   assert.match(elements["step-3-line"].textContent, /Your agent can use this browser now/);
   assert.equal(elements["step-2"].attributes["data-state"], "done");
-  assert.match(elements["step-2-title"].textContent, /Connected to 100\.1\.2\.3:8900/);
+  assert.match(elements["step-2-title"].textContent, /Paired with 100\.1\.2\.3:8900/);
 });
 
 test("pollStatusUntilKnown lands on an honest 'couldn't determine status' state -- never a stale optimistic string -- when every attempt rejects", async () => {
