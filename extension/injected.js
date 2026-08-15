@@ -453,6 +453,95 @@ if (!window.__amplifierBrowserBridge) {
       return { url: location.href, title: document.title, text: document.body.innerText };
     }
 
+    // ---------------------------------------------------------------------
+    // Browser-state archive capability -- per-tab page state (D2, archive.py)
+    // ---------------------------------------------------------------------
+    // outerHTML, form field values, localStorage/sessionStorage, and scroll
+    // position -- the DOM/form/storage rung of the archive depth ladder
+    // (L2). Top frame only by default, same documented narrower limitation
+    // as scroll/wait_for/wait_text (docs/PROTOCOL.md's "Frames" section) --
+    // background.js's runInPage() already supports args.frame_id for this
+    // command generically (the same explicit single-frame-targeting branch
+    // read/snapshot use), so a caller with a known frame id can still reach
+    // an embedded document without this command needing its own
+    // MULTI_FRAME_COMMANDS combine strategy.
+
+    // A page's outerHTML can be arbitrarily large (a heavy SPA's fully
+    // hydrated DOM easily exceeds several MB) -- capped the same way
+    // combine_frames.mjs caps per-frame text (READ_FRAME_TEXT_CAP), with an
+    // honest `truncated` flag rather than silently growing the archive
+    // without bound. This caps in-memory/wire size on THIS side; the
+    // archive orchestrator additionally never returns this payload as a
+    // tool's return value at all (writes it straight to disk).
+    const PAGE_STATE_HTML_CAP = 2_000_000;
+
+    function capHtml(html) {
+      if (html.length <= PAGE_STATE_HTML_CAP) return { html, truncated: false, chars: html.length };
+      return { html: html.slice(0, PAGE_STATE_HTML_CAP), truncated: true, chars: html.length };
+    }
+
+    // Reads every key/value pair from a Storage object. Wrapped as a single
+    // try/catch around the whole operation (not per-key) because merely
+    // ACCESSING window.localStorage/sessionStorage can throw a SecurityError
+    // in some contexts (an opaque-origin data:/about:blank frame, or storage
+    // access blocked by the embedder) -- an honest empty dump in that case,
+    // not a thrown error that would fail the whole page_state() call.
+    function dumpStorage(getStorage) {
+      try {
+        const storage = getStorage();
+        const out = {};
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          out[key] = storage.getItem(key);
+        }
+        return out;
+      } catch {
+        return {};
+      }
+    }
+
+    function formFieldsFor(form) {
+      const fields = [];
+      for (const el of form.elements) {
+        if (!el.name) continue;
+        const isPassword = (el.type || "").toLowerCase() === "password";
+        fields.push({
+          name: el.name,
+          type: el.type || el.tagName.toLowerCase(),
+          // Password field VALUES are never captured, archived, or
+          // transmitted here -- a deliberate, permanent exception (unlike
+          // the cookies opt-in gate in archive.py, this is not a toggle:
+          // there is no legitimate archival use for a raw password string,
+          // and writing one to disk by default is a bad default regardless
+          // of what chrome.scripting already permits).
+          value: isPassword ? null : "value" in el ? String(el.value ?? "") : null,
+        });
+      }
+      return fields;
+    }
+
+    function pageState() {
+      const htmlCap = capHtml(document.documentElement.outerHTML);
+      return {
+        url: location.href,
+        title: document.title,
+        outer_html: htmlCap.html,
+        outer_html_chars: htmlCap.chars,
+        outer_html_truncated: htmlCap.truncated,
+        forms: Array.from(document.forms).map((form, index) => ({
+          index,
+          id: form.id || null,
+          name: form.getAttribute("name") || null,
+          action: form.getAttribute("action") || null,
+          method: (form.getAttribute("method") || "get").toLowerCase(),
+          fields: formFieldsFor(form),
+        })),
+        local_storage: dumpStorage(() => window.localStorage),
+        session_storage: dumpStorage(() => window.sessionStorage),
+        scroll: { x: window.scrollX, y: window.scrollY },
+      };
+    }
+
     function click(ref) {
       const el = resolveRef(ref);
       el.scrollIntoView({ block: "center", inline: "center" });
@@ -544,6 +633,8 @@ if (!window.__amplifierBrowserBridge) {
             return describe(args.ref);
           case "read":
             return read();
+          case "page_state":
+            return pageState();
           case "click":
             return click(args.ref);
           case "type":

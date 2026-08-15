@@ -65,7 +65,13 @@ Sent once, immediately after the WebSocket opens. Establishes device identity an
     "capture_visible_tab": true,
     "downloads": true,
     "alarms": true,
-    "scripting": true
+    "scripting": true,
+    "history": true,
+    "bookmarks": true,
+    "sessions": true,
+    "top_sites": true,
+    "reading_list": true,
+    "cookies": true
   },
   "protocol_version": 1,
   "token": "shared secret, validated against the hub's TokenStore"
@@ -551,6 +557,16 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 | `downloads_list` | background.js (`chrome.downloads.search`) | `args.limit` (optional, default 20). Target is device-only. |
 | `download` | background.js (`chrome.downloads.download`) | `args.url`, `args.filename` (optional). Target is device-only. |
 | `wait_download` | background.js (`chrome.downloads.search`, polled) | `args.download_id` XOR `args.since_id` (+ optional `args.pattern`), `args.timeout_ms`. Target is device-only. See "Content-extraction mechanisms" below. |
+| `windows` | background.js (`chrome.windows.getAll` + `chrome.tabGroups.query`) | Target is device-only. Full window metadata (incl. `incognito`) and tab-group metadata. No tab_id/page contact -- see "Browser-state archive" below. |
+| `page_state` | injected.js | Per-tab `outer_html` (capped, honest `truncated` flag), `forms` (field values -- password values always excluded), `local_storage`/`session_storage`, `scroll`. Top frame only by default (same narrower limitation as `scroll`/`wait_for`); `args.frame_id` targets one known frame. |
+| `mhtml` | background.js (CDP `Page.captureSnapshot`) | Unconditionally CDP-requiring -- no injection-only alternative exists. Returns the raw MHTML document as `result.data` (a string, not base64). |
+| `nav_history` | background.js (CDP `Page.getNavigationHistory`) | Unconditionally CDP-requiring, same as `mhtml`. |
+| `history_list` | background.js (`chrome.history.search`) | `args.query` (default `""`), `args.max_results` (default 1000), `args.start_time` (ms epoch, optional). Target is device-only. |
+| `bookmarks_list` | background.js (`chrome.bookmarks.getTree`) | Target is device-only. Returns a flattened list, not the nested tree. |
+| `sessions_list` | background.js (`chrome.sessions.getRecentlyClosed` + `getDevices`) | `args.max_results` (default 25). Target is device-only. |
+| `top_sites` | background.js (`chrome.topSites.get`) | Target is device-only. |
+| `reading_list` | background.js (`chrome.readingList.query`) | Target is device-only. |
+| `cookies_list` | background.js (`chrome.cookies.getAll`) | `args.url`/`args.domain` (optional filters). Target is device-only. **Not gated at this wire-command level** -- a direct caller gets cookies like any other command; the opt-in gate lives at the archive orchestrator level (see below). |
 
 Every `PAGE_WORLD_COMMAND` (`snapshot`, `read`, `click`, `type`, `key`, `scroll`, `back`, `forward`,
 `wait_for`, `wait_text`) also accepts an optional `args.wake` -- see "Discarded tabs" below -- and
@@ -664,12 +680,17 @@ on navigation), so this is not a new class of staleness, just a stricter, unambi
 never frame 0 by default, never a guess. A ref whose frame no longer exists in the tab (navigated
 away, reloaded, or removed) fails loud, naming the frame id, rather than a bare "stale ref".
 
-**Documented narrower limitation:** `scroll`, `back`, `forward`, `wait_for`, `wait_text`, and a
-ref-less `key` press still operate on the top frame (frameId 0) only, in this phase. A
-`wait_for`/`wait_text` selector or text that only exists inside an iframe will not be found. This
-is a scope decision, not an oversight -- these are page/tab-level operations (or, for `key`, have
-no ref to resolve a frame from) where multi-frame semantics are considerably less obviously
-correct (e.g. "scroll which frame?"). Revisit if a real need for frame-scoped waits emerges.
+**Documented narrower limitation:** `scroll`, `back`, `forward`, `wait_for`, `wait_text`, a
+ref-less `key` press, and `page_state` (D2, browser-state archive) still operate on the top
+frame (frameId 0) only by default, in this phase. A `wait_for`/`wait_text` selector or text that
+only exists inside an iframe will not be found; `page_state` will not capture an embedded
+document's own outerHTML/storage without an explicit `args.frame_id`. This is a scope decision,
+not an oversight -- these are page/tab-level operations (or, for `key`, have no ref to resolve a
+frame from) where multi-frame semantics are considerably less obviously correct (e.g. "scroll
+which frame?"). `page_state` accepts `args.frame_id` (the same generic single-frame-targeting
+branch `read`/`snapshot` use) to reach one known frame explicitly, without needing its own
+MULTI_FRAME_COMMANDS combine strategy. Revisit if a real need for frame-scoped waits/page_state
+emerges.
 
 ### Snapshot generations and ref staleness
 
@@ -1147,6 +1168,14 @@ When either is set and the hub determines CDP is genuinely required (`cdp.requir
    request is stripped by `Hub.send_command` before any of this runs (the same
    capability-binding discipline policy.py applies to denylisted targets applies here: the hub
    decides CDP usage from its own state, never from anything the caller asserts).
+
+**Unconditionally CDP-requiring commands (browser-state archive, D2):** `mhtml` and
+`nav_history` have no `args` key to opt in -- `cdp.requires_cdp` treats both as
+CDP-requiring unconditionally (`_ALWAYS_CDP_COMMANDS`), because neither has an
+injection-only alternative at all (`Page.captureSnapshot`/`Page.getNavigationHistory`
+are CDP methods with no `chrome.scripting` equivalent). The same three-step sequence
+above still applies: capability check first (fails loud, no silent fallback, on a
+device without `debugger`), then attach, then dispatch.
 
 ### `attach` / `detach` (agent -> hub -> ext)
 

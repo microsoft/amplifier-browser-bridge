@@ -72,6 +72,11 @@ _EXTENSION_FILES = (
     # options.js's status query depends on. See docs/ISSUE_CASE_STUDIES.md-style
     # note in options.js/background.js for the full failure chain this caused.
     "effects_collector.mjs",
+    # Browser-state archive (D2): background.js statically imports this at
+    # module top level for bookmarks_list()'s tree-flattening logic. Same
+    # 87ce68d whitelist-omission failure mode as every other entry above
+    # applies if this is ever omitted here.
+    "flatten_bookmarks.mjs",
     "manifest.json",
     # Toolbar/store icons. Referenced by manifest.json's `icons` and
     # `action.default_icon`, so `verify_extension_integrity` (which reads those

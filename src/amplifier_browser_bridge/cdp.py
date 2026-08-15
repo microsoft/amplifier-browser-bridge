@@ -75,6 +75,15 @@ DEFAULT_SOFT_DETACH_IDLE_SECONDS: float = 20.0
 # `send_command`, which strips any caller-supplied `_cdp` before evaluation).
 _TRUSTED_INPUT_COMMANDS: frozenset[str] = frozenset({"click", "type", "key"})
 
+# Commands that are UNCONDITIONALLY CDP-requiring -- unlike CDP_INTENT_ARGS
+# (an optional per-call escalation of an otherwise-injectable command), these
+# have no injection-only alternative at all. `Page.captureSnapshot` (MHTML)
+# and `Page.getNavigationHistory` are CDP methods with no `chrome.scripting`
+# equivalent, so every call needs the same capability check + attach
+# bookkeeping as a `trusted`/`capture_hidden` escalation -- see
+# `requires_cdp` below and docs/PROTOCOL.md's CDP escalation section.
+_ALWAYS_CDP_COMMANDS: frozenset[str] = frozenset({"mhtml", "nav_history"})
+
 
 def requires_cdp(command: str, args: dict[str, Any]) -> bool:
     """True if this (command, args) pair genuinely needs CDP to satisfy the
@@ -83,6 +92,9 @@ def requires_cdp(command: str, args: dict[str, Any]) -> bool:
     available; only because the caller asked for something injection-only
     cannot provide:
 
+        - `mhtml`/`nav_history`: unconditionally CDP-requiring -- see
+          `_ALWAYS_CDP_COMMANDS` above. No `args` check needed; there is no
+          non-CDP path for either command to opt out of.
         - `click`/`type`/`key` with `args["trusted"] is True`: the caller
           needs `isTrusted: true` events, which `injected.js`'s
           `dispatchEvent` calls structurally cannot produce.
@@ -91,6 +103,8 @@ def requires_cdp(command: str, args: dict[str, Any]) -> bool:
           window, which `chrome.tabs.captureVisibleTab` cannot do (design doc
           §7: "screenshotting a non-active tab is desktop-only [via CDP]").
     """
+    if command in _ALWAYS_CDP_COMMANDS:
+        return True
     if command in _TRUSTED_INPUT_COMMANDS and truthy(args.get("trusted")):
         return True
     return command == "screenshot" and truthy(args.get("capture_hidden"))

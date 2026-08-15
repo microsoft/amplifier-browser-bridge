@@ -23,6 +23,7 @@ import {
 import { EffectsCollector, EFFECTS_WINDOW_MS, emptyEffectsReport } from "./effects_collector.mjs";
 import { resolveBundledConfigAdoption, CONFIG_SOURCE_BUNDLED, BUNDLED_CONFIG_RESOURCE } from "./bundled_config.mjs";
 import { classifyHubErrorMessage, classifyCloseEvent, badgeTitleForErrorCode } from "./connection_error.mjs";
+import { flattenBookmarks } from "./flatten_bookmarks.mjs";
 
 const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 15000; // measured to hold a desktop MV3 worker alive
@@ -350,6 +351,56 @@ async function probeCapabilities() {
     }
   } catch {
     caps.scripting = false;
+  }
+
+  // Archive capability (browser-state archive): browser-wide profile-data
+  // permissions. Each probe is a REAL, non-destructive invocation -- never a
+  // `typeof` check -- same discipline as every capability above.
+  // `maxResults`/query args are chosen to be as cheap as possible while still
+  // proving the API actually works end-to-end, not merely present.
+  try {
+    await chrome.history.search({ text: "", maxResults: 1 });
+    caps.history = true;
+  } catch {
+    caps.history = false;
+  }
+
+  try {
+    await chrome.bookmarks.getTree();
+    caps.bookmarks = true;
+  } catch {
+    caps.bookmarks = false;
+  }
+
+  try {
+    await chrome.sessions.getRecentlyClosed({ maxResults: 1 });
+    caps.sessions = true;
+  } catch {
+    caps.sessions = false;
+  }
+
+  try {
+    await chrome.topSites.get();
+    caps.top_sites = true;
+  } catch {
+    caps.top_sites = false;
+  }
+
+  try {
+    await chrome.readingList.query({});
+    caps.reading_list = true;
+  } catch {
+    caps.reading_list = false;
+  }
+
+  try {
+    // A concrete URL (rather than an empty filter) keeps this probe cheap
+    // and its result trivially discardable; an empty match is still a real,
+    // successful call, not a failure.
+    await chrome.cookies.getAll({ url: "https://example.com" });
+    caps.cookies = true;
+  } catch {
+    caps.cookies = false;
   }
 
   return caps;
@@ -748,6 +799,7 @@ const PAGE_WORLD_COMMANDS = new Set([
   "forward",
   "wait_for",
   "wait_text",
+  "page_state",
 ]);
 
 // Commands that gather results across EVERY frame of the tab (Bug 2, real-profile
@@ -835,6 +887,18 @@ async function executeCommand(command, target, args) {
     if (command === "downloads_list") return { ok: true, result: await downloadsList(args) };
     if (command === "download") return { ok: true, result: await triggerDownload(args) };
     if (command === "wait_download") return { ok: true, result: await waitDownload(args) };
+    // Browser-state archive capability (see protocol.py's COMMANDS comment) --
+    // each of these is composed by the hub-side archive orchestrator
+    // (archive.py), never exposed as its own agent-facing tool in this phase.
+    if (command === "windows") return { ok: true, result: await listWindows() };
+    if (command === "mhtml") return { ok: true, result: await cdpCaptureMhtml(requireTabId(target)) };
+    if (command === "nav_history") return { ok: true, result: await cdpNavHistory(requireTabId(target)) };
+    if (command === "history_list") return { ok: true, result: await historyList(args) };
+    if (command === "bookmarks_list") return { ok: true, result: await bookmarksList() };
+    if (command === "sessions_list") return { ok: true, result: await sessionsList(args) };
+    if (command === "top_sites") return { ok: true, result: await topSitesList() };
+    if (command === "reading_list") return { ok: true, result: await readingListEntries() };
+    if (command === "cookies_list") return { ok: true, result: await cookiesList(args) };
     if (PAGE_WORLD_COMMANDS.has(command)) return { ok: true, result: await runInPage(target, command, args) };
     return { ok: false, error: `unsupported command: ${command}` };
   } catch (err) {
@@ -1260,7 +1324,56 @@ async function listTabs(target) {
     discarded: !!t.discarded,
     asleep: isAsleep(t),
     status: t.status,
+    // Archive audit finding: chrome.tabs.query already returns these fields
+    // on the same object -- previously read and dropped. `groupId` is
+    // `chrome.tabGroups.TAB_GROUP_ID_NONE` (-1) for an ungrouped tab;
+    // reported as `null` here so "no group" is unambiguous without the
+    // caller needing to know that sentinel value.
+    group_id: typeof t.groupId === "number" && t.groupId >= 0 ? t.groupId : null,
+    fav_icon_url: t.favIconUrl || null,
+    pinned: !!t.pinned,
+    audible: !!t.audible,
+    muted: !!(t.mutedInfo && t.mutedInfo.muted),
+    mute_reason: (t.mutedInfo && t.mutedInfo.reason) || null,
+    last_accessed: typeof t.lastAccessed === "number" ? t.lastAccessed : null,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Browser-state archive capability -- window/tab-group inventory
+// ---------------------------------------------------------------------------
+// Audit finding: chrome.windows.getAll({}) and chrome.tabGroups.query({}) were
+// already probed at startup (probeCapabilities() above) and the results
+// thrown away -- no window metadata (state, bounds, focus, incognito) or
+// group metadata (title, color, collapsed) was exposed anywhere. This command
+// is the fix: real window/group inventory, on demand, with zero tab_id/page
+// contact -- the L0 (cheapest) rung of the archive depth ladder (archive.py).
+
+async function listWindows() {
+  const [windows, groups] = await Promise.all([
+    chrome.windows.getAll({ populate: false }),
+    chrome.tabGroups.query({}),
+  ]);
+  return {
+    windows: windows.map((w) => ({
+      window_id: w.id,
+      focused: w.focused,
+      state: w.state,
+      type: w.type,
+      incognito: w.incognito,
+      top: w.top,
+      left: w.left,
+      width: w.width,
+      height: w.height,
+    })),
+    tab_groups: groups.map((g) => ({
+      group_id: g.id,
+      window_id: g.windowId,
+      title: g.title || null,
+      color: g.color,
+      collapsed: g.collapsed,
+    })),
+  };
 }
 
 async function tabOpen(args) {
@@ -2002,6 +2115,147 @@ async function cdpScreenshotRegion(tabId, clip) {
     params.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 };
   }
   return await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", params);
+}
+
+// ---------------------------------------------------------------------------
+// Browser-state archive capability -- CDP-only per-tab capture (mhtml, nav_history)
+// ---------------------------------------------------------------------------
+// Audit finding: chrome.debugger is granted and attach/detach already
+// implemented, but Page.captureSnapshot (MHTML) and Page.getNavigationHistory
+// had ZERO call sites. Both are unconditionally CDP-requiring (see cdp.py's
+// requires_cdp/_ALWAYS_CDP_COMMANDS) -- no injection-only alternative exists
+// for either. Composed exclusively by the hub-side archive orchestrator
+// (archive.py); neither is exposed as its own agent-facing tool in this phase
+// -- the raw payloads here (a full MHTML document can be multi-MB) must never
+// become an agent tool's return value, only bytes written to disk.
+
+async function cdpCaptureMhtml(tabId) {
+  await cdpAttach(tabId);
+  // Page.captureSnapshot's `data` field is the serialized MHTML document
+  // itself (a string), not base64 -- unlike Page.captureScreenshot's binary
+  // image data, MHTML is already a text format, so no further encoding is
+  // needed before writing it straight to disk.
+  const result = await chrome.debugger.sendCommand({ tabId }, "Page.captureSnapshot", { format: "mhtml" });
+  return { tab_id: tabId, format: "mhtml", bytes: result.data.length, data: result.data };
+}
+
+async function cdpNavHistory(tabId) {
+  await cdpAttach(tabId);
+  const result = await chrome.debugger.sendCommand({ tabId }, "Page.getNavigationHistory", {});
+  return {
+    tab_id: tabId,
+    current_index: result.currentIndex,
+    entries: (result.entries || []).map((e) => ({
+      id: e.id,
+      url: e.url,
+      user_typed_url: e.userTypedURL || null,
+      title: e.title,
+      transition_type: e.transitionType,
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Browser-state archive capability -- browser-wide profile data
+// ---------------------------------------------------------------------------
+// Audit finding: history/bookmarks/sessions/topSites/readingList were NOT
+// granted permissions at all despite being valuable browser-wide profile data
+// -- see manifest.json. Every command below is device-only (target carries no
+// tab_id/window_id) and composed exclusively by the hub-side archive
+// orchestrator's deepest level (archive.py's L5) -- none is exposed as its
+// own agent-facing tool in this phase.
+//
+// `cookies_list` is deliberately NOT gated here at the wire-command level --
+// a caller invoking this command directly (e.g. via the CLI's `cmd` escape
+// hatch) gets cookies back like any other command. The opt-in gate for
+// cookie collection lives at the archive ORCHESTRATOR level
+// (archive.py's `include_cookies`, default False) -- see docs/PROTOCOL.md.
+
+async function historyList(args) {
+  const query = args && typeof args.query === "string" ? args.query : "";
+  const maxResults = args && typeof args.max_results === "number" && args.max_results > 0 ? args.max_results : 1000;
+  const startTime = args && typeof args.start_time === "number" ? args.start_time : 0;
+  const items = await chrome.history.search({ text: query, maxResults, startTime });
+  return {
+    entries: items.map((it) => ({
+      url: it.url,
+      title: it.title,
+      last_visit_time: it.lastVisitTime,
+      visit_count: it.visitCount,
+      typed_count: it.typedCount,
+    })),
+  };
+}
+
+// chrome.bookmarks.getTree() returns a nested tree (folders contain children);
+// flattened here into a single list -- easier for the archive orchestrator to
+// write straight to a JSON file and for a caller to scan without recursing.
+// flattenBookmarks() itself is pure logic imported from flatten_bookmarks.mjs
+// (zero chrome.* usage, unit-tested with `node --test` -- see that module's
+// own docstring for why it lives there rather than inline here).
+async function bookmarksList() {
+  const tree = await chrome.bookmarks.getTree();
+  return { entries: flattenBookmarks(tree) };
+}
+
+async function sessionsList(args) {
+  const maxResults = args && typeof args.max_results === "number" && args.max_results > 0 ? args.max_results : 25;
+  const [recentlyClosed, devices] = await Promise.all([
+    chrome.sessions.getRecentlyClosed({ maxResults }),
+    chrome.sessions.getDevices({ maxResults }),
+  ]);
+  return {
+    recently_closed: recentlyClosed.map((s) => ({
+      last_modified: s.lastModified,
+      tab: s.tab ? { url: s.tab.url, title: s.tab.title } : null,
+      window: s.window ? { tab_count: (s.window.tabs || []).length } : null,
+    })),
+    devices: devices.map((d) => ({
+      device_name: d.deviceName,
+      sessions: (d.sessions || []).map((s) => ({
+        last_modified: s.lastModified,
+        window: s.window ? { tab_count: (s.window.tabs || []).length } : null,
+      })),
+    })),
+  };
+}
+
+async function topSitesList() {
+  const sites = await chrome.topSites.get();
+  return { entries: sites.map((s) => ({ url: s.url, title: s.title })) };
+}
+
+async function readingListEntries() {
+  const entries = await chrome.readingList.query({});
+  return {
+    entries: entries.map((e) => ({
+      url: e.url,
+      title: e.title,
+      has_been_read: e.hasBeenRead,
+      creation_time: e.creationTime,
+      last_update_time: e.lastUpdateTime,
+    })),
+  };
+}
+
+async function cookiesList(args) {
+  const filter = {};
+  if (args && typeof args.url === "string" && args.url) filter.url = args.url;
+  if (args && typeof args.domain === "string" && args.domain) filter.domain = args.domain;
+  const cookies = await chrome.cookies.getAll(filter);
+  return {
+    entries: cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      secure: c.secure,
+      http_only: c.httpOnly,
+      same_site: c.sameSite,
+      session: c.session,
+      expiration_date: c.expirationDate || null,
+    })),
+  };
 }
 
 // Fires on ANY debugger detach -- including ones we didn't ask for: the

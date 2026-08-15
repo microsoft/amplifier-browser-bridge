@@ -33,7 +33,13 @@
     "alarms",
     "downloads",
     "tabGroups",
-    "clipboardRead"
+    "clipboardRead",
+    "history",
+    "bookmarks",
+    "sessions",
+    "topSites",
+    "readingList",
+    "cookies"
   ],
   "host_permissions": [
     "<all_urls>"

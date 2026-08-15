@@ -291,6 +291,109 @@ every other permission in this document.**
 
 ---
 
+## 5. `history`, `bookmarks`, `sessions`, `topSites`, `readingList` (browser-state archive)
+
+### What they grant
+
+Read access to the user's entire browsing history (`chrome.history`), bookmark tree
+(`chrome.bookmarks`), recently-closed tabs/windows and synced-device sessions
+(`chrome.sessions`), most-visited sites (`chrome.topSites`), and reading list
+(`chrome.readingList`). Each is a narrowly-scoped Chrome extension API -- unlike
+`<all_urls>` or `chrome.debugger`, none of these grants arbitrary code execution or
+network interception; they expose exactly the browser-profile data their names describe,
+nothing more.
+
+### The defense
+
+Added for the browser-state **archive** capability (`archive.py`,
+`docs/PROTOCOL.md`'s "Browser-state archive" section): an agent capturing the state of a
+browser at its deepest level (L5) needs this profile-wide data, not just per-tab state.
+The same "broad access is the feature" argument from `<all_urls>` above applies here,
+narrower in scope: this project's stated design goal is an agent that can see what the
+user has seen (`docs/POLICY.md` section 1) -- browsing history, bookmarks, and recently
+closed tabs are squarely part of "what the user has seen," not an unrelated escalation.
+None of the five is fetched unless the agent explicitly requests archive depth L5 (or
+calls the underlying wire command directly via the CLI's `cmd` escape hatch) -- there is
+no background collection, polling, or periodic sync of any of this data.
+
+### Where this defense is honestly weaker than it sounds
+
+- **These permissions are requested unconditionally in the manifest**, the same gap named
+  for `chrome.debugger` above -- not lazily via `chrome.permissions.request()` at the
+  moment an L5 archive is actually run. A reviewer's risk assessment has to price in "this
+  extension holds standing read access to history/bookmarks/sessions/topSites/readingList
+  at all times," not "only when an archive is requested."
+- **Capability reporting is not a gate.** `probeCapabilities()` reports each of these
+  behaviorally (a real, non-destructive invocation, per this project's own convention --
+  CONTRIBUTING.md:148-173), but a `true` here means "this API works," not "the hub only
+  uses it when asked." The actual restraint -- only calling these commands when an L5
+  archive (or a direct `cmd` invocation) asks for them -- lives entirely in `archive.py`
+  and the calling agent's own behavior, same structural weakness as `<all_urls>`'s policy
+  engine: none of it is visible from the manifest or Chrome's own permission model.
+- **`manifest.android.json` requests all five without independent verification that they
+  work correctly on Edge Android.** Unlike `chrome.debugger` (confirmed genuinely absent),
+  no equivalent confirmation exists one way or the other for these APIs on that platform
+  in this codebase's history -- the behavioral probes will honestly report `false` if any
+  are actually unavailable there, but that has not been exercised against a real Android
+  device as part of this change.
+
+**Verdict: honestly justifiable as an extension of the existing "broad access is the
+feature" design choice, narrower in blast radius than `<all_urls>`/`chrome.debugger` --
+but requested unconditionally rather than lazily, same gap as `chrome.debugger`, and the
+actual restraint (only used when an L5 archive or direct command asks) is enforced by
+`archive.py`'s own discipline, not by anything in the manifest.**
+
+---
+
+## 6. `cookies`
+
+### What it grants
+
+Read (and write/delete, though this project never writes) access to every cookie the
+browser holds, across every domain -- `chrome.cookies.getAll`. Cookies routinely carry
+live session/authentication tokens; this is meaningfully more dangerous than the other
+profile-data permissions in section 5, which is why it gets its own section rather than
+being grouped with them.
+
+### The defense
+
+**This is the one piece of data this project treats as opt-in at the API level, not just
+at the manifest level -- per explicit maintainer direction.** The `cookies_list` wire
+command itself is an ordinary command (not gated at the protocol layer -- a direct caller
+using the CLI's `cmd` escape hatch gets cookies back like any other command, consistent
+with this project's "the hub is the trust boundary, not the wire protocol" design). But
+the **archive orchestrator** -- the only place this project composes profile-wide data
+collection today -- never calls `cookies_list` by default, at ANY depth, including its
+deepest level (L5). `archive.py`'s `include_cookies` parameter defaults to `False` and
+must be explicitly set `True` by the calling agent for cookies to be collected at all,
+regardless of how deep an archive is requested. A default that silently exfiltrates
+session tokens into an archive directory on disk is a bad default regardless of what the
+manifest permits -- the risk here is qualitatively different from history/bookmarks/etc.
+(section 5), which is why it is not folded into that section's default-on treatment.
+
+### Where this defense is honestly weaker than it sounds
+
+- **The opt-in gate is enforced in `archive.py`, not by Chrome's permission model or the
+  wire protocol.** `cookies` is requested unconditionally in the manifest, same as every
+  permission in this document; a caller that bypasses the archive orchestrator entirely
+  (the CLI's `cmd` escape hatch, or a caller scripting the wire protocol directly) gets
+  cookies with no opt-in prompt at all -- the restraint is a single Python-level default,
+  not a platform-enforced boundary.
+  a security reviewer should treat "cookies are opt-in" as a claim about this project's
+  own orchestrator code, not about what the extension is technically capable of doing.
+- **Cookie VALUES are returned in full**, unredacted, when `cookies_list` is invoked
+  (directly or via `include_cookies=True`) -- there is no partial-redaction mode. Once
+  collected, a cookie value is exactly as sensitive on disk as it was in the browser.
+
+**Verdict: honestly justifiable as a deliberate, maintainer-directed design choice --
+genuinely dangerous data is opt-in at the point that matters most (the archive
+orchestrator's own default), never included silently even at maximum archive depth -- but
+the opt-in is a Python-level default in `archive.py`, not a permission-model or wire-level
+boundary. A caller with direct wire/CLI access bypasses it entirely, same as every
+capability in this document once granted.**
+
+---
+
 ## Summary for a time-pressed reviewer
 
 | Permission | Can be honestly defended as-is? | Caveat |
@@ -299,6 +402,8 @@ every other permission in this document.**
 | `chrome.debugger` | **Only partially** | Two narrow use cases; permission granted is far broader than either, requested unconditionally rather than lazily -- treat a "no" here as reasonable, not a misunderstanding |
 | Persistent hub WebSocket | Yes, conditionally | Depends entirely on the user's own hub deployment being sound; the extension cannot verify this |
 | `clipboardRead` | Yes, as a narrow, validated-before-use fallback | The grant itself is broader than the one purpose it's used for -- same limitation as every Chrome permission in this document |
+| `history`/`bookmarks`/`sessions`/`topSites`/`readingList` | Yes, as a narrower extension of the `<all_urls>` design choice | Requested unconditionally, not lazily; restraint (only used for archive L5) lives in `archive.py`, not the manifest; not independently verified on Android |
+| `cookies` | Yes, opt-in enforced at the point that matters | The opt-in (`include_cookies=False` default, even at max archive depth) is a Python-level default in `archive.py`, not a platform/wire-level boundary -- direct wire/CLI access bypasses it |
 
 If you are approving a force-install policy or a store submission and need
 exactly one takeaway: **`chrome.debugger` is the permission this document
