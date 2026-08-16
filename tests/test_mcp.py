@@ -74,6 +74,9 @@ def test_all_expected_tools_are_registered():
         "browser_downloads_list",
         "browser_download",
         "browser_wait_download",
+        "browser_archive",
+        "browser_archive_convert",
+        "browser_update_extension",
     }
     registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert registered == expected
@@ -167,6 +170,81 @@ async def test_browser_tab_open_defaults_to_background(monkeypatch: pytest.Monke
     assert target == Target(device_id="d1")  # device-only -- no tab exists yet
     assert command == "tab_open"
     assert args == {"url": "about:blank", "active": False}
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_pages_and_reports_filters_and_totals(monkeypatch: pytest.MonkeyPatch):
+    """browser_tabs must actually run its raw hub response through paging.py --
+    not just fetch it (see paging.py's own unit tests for the shaping logic
+    itself)."""
+    tabs = [
+        {"tab_id": i, "window_id": 1, "url": "https://example.com/", "title": "Example Page"}
+        for i in range(5)
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="d1", limit=2, offset=1)
+
+    assert result["ok"] is True
+    r = result["result"]
+    assert r["total"] == 5
+    assert r["matched"] == 5
+    assert r["returned"] == 2
+    assert r["offset"] == 1
+    assert r["limit"] == 2
+    assert r["has_more"] is True
+    assert [t["tab_id"] for t in r["tabs"]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_window_id_is_a_local_filter_not_forwarded_to_the_wire_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """window_id narrows the RESPONSE (paging.py), not the wire-level Target --
+    otherwise the reported `total` could never be the true, device-wide count."""
+    tabs = [
+        {"tab_id": 1, "window_id": 10, "url": "https://example.com/a", "title": "A"},
+        {"tab_id": 2, "window_id": 20, "url": "https://example.com/b", "title": "B"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="d1", window_id=10)
+
+    target, command, _args = fake.command_calls[0]
+    assert command == "tabs"
+    assert target.window_id is None  # NOT forwarded to the hub/device
+    r = result["result"]
+    assert r["total"] == 2  # unfiltered grand total across the whole device
+    assert r["matched"] == 1
+    assert [t["tab_id"] for t in r["tabs"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_summary_mode_returns_no_tab_list(monkeypatch: pytest.MonkeyPatch):
+    tabs = [
+        {"tab_id": 1, "window_id": 1, "url": "https://example.com/", "title": "Example", "discarded": True},
+        {"tab_id": 2, "window_id": 2, "url": "https://example.org/", "title": "Other"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_tabs(device_id="d1", summary=True)
+
+    r = result["result"]
+    assert "tabs" not in r
+    assert r["summary"] is True
+    assert r["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_description_teaches_paging_and_summary():
+    tools = {t.name: t for t in srv.mcp._tool_manager.list_tools()}
+    desc = (tools["browser_tabs"].description or "").lower()
+    assert "paged" in desc or "page" in desc
+    assert "summary" in desc
+    assert "has_more" in desc
 
 
 @pytest.mark.asyncio
@@ -375,3 +453,135 @@ async def test_browser_vision_read_surfaces_config_error_as_ok_false(monkeypatch
 
     assert result["ok"] is False
     assert "No vision provider is configured" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# browser_archive -- D2, browser-state archive: proves this surface actually
+# routes through archive.py's run_archive (not just fetches). See
+# tests/test_archive.py for the orchestrator's own logic (depth ladder,
+# no-wake guarantee, failure recording, impossible-depth) -- this file only
+# proves the MCP adapter wiring.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedHubClient:
+    """Same shape as _FakeHubClient but with per-command scripted responses --
+    a plain constant response (_FakeHubClient) can't stand in for run_archive,
+    which needs `windows` and `tabs` to return different shapes."""
+
+    def __init__(self, devices: list[dict[str, Any]], by_command: dict[str, Any]) -> None:
+        self._devices = devices
+        self._by_command = by_command
+        self.command_calls: list[tuple[Target, str, dict[str, Any]]] = []
+
+    async def list_devices(self) -> list[dict[str, Any]]:
+        return self._devices
+
+    async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]:
+        self.command_calls.append((target, command, args))
+        return self._by_command.get(command, {"ok": True, "result": {}})
+
+
+def _archive_device(**capabilities: bool) -> dict[str, Any]:
+    return {
+        "device_id": "d1",
+        "capabilities": {"debugger": False, "scripting": True, **capabilities},
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_routes_through_run_archive(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    fake = _ScriptedHubClient(
+        [_archive_device()],
+        {
+            "windows": {"ok": True, "result": {"windows": [], "tab_groups": []}},
+            "tabs": {"ok": True, "result": []},
+        },
+    )
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path), depth="L0")
+
+    assert result["ok"] is True
+    manifest = result["result"]
+    assert manifest["device_id"] == "d1"
+    assert manifest["depth"] == "L0"
+    assert (tmp_path.__class__(manifest["archive_dir"]) / "manifest.json").is_file()
+    # Actually went through run_archive's own command sequence, not a stub.
+    called_commands = {c for (_t, c, _a) in fake.command_calls}
+    assert called_commands == {"windows", "tabs"}
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_impossible_depth_surfaces_as_ok_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    fake = _ScriptedHubClient([_archive_device(debugger=False)], {})
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path), depth="L4")
+
+    assert result["ok"] is False
+    assert "debugger" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_hub_error_surfaces_as_ok_false(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    class _RaisingArchiveClient:
+        async def list_devices(self):
+            raise HubError("unauthorized")
+
+        async def command(self, *a, **k):
+            raise HubError("unauthorized")
+
+    monkeypatch.setattr(srv, "_client", lambda: _RaisingArchiveClient())
+
+    result = await srv.browser_archive(device_id="d1", dest_dir=str(tmp_path))
+
+    assert result == {"ok": False, "error": "unauthorized"}
+
+
+# ---------------------------------------------------------------------------
+# browser_archive_convert -- proves this surface actually routes through
+# archive_convert.py's run_archive_convert (not just fetches). See
+# tests/test_archive_convert.py and tests/test_mhtml_convert.py for the
+# conversion pipeline's own logic -- this file only proves the MCP adapter
+# wiring, including that the manifest never contains markdown BODY text.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_routes_through_run_archive_convert(tmp_path):
+    archive_dir = tmp_path / "archive_d1_20260815T000000Z"
+    tab_dir = archive_dir / "tabs" / "101"
+    tab_dir.mkdir(parents=True)
+    (tab_dir / "page.mhtml").write_bytes(
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/related; boundary="X"\r\n\r\n'
+        b"--X\r\nContent-Type: text/html\r\nContent-Location: https://example.com/\r\n\r\n"
+        b"<html><body><article><p>Some real synthetic article text for this test.</p>"
+        b"</article></body></html>\r\n--X--\r\n"
+    )
+
+    result = await srv.browser_archive_convert(archive_dir=str(archive_dir))
+
+    assert result["ok"] is True
+    manifest = result["result"]
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    extracted_path = manifest["tabs"]["101"]["extracted_markdown"]["path"]
+    assert tmp_path.__class__(extracted_path).is_file()
+    # Load-bearing: the manifest itself must never carry the converted markdown
+    # TEXT -- only paths/counts, same contract as browser_archive's own manifest.
+    serialized = str(manifest)
+    assert "Some real synthetic article text for this test" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_bad_archive_dir_surfaces_as_ok_false(tmp_path):
+    not_an_archive = tmp_path / "not_an_archive"
+    not_an_archive.mkdir()
+
+    result = await srv.browser_archive_convert(archive_dir=str(not_an_archive))
+
+    assert result["ok"] is False
+    assert "tabs/" in result["error"]

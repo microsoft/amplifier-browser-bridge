@@ -35,9 +35,16 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 
 from .addressing import Target
+from .archive import DEFAULT_DEPTH, ArchiveError
+from .archive import run_archive as _run_archive
+from .archive_convert import ConversionError
+from .archive_convert import run_archive_convert as _run_archive_convert
 from .auth import resolve_default_token
 from .client import HubClient, HubError
 from .hub_location import resolve_hub_url
+from .paging import DEFAULT_LIMIT, shape_tabs_response
+from .update_extension import DEFAULT_RECONNECT_TIMEOUT_S
+from .update_extension import run_update_extension as _run_update_extension
 from .vision import VisionConfigError, VisionError
 from .vision_read import vision_read as _vision_read
 
@@ -162,18 +169,54 @@ async def browser_devices() -> dict[str, Any]:
 
 @mcp.tool()
 async def browser_tabs(
-    device_id: str, window_id: int | None = None, timeout_s: float | None = None
+    device_id: str,
+    window_id: int | None = None,
+    url_contains: str | None = None,
+    title_contains: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+    summary: bool = False,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
-    """List open tabs on a device, optionally scoped to one window_id. Use this
-    after browser_devices() to discover tab_id values for the other tools.
+    """List open tabs on a device. Use this after browser_devices() to discover
+    tab_id values for the other tools.
+
+    Results are PAGED by default (limit=100, offset=0) -- on a large profile
+    (hundreds of tabs) an unpaged listing can be hundreds of KB, enough to
+    truncate before it ever reaches your context. The response's `result`
+    always reports `total` (every tab on the device, unfiltered), `matched`
+    (how many passed your filters), `returned` (this page's size), `offset`,
+    `limit`, and `has_more` -- so you can tell "3 tabs matched my filter" from
+    "3 tabs exist" and page correctly without guessing. Pass limit=0 to opt
+    back into the old, unpaged full listing.
+
+    On a large or unknown-size profile, call with summary=True FIRST: it
+    returns ONLY per-window tab counts, totals, and how many tabs are
+    discarded/asleep -- no tab list at all -- so you can decide how to narrow
+    before paying for the full listing.
+
+    Filter BEFORE paging with window_id (exact match), url_contains, and/or
+    title_contains (both case-insensitive substrings) -- filters apply before
+    offset/limit, so `matched`/`has_more` reflect the filtered set, not the
+    unfiltered device-wide total.
 
     If the device is not 'live', this returns immediately as {"status": "queued",
     "command_id": ..., "tier": ..., "last_seen": ..., "queue_position": ...}
-    instead of {"ok": ...}. That is a normal, actionable result, not an error or a
-    hang -- call browser_poll(device_id, command_id) later to retrieve the
-    eventual result.
+    instead of {"ok": ...} -- that shape is passed through completely
+    untouched, never paged/filtered/summarized. That is a normal, actionable
+    result, not an error or a hang -- call browser_poll(device_id, command_id)
+    later to retrieve the eventual result.
     """
-    return await _run_command(device_id, "tabs", {}, window_id=window_id, timeout_s=timeout_s)
+    raw = await _run_command(device_id, "tabs", {}, timeout_s=timeout_s)
+    return shape_tabs_response(
+        raw,
+        window_id=window_id,
+        url_contains=url_contains,
+        title_contains=title_contains,
+        limit=limit,
+        offset=offset,
+        summary=summary,
+    )
 
 
 @mcp.tool()
@@ -948,6 +991,204 @@ async def browser_narrow_scope(
         return await _client().narrow_scope(session_id, **kwargs)
     except HubError as e:
         return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_archive(
+    device_id: str,
+    dest_dir: str,
+    depth: str = DEFAULT_DEPTH,
+    tab_ids: list[int] | None = None,
+    include_cookies: bool = False,
+    wake: bool = False,
+    all_frames: bool = False,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Archive the state of a browser at a chosen depth -- from 'just the URLs' to
+    'everything we can physically get' -- and get back a MANIFEST, never the
+    payload. Every captured page/profile payload (DOM, screenshots, MHTML,
+    history, ...) is written straight to disk under a fresh timestamped
+    directory inside `dest_dir`; this tool's own return value is only paths,
+    counts, byte sizes, and per-tab/profile status -- the same reason
+    browser_tabs is paged by default (a raw payload this size would truncate
+    mid-response before it ever reached your context).
+
+    DEPTH LADDER (each level is a strict superset of the one below):
+        L0 -- windows/tab-groups/tabs inventory. NO tab wake, NO page contact.
+        L1 -- L0 + visible text per tab.
+        L2 -- L1 + DOM/forms/localStorage/sessionStorage/scroll per tab.
+        L3 -- L2 + screenshots per tab.
+        L4 -- L3 + MHTML per tab. Requires the 'debugger' capability (CDP-only,
+              no fallback) -- requesting L4/L5 on a device without it fails
+              loud immediately, before anything is captured, rather than
+              silently degrading to a lower depth.
+        L5 -- L4 + navigation history per tab, AND browser-wide profile data
+              (history/bookmarks/sessions/top_sites/reading_list).
+
+    NO-WAKE GUARANTEE: at real-world scale (hundreds of tabs) most are
+    discarded/asleep -- waking one destroys real, unsaved in-page state. Every
+    tab flagged discarded/asleep in the L0 inventory is SKIPPED for L1+
+    capture (recorded in the manifest, not silently dropped) unless wake=True
+    is explicitly passed.
+
+    tab_ids, if given, restricts L1+ per-tab capture to that subset -- the L0
+    inventory itself always covers every tab regardless. all_frames, if True,
+    is forwarded to the L1 text capture only (page_state/L2 does not support
+    multi-frame gathering in this phase). include_cookies gates cookie
+    collection at L5 -- defaults to False and is NEVER implied by requesting a
+    deeper archive; a caller must opt in explicitly even at maximum depth,
+    because a default that silently captures session tokens is a bad default
+    regardless of what's permitted.
+
+    The returned manifest's `status` field is the one key to check: `"ok"` only
+    if nothing failed or was skipped; `"ok_with_skips"` if some tabs were
+    skipped (no-wake guarantee); `"ok_with_failures"` if any capture actually
+    failed. `manifest["failures"]` lists every failure/skip explicitly -- never
+    buried, never silently absorbed into a clean-looking result.
+
+    `manifest["summary"]` never collapses "how many tabs/windows/tab-groups
+    exist" into "how many had page content captured" -- these are different
+    numbers at every depth. `tabs_inventoried`/`windows_inventoried`/
+    `tab_groups_inventoried` are populated even at L0 (from the always-run
+    inventory); `tabs_captured`/`tabs_skipped`/`tabs_failed` describe per-tab
+    CONTENT capture and are honestly all `0` at L0 -- that is success, not an
+    empty archive. An L0 run of 735 tabs reports `tabs_inventoried: 735`
+    alongside `tabs_captured: 0`; it never reports `tabs_inventoried: 0`.
+
+    Per-tab status is likewise not binary: `"ok"` only when every attempted
+    capture succeeded, `"failed"` only when every attempted capture failed,
+    and `"partial"` when some succeeded and some failed (e.g. a browser error
+    page where CDP-based captures -- mhtml/screenshot/nav_history -- succeed
+    even though JS-injection captures -- text/dom -- cannot run at all).
+    `"skipped"` (no-wake guarantee) stays a distinct fourth state.
+    `manifest["summary"]["tabs_partial"]` counts partial tabs explicitly, and
+    a run containing any partial tab is never reported as plain `"ok"`.
+
+    A tab_id named in `tab_ids` that no longer exists in the live inventory
+    (closed between the caller reading it and this call -- or never existed
+    at all) is a FIFTH state, `"not_found"` -- `manifest["tabs"][tab_id]`
+    gets a `{"status": "not_found", "reason": ...}` entry so every requested
+    id is accounted for, never silently dropped, **at every depth including
+    L0**: this accounting is computed once against the live inventory and
+    does not depend on any per-tab capture actually running. This is benign
+    (nothing failed -- there was just nothing left to capture) so it never
+    adds to `manifest["failures"]`, but it still moves `manifest["status"]`
+    away from plain `"ok"` (to `"ok_with_skips"`, the same bucket `"skipped"`
+    tabs use) and is counted explicitly in
+    `manifest["summary"]["tabs_not_found"]`.
+    """
+    try:
+        return await _run_archive(
+            _client(),
+            device_id,
+            dest_dir,
+            depth=depth,
+            tab_ids=tab_ids,
+            include_cookies=include_cookies,
+            wake=wake,
+            all_frames=all_frames,
+            timeout_s=timeout_s,
+        )
+    except (ArchiveError, HubError) as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_archive_convert(
+    archive_dir: str,
+    tab_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Convert an existing browser_archive output's captured MHTML pages into
+    markdown, AFTER THE FACT, from what is already on disk -- see
+    `archive_convert.py`'s module docstring. `archive_dir` is the same directory
+    `browser_archive`'s own manifest reported (`manifest["archive_dir"]`), not an
+    individual tab directory. This is a distinct, later, OPT-IN step: it never
+    runs automatically as part of `browser_archive` itself, and does no browser
+    interaction at all -- pure local CPU work over MHTML files already captured.
+
+    For each tab with a `page.mhtml` on disk (written by `browser_archive` at
+    depth L4 or deeper), this writes TWO markdown files -- `page.extracted.md`
+    (trafilatura's best-effort main-content extraction) and
+    `page.full_page.md` (a deliberately unfiltered whole-page conversion, so a
+    bad extraction is recoverable rather than lossy) -- plus content-addressed
+    asset sidecars (images/CSS/fonts) under a SHARED `archive_dir/assets/`
+    directory, so identical assets across pages (a shared logo/icon/font)
+    dedupe rather than being duplicated per tab.
+
+    Like `browser_archive`, this returns only a MANIFEST -- paths, byte counts,
+    per-tab status, warnings -- NEVER the markdown text itself; a converted
+    page can be many KB of markdown, and returning it as this tool's return
+    value would recreate the exact context-truncation failure `browser_archive`
+    itself exists to avoid.
+
+    `tab_ids`, if given, restricts conversion to that subset -- a requested id
+    with no `page.mhtml` on disk (never captured at MHTML depth, or a typo)
+    gets a `{"status": "not_captured", ...}` entry rather than being silently
+    dropped, mirroring `browser_archive`'s own `"not_found"` per-tab state. If
+    omitted, every tab directory under `archive_dir/tabs/` with a `page.mhtml`
+    is converted.
+
+    A table with merged cells (`colspan`/`rowspan`) cannot be represented as a
+    markdown pipe table -- a format limitation, not a tooling gap. Affected
+    tables are named explicitly in each tab's
+    `result["tabs"][tab_id]["tables_with_merged_cells"]` list rather than
+    silently mangled with no trace. A page containing more than one
+    `text/html` body (an `<iframe>`-heavy page captured as separate frame
+    documents) is the documented hard case this converter does not attempt to
+    merge -- that tab's entry reports `{"status": "failed", "error": ...}`
+    naming every frame found, rather than silently converting only the first
+    frame as if it were the whole page.
+    """
+    try:
+        return _run_archive_convert(archive_dir, tab_ids=tab_ids)
+    except ConversionError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_update_extension(
+    device_id: str,
+    reconnect_timeout_s: float = DEFAULT_RECONNECT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Verify-or-guide update for one device's extension (the version-skew story).
+    ALWAYS attempts the automatic path first, then VERIFIES it actually worked by
+    re-reading the device's reported command set after it reconnects -- this tool never
+    reports success without that proof.
+
+    Detecting up front whether this browser's unpacked extension lives on THIS machine
+    or a genuinely remote one is unreliable (a network mount can look local) -- so this
+    tool does not try. It restages a fresh build from this hub's own source (the same
+    mechanism `amplifier-browser-bridge init` uses) and sends the device a `reload`
+    command, which drops its websocket -- `chrome.runtime.reload()` re-reads files from
+    disk close to immediately. It then polls (never a bare sleep) for the device to
+    reconnect with a NEW connection (not the stale pre-reload one) within
+    reconnect_timeout_s, and compares its command set before and after:
+
+    - If the device was already reporting every command this hub knows, this is a
+      no-op: `{"ok": true, "already_current": true, "updated": false, ...}`.
+    - If the command set genuinely changed after reload, the automatic update reached
+      this device's real extension files: `{"ok": true, "updated": true, ...}`.
+    - If reload succeeded and the device reconnected but its command set is UNCHANGED,
+      this hub's restage did not reach wherever the browser actually loads its
+      extension from (most likely a different machine) -- reported plainly, with a
+      `guided` block: a real `download_url` (this hub's own `GET /setup/extension.zip`,
+      resolvable from wherever this tool is being called from) plus the manual
+      unzip/reload steps to follow on the machine actually running that browser.
+    - If the device never acknowledges `reload` at all, its extension predates
+      self-service reload entirely (a one-time bootstrap limit, not a bug) -- also
+      guided, with that reason named explicitly.
+    - If the device isn't currently connected, or never reconnects within
+      reconnect_timeout_s, this fails loud naming exactly which of those happened --
+      never silently treated as success.
+
+    Call browser_devices() first (or read this tool's own error) to get a valid
+    device_id. A pre-existing device that has NEVER reported a command set at all
+    (every extension shipped before this feature) is not a crash and not "unknown" --
+    it is a definitively stale extension, and this tool still attempts the automatic
+    path for it: seeing its command set go from unreported to a real, populated set
+    after reload IS the proof the automatic update worked.
+    """
+    return await _run_update_extension(_client(), device_id, reconnect_timeout_s=reconnect_timeout_s)
 
 
 def main() -> None:

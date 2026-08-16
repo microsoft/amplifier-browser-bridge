@@ -9,7 +9,7 @@
 // block (see options.html's <style> and onboarding.py's `_TOKENS_CSS` --
 // tests/test_shared_design_tokens.py guards the two staying byte-identical). Step 1
 // ("Extension installed") is always done -- this page running proves it. Step 2
-// ("Connect it" / "Connected to <host>") collapses to a single done line the moment
+// ("Connect it" / "Paired with <host>") collapses to a single done line the moment
 // this device has ever been paired. Step 3 is the dynamic slot: the same four-class
 // status vocabulary this file has always used (ok/pending/alert), now expressed as
 // this step's own marker/title/context, with its body holding either the pairing
@@ -67,6 +67,29 @@
 // state, but moved into the "Connection details" disclosure (see
 // `renderConnectionDetails`) -- useful diagnostic info once actually connected, no
 // longer a paragraph sitting on the path before anything has happened.
+//
+// "Connecting..." is not a settled answer (bug report, 2026-08): a real hub restart
+// sends the extension into its own reconnect/backoff loop (`RECONNECT_BASE_MS`..
+// `RECONNECT_MAX_MS` in background.js, capped at 30s + jitter per attempt) -- one real
+// run measured about six minutes from restart to a healthy reconnect. `pollStatusUntilKnown`
+// used to return the moment ANY real response arrived, even a transient one ("configured,
+// not connected, no concrete error yet" -- exactly the shape of "still reconnecting").
+// That left this page frozen on "Connecting... / Give it a moment." for the rest of the
+// six minutes while the device was, underneath, perfectly healthy again -- a second,
+// different way to land on a stale optimistic string, this time by mistaking "the
+// background script answered" for "the connection settled." `isTerminalStatus` is the one
+// place that now draws that line; `pollStatusUntilKnown` keeps watching, on a slower
+// bounded cadence (`SUSTAINED_POLL_INTERVAL_MS`/`SUSTAINED_POLL_CEILING_MS`) past its
+// initial burst schedule, until the status is genuinely terminal, the page goes hidden
+// (`pageIsVisible`), or the ceiling is reached -- at which point `renderWatchTimedOut`
+// says so honestly instead of repeating "Give it a moment" past the point that's
+// plausible.
+//
+// Step 2's title used to read "Connected to <host>" (same bug report): that word
+// describes step 3's job (live connectivity), not step 2's (this device has been
+// paired, ever). The two lines could -- and did -- read "Connected" and "Connecting..."
+// at the same time, for the same device. Step 2 now says "Paired with <host>", which is
+// true independent of whatever step 3 is currently reporting.
 
 import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
 import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
@@ -134,7 +157,7 @@ function platformLabel() {
 }
 
 // Extracts "host:port" from a stored ws://host:port/device URL, for step 2's
-// "Connected to <host>" title -- falls back to the raw URL if parsing fails
+// "Paired with <host>" title -- falls back to the raw URL if parsing fails
 // for any reason (never throws, never shows a blank title).
 function hostPortFromHubUrl(hubUrl) {
   try {
@@ -257,11 +280,14 @@ function renderLadder(response) {
 
   // Step 2 collapses to "done" the moment this device has EVER been paired --
   // independent of whether the LIVE socket is up right now (that's step 3's
-  // job). "Connected to <host>" stays visible even mid-error, since pairing
-  // itself already happened; only the connectivity axis is in question.
+  // job). The title says "Paired with <host>", never "Connected to <host>"
+  // (bug report, 2026-08): step 3 alone owns the live-connectivity claim, and
+  // a user must never be able to read step 2 as contradicting whatever step 3
+  // is currently saying (e.g. "Connected to X" next to step 3's "Connecting...").
+  // Stays visible even mid-error, since pairing itself already happened.
   if (pairedBefore) {
     step2El.setAttribute("data-state", "done");
-    step2TitleEl.textContent = `Connected to ${hostPortFromHubUrl(response.hubUrl)}`;
+    step2TitleEl.textContent = `Paired with ${hostPortFromHubUrl(response.hubUrl)}`;
   } else {
     step2El.setAttribute("data-state", "next");
     step2TitleEl.textContent = "Connect it";
@@ -284,7 +310,10 @@ async function renderAutoPairLine(pairedBefore) {
 }
 
 /** The honest "we tried, and we still don't know" terminal state -- what a caller
- * lands on when every retry in pollStatusUntilKnown's budget failed. */
+ * lands on when every retry in pollStatusUntilKnown's BURST schedule failed outright
+ * (the background script never answered at all -- see queryStatusOnce). Distinct from
+ * renderWatchTimedOut below: this fires when we never got a real answer; that one fires
+ * when we got real answers the whole time and the connection just never settled. */
 function renderUnknown(lastError) {
   step3El.setAttribute("data-marker-class", "alert");
   step3MarkerEl.textContent = "!";
@@ -297,24 +326,46 @@ function renderUnknown(lastError) {
   mountPairingControls();
 }
 
-// Polls queryStatusOnce on the given delay schedule (each entry is a delay in ms BEFORE
-// that attempt) until a real response arrives, rendering it immediately and stopping.
-// If every attempt in the schedule fails, renders the honest "couldn't determine" state
-// -- this is the guarantee that closes off the bug this file used to have: no matter how
-// many attempts it takes or whether every single one fails, the page always ends on a
-// truthful terminal state, never a stale optimistic one.
-async function pollStatusUntilKnown(delaysMs) {
-  let lastError = null;
-  for (const delay of delaysMs) {
-    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-    const result = await queryStatusOnce();
-    if (result.ok) {
-      renderLadder(result.response);
-      return;
-    }
-    lastError = result.error;
-  }
-  renderUnknown(lastError);
+// ---------------------------------------------------------------------------
+// Transient vs terminal (bug report, 2026-08 -- see this file's module docstring's
+// "'Connecting...' is not a settled answer" paragraph). `queryStatusOnce`'s `ok: true`
+// means only "the background script answered" -- it says nothing about whether the
+// connection itself has reached a settled state. isTerminalStatus is the one place
+// that decides which shape of a REAL response means "nothing left to watch for" vs
+// "keep looking."
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} response - a real response from queryStatusOnce (result.ok === true).
+ * @returns {boolean} true for connected, a concrete named error (auth_rejected/
+ *   unreachable/hub_error), never-configured, or legacy-config -- none of these change
+ *   on their own from here. false only for "configured, not connected, no error yet" --
+ *   the one shape background.js's own reconnect loop can still resolve unassisted.
+ */
+function isTerminalStatus(response) {
+  if (!response || !response.configured) return true;
+  if (response.connected) return true;
+  return !!response.lastError;
+}
+
+/** The honest state pollStatusUntilKnown's sustained watch lands on if its ceiling
+ * elapses while the status is STILL "configured, not connected, no concrete error yet."
+ * Distinct from renderUnknown above: here the background script answered every single
+ * time -- the connection itself just never became a name-able error or a success.
+ * Deliberately does NOT repeat "Give it a moment" -- past this many minutes that stops
+ * being an honest thing to say (see SUSTAINED_POLL_CEILING_MS below). */
+function renderWatchTimedOut(response, ceilingMs) {
+  step3El.setAttribute("data-marker-class", "alert");
+  step3MarkerEl.textContent = "!";
+  step3TitleEl.textContent = "Still not connected";
+  const host = response && response.hubUrl ? hostPortFromHubUrl(response.hubUrl) : "the configured hub";
+  const minutes = Math.max(1, Math.round(ceilingMs / 60000));
+  step3LineEl.textContent =
+    `This has been trying to connect for longer than ${minutes} minute${minutes === 1 ? "" : "s"} -- ` +
+    `longer than a normal reconnect takes. Check that ${host} is the right address, that the hub is ` +
+    "running there, and that this device can reach it (same tailnet), then run " +
+    "`amplifier-browser-bridge doctor` on the hub host for a full check.";
+  mountPairingControls();
 }
 
 // Widened + backoff schedule for the initial page load (first attempt immediate, then
@@ -325,6 +376,88 @@ const LOAD_STATUS_POLL_DELAYS_MS = [0, 300, 800, 2000, 4000];
 // Post-save schedule: a real hub round trip (device auth + hello) is not instant, so the
 // first attempt waits a beat; growing gaps after that cover slower reconnects.
 const SAVE_STATUS_POLL_DELAYS_MS = [500, 1500, 3000, 6000, 10000];
+
+// Sustained watch -- once the burst schedule above is exhausted without reaching a
+// terminal state, the connection may STILL be reconnecting: background.js's own
+// exponential backoff (`RECONNECT_BASE_MS`..`RECONNECT_MAX_MS`, capped at 30s + jitter
+// per attempt) can legitimately keep retrying for minutes after a hub restart (one real
+// run measured about six). The page is open and a human is looking at it, so continuing
+// to watch costs nothing -- but it must never become an unbounded tight loop either.
+// SUSTAINED_POLL_INTERVAL_MS is how often to check in this phase; SUSTAINED_POLL_CEILING_MS
+// is the point past which "still connecting" stops being a plausible explanation --
+// see renderWatchTimedOut above.
+const SUSTAINED_POLL_INTERVAL_MS = 5000;
+const SUSTAINED_POLL_CEILING_MS = 10 * 60 * 1000; // 10 minutes
+
+/** True unless the page is demonstrably hidden right now -- the signal that stops the
+ * sustained watch from polling a background tab forever. Guarded for the test harness's
+ * fake `document` (options.test.mjs's installFakeDom), which has no `visibilityState` at
+ * all -- absence is treated as "visible," never as a silent reason a test can't see the
+ * watch stop. Only an explicit "hidden" ever stops it. */
+function pageIsVisible() {
+  return typeof document === "undefined" || document.visibilityState !== "hidden";
+}
+
+// Polls queryStatusOnce on the given burst schedule (each entry is a delay in ms BEFORE
+// that attempt), rendering every real response as it arrives. A response that is
+// TERMINAL (connected, a concrete named error, never-configured, or legacy-config -- see
+// isTerminalStatus) ends the poll right there -- the pre-existing guarantee this file
+// already had for that case. A response that is real but TRANSIENT ("configured, not
+// connected, no error yet") does NOT end it: that shape means only "the background
+// script answered," never "the connection settled" (this file's module docstring).
+// Once the burst schedule is exhausted still-transient, this keeps watching on a
+// slower, bounded cadence (SUSTAINED_POLL_INTERVAL_MS) until the status goes terminal,
+// the page is hidden (pageIsVisible), or SUSTAINED_POLL_CEILING_MS elapses -- at which
+// point renderWatchTimedOut says so honestly instead of repeating "Give it a moment"
+// past the point that's plausible. If EVERY attempt in the burst schedule fails
+// outright (the background script never answers at all), it renders the honest
+// "couldn't determine" state instead, exactly as before.
+async function pollStatusUntilKnown(
+  delaysMs,
+  { sustainedIntervalMs = SUSTAINED_POLL_INTERVAL_MS, sustainedCeilingMs = SUSTAINED_POLL_CEILING_MS } = {}
+) {
+  let lastError = null;
+  let lastResponse = null;
+
+  for (const delay of delaysMs) {
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    const result = await queryStatusOnce();
+    if (result.ok) {
+      lastError = null;
+      lastResponse = result.response;
+      renderLadder(result.response);
+      if (isTerminalStatus(result.response)) return;
+      continue; // real, but transient -- keep going rather than treating this as settled
+    }
+    lastError = result.error;
+  }
+
+  if (!lastResponse) {
+    // Every attempt in the burst failed outright -- unchanged fail-loud guarantee.
+    renderUnknown(lastError);
+    return;
+  }
+
+  // Burst schedule exhausted, still transient. Keep watching on a slower cadence until
+  // it settles, the page goes hidden, or the ceiling elapses.
+  const startedAt = Date.now();
+  while (pageIsVisible() && Date.now() - startedAt < sustainedCeilingMs) {
+    await new Promise((resolve) => setTimeout(resolve, sustainedIntervalMs));
+    if (!pageIsVisible()) break;
+    const result = await queryStatusOnce();
+    if (result.ok) {
+      lastResponse = result.response;
+      renderLadder(result.response);
+      if (isTerminalStatus(result.response)) return;
+    }
+    // A failed tick mid-watch is not itself terminal -- background.js's service worker
+    // can be briefly unavailable between polls; keep watching rather than treating one
+    // missed beat as "couldn't determine status."
+  }
+
+  if (!pageIsVisible()) return; // hidden/closed -- stop cleanly, nothing left to render to
+  renderWatchTimedOut(lastResponse, sustainedCeilingMs);
+}
 
 // ---------------------------------------------------------------------------
 // Wiring for step-3-body's two templates -- called each time one is mounted,
@@ -654,6 +787,9 @@ export {
   queryStatusOnce,
   renderLadder,
   renderUnknown,
+  isTerminalStatus,
+  renderWatchTimedOut,
+  pageIsVisible,
   pollStatusUntilKnown,
   getOrCreateDeviceId,
   runPairingDiscovery,
@@ -662,5 +798,7 @@ export {
   hostPortFromHubUrl,
   LOAD_STATUS_POLL_DELAYS_MS,
   SAVE_STATUS_POLL_DELAYS_MS,
+  SUSTAINED_POLL_INTERVAL_MS,
+  SUSTAINED_POLL_CEILING_MS,
   PAIRED_AUTO_STORAGE_KEY,
 };

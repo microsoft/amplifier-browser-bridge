@@ -240,7 +240,7 @@ The credential warning cannot be nested. Everything else can.
 Amplifier Browser Bridge                              --t-page
 
 (v)  Extension installed                              step: done
-(v)  Connected to 100.124.126.19                      step: done
+(v)  Paired with 100.124.126.19                        step: done
      Paired automatically — nothing to copy.           --t-sm --ink-dim [conditional]
 
 (3)  You're ready                                     step: now
@@ -302,9 +302,16 @@ vocabulary as before, now expressed through the step component.
 | Connected | check, `ok` | You're ready | Your agent can use this browser now. |
 | Never paired | `3`, `pending` | Not connected yet | Open your hub's setup link, or enter a code below. |
 | Connecting / in flight | `3`, `pending` | Connecting… | Give it a moment. |
+| Still connecting past the watch ceiling (bug report, 2026-08 — see options.js's `renderWatchTimedOut`) | `!`, `alert` | Still not connected | Names the elapsed wait, the hub host, and what to check (address, hub running, reachability) — never repeats "Give it a moment." |
 | Token rejected | `!`, `alert` | Hub refused this browser | `lastError.message`, then: *Pair again to get a fresh code.* |
 | Hub unreachable | `!`, `alert` | Can't reach 100.124.126.19 | `lastError.message`, then: *Check the hub is running.* |
 | Config keys changed | `!`, `alert` | Settings need re-pairing | Existing message, unchanged. |
+
+The page keeps polling in the background while "Connecting / in flight" is showing —
+a real reconnect after a hub restart can legitimately take minutes (background.js's own
+backoff), so the page must not treat the first "still connecting" answer as settled. It
+only gives up (rendering the "Still connecting past the watch ceiling" row above) once a
+bounded ceiling elapses with no change, and stops polling entirely if the tab is hidden.
 
 `pending` for both "never paired" and "in flight" — preserving the existing, correct
 rule that a user who has done nothing wrong never sees red.

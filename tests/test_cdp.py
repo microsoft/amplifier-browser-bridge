@@ -86,6 +86,35 @@ def test_requires_cdp_false_by_default() -> None:
     assert requires_cdp("click", {"_cdp": True}) is False
 
 
+def test_requires_cdp_unconditional_for_mhtml_and_nav_history() -> None:
+    """D2 (browser-state archive): `mhtml`/`nav_history` have no injection-only
+    alternative at all -- unlike `trusted`/`capture_hidden`, no `args` key
+    opts them in; they are ALWAYS CDP-requiring, empty args included."""
+    assert requires_cdp("mhtml", {}) is True
+    assert requires_cdp("nav_history", {}) is True
+    # Truthy-looking irrelevant args don't change anything -- still always True.
+    assert requires_cdp("mhtml", {"trusted": False}) is True
+    assert requires_cdp("nav_history", {"capture_hidden": False}) is True
+
+
+def test_requires_cdp_false_for_archive_commands_with_an_injection_only_path() -> None:
+    """The rest of the browser-state archive commands (windows, page_state,
+    and the profile-data commands) are NOT CDP-requiring at all -- only
+    mhtml/nav_history (and the pre-existing trusted/capture_hidden intents)
+    escalate."""
+    for name in (
+        "windows",
+        "page_state",
+        "history_list",
+        "bookmarks_list",
+        "sessions_list",
+        "top_sites",
+        "reading_list",
+        "cookies_list",
+    ):
+        assert requires_cdp(name, {}) is False
+
+
 def test_requires_cdp_accepts_string_and_int_true_forms() -> None:
     """Regression test for a real reported bug: `amplifier-browser-bridge cmd <target> screenshot
     --arg capture_hidden=true` sends the STRING "true" (the CLI's `cmd` escape

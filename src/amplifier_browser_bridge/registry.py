@@ -53,6 +53,29 @@ class DeviceRecord:
     platform: str = "unknown"
     capabilities: dict[str, bool] = field(default_factory=dict)
     protocol_version: int | None = None
+    # Tier 0 handshake (version-skew story, see skew.py's module docstring):
+    # the actual set of commands this device's CURRENT build can execute,
+    # self-reported in `hello.commands` (extension/background.js's
+    # SUPPORTED_COMMANDS). `None` -- not an empty set -- means this device has
+    # never reported one at all: every extension shipped before this feature,
+    # including whatever is connected to a hub right now the moment it's
+    # upgraded. That is a distinct, definitively-stale state (skew.py's
+    # `SkewReport.known = False`), not "reports supporting zero commands."
+    commands: frozenset[str] | None = None
+    # Diagnostic color ONLY -- `chrome.runtime.getManifest().version`, hand-
+    # maintained and already measured to drift in this exact repo
+    # (pyproject.toml said 0.1.0, manifest.json said 0.4.0, same repo, same
+    # day). Never consulted for skew detection -- see skew.py.
+    manifest_version: str | None = None
+    # Build-freshness handshake (build_stamp.py's module docstring): the
+    # content-derived hash of this device's CURRENT build's shipped files,
+    # self-reported in `hello.build_stamp` (extension/background.js's
+    # `computeBuildStamp()`). `None` -- not an empty string -- means this
+    # device has never reported one at all: every extension shipped before
+    # this feature, exactly the same distinct "never reported" state
+    # `commands` already carries (`build_stamp.py`'s
+    # `BuildFreshness.known = False`), not "reports an empty build."
+    build_stamp: str | None = None
 
     ws: DeviceConnection | None = None
     connected_at: datetime | None = None
@@ -91,6 +114,25 @@ class DeviceRecord:
         self.platform = str(hello.get("platform", self.platform))
         self.capabilities = dict(hello.get("capabilities") or {})
         self.protocol_version = hello.get("protocol_version")
+        # Tier 0 handshake -- see this class's `commands` field docstring and
+        # skew.py's module docstring. `raw_commands` absent/not-a-list (every
+        # extension shipped before this feature) leaves `self.commands` as
+        # `None`, NOT an empty frozenset -- those are different facts
+        # (`None` = "never reported one"; empty = "reported supporting
+        # nothing", which no real build ever actually does).
+        raw_commands = hello.get("commands")
+        if isinstance(raw_commands, list):
+            self.commands = frozenset(str(c) for c in raw_commands)
+        manifest_version = hello.get("manifest_version")
+        if isinstance(manifest_version, str):
+            self.manifest_version = manifest_version
+        # Build-freshness handshake -- see this class's `build_stamp` field
+        # docstring and build_stamp.py's module docstring. Same "absent
+        # leaves it None, never an empty/guessed value" discipline as
+        # `commands` above.
+        build_stamp = hello.get("build_stamp")
+        if isinstance(build_stamp, str):
+            self.build_stamp = build_stamp
         now = datetime.now(UTC)
         self.connected_at = now
         self.last_seen = now
@@ -116,9 +158,32 @@ class DeviceRecord:
             "platform": self.platform,
             "capabilities": self.capabilities,
             "protocol_version": self.protocol_version,
+            # Tier 0 handshake -- `None` (not `[]`) means this device has
+            # never reported a command set at all (skew.py's
+            # `SkewReport.known = False`). See `hub.py`'s `_devices_snapshot`
+            # for the "skew" key computed FROM this against the hub's own
+            # vocabulary -- kept out of this class deliberately, the same way
+            # `cdp` attach state is enriched by `Hub`, not `DeviceRecord`,
+            # because both are comparisons against HUB-owned state.
+            "commands": sorted(self.commands) if self.commands is not None else None,
+            "manifest_version": self.manifest_version,
+            # Build-freshness handshake -- `None` means this device has
+            # never reported a build stamp at all (build_stamp.py's
+            # `BuildFreshness.known = False`). See `hub.py`'s
+            # `_devices_snapshot` for the "build_freshness" key computed FROM
+            # this against the hub's own currently-expected stamp -- kept out
+            # of this class deliberately, same reasoning as "skew" above.
+            "build_stamp": self.build_stamp,
             "connected": self.connected,
             "tier": self.tier.value,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+            # The moment THIS connection was established -- distinct from
+            # `last_seen` (bumped by every heartbeat/result/event on an
+            # ALREADY-live connection too). `update_extension.py`'s
+            # reload-then-verify flow needs to tell "the device reconnected"
+            # apart from "the device has just been quietly heartbeating the
+            # whole time" -- only a NEW `connected_at` proves the former.
+            "connected_at": self.connected_at.isoformat() if self.connected_at else None,
             "queue_length": len(self.queue),
         }
 

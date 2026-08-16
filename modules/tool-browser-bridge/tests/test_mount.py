@@ -116,8 +116,11 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_wait_download",
         "browser_establish_session",
         "browser_narrow_scope",
+        "browser_archive",
+        "browser_archive_convert",
         "browser_setup",
         "browser_setup_status",
+        "browser_update_extension",
     }
     assert names == expected
 
@@ -156,6 +159,93 @@ async def test_browser_type_maps_ref_and_text(monkeypatch: pytest.MonkeyPatch):
     _, command, args = fake.command_calls[0]
     assert command == "type"
     assert args == {"ref": "e1", "text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_pages_and_reports_filters_and_totals(monkeypatch: pytest.MonkeyPatch):
+    """browser_tabs must run its raw hub response through paging.py -- not just
+    fetch it (see paging.py's own unit tests for the shaping logic itself)."""
+    tabs = [
+        {"tab_id": i, "window_id": 1, "url": "https://example.com/", "title": "Example Page"}
+        for i in range(5)
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_tabs")
+    result = await tool.execute({"device_id": "d1", "limit": 2, "offset": 1})
+
+    assert result.success is True
+    output: Any = result.output
+    r = output["result"]
+    assert r["total"] == 5
+    assert r["matched"] == 5
+    assert r["returned"] == 2
+    assert r["offset"] == 1
+    assert r["limit"] == 2
+    assert r["has_more"] is True
+    assert [t["tab_id"] for t in r["tabs"]] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_window_id_is_a_local_filter_not_forwarded_to_the_wire_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """window_id narrows the RESPONSE (paging.py), not the wire-level Target --
+    otherwise the reported `total` could never be the true, device-wide count."""
+    tabs = [
+        {"tab_id": 1, "window_id": 10, "url": "https://example.com/a", "title": "A"},
+        {"tab_id": 2, "window_id": 20, "url": "https://example.com/b", "title": "B"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_tabs")
+    result = await tool.execute({"device_id": "d1", "window_id": 10})
+
+    target, command, _args = fake.command_calls[0]
+    assert command == "tabs"
+    assert target.window_id is None  # NOT forwarded to the hub/device
+    output: Any = result.output
+    r = output["result"]
+    assert r["total"] == 2  # unfiltered grand total across the whole device
+    assert r["matched"] == 1
+    assert [t["tab_id"] for t in r["tabs"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_browser_tabs_summary_mode_returns_no_tab_list(monkeypatch: pytest.MonkeyPatch):
+    tabs = [
+        {"tab_id": 1, "window_id": 1, "url": "https://example.com/", "title": "Example", "discarded": True},
+        {"tab_id": 2, "window_id": 2, "url": "https://example.org/", "title": "Other"},
+    ]
+    fake = _FakeHubClient({"ok": True, "result": tabs})
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_tabs")
+    result = await tool.execute({"device_id": "d1", "summary": True})
+
+    output: Any = result.output
+    r = output["result"]
+    assert "tabs" not in r
+    assert r["summary"] is True
+    assert r["total"] == 2
+
+
+def test_browser_tabs_description_teaches_paging_and_summary():
+    tool = _tool_by_name("browser_tabs")
+    desc = tool.description.lower()
+    assert "paged" in desc or "page" in desc
+    assert "summary" in desc
+    assert "has_more" in desc
+
+
+def test_browser_tabs_schema_declares_new_filter_and_paging_properties():
+    tool = _tool_by_name("browser_tabs")
+    props = tool.input_schema["properties"]
+    for name in ("window_id", "url_contains", "title_contains", "limit", "offset", "summary"):
+        assert name in props, f"browser_tabs schema missing {name!r}"
+    assert tool.input_schema["required"] == ["device_id"]
 
 
 @pytest.mark.asyncio
@@ -229,6 +319,108 @@ async def test_hub_error_surfaces_as_adapter_failure(monkeypatch: pytest.MonkeyP
 
     assert result.success is False
     assert "unauthorized" in str(result.output)
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_routes_through_run_archive(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Proves this surface actually routes through archive.py's run_archive
+    (not just a stub) -- tests/test_archive.py covers run_archive's own logic
+    (depth ladder, no-wake guarantee, failure recording, impossible-depth)."""
+
+    class _ScriptedClient:
+        def __init__(self) -> None:
+            self.command_calls: list[tuple[Any, str, dict[str, Any]]] = []
+
+        async def list_devices(self):
+            return [{"device_id": "d1", "capabilities": {"debugger": False, "scripting": True}}]
+
+        async def command(self, target, command, args):
+            self.command_calls.append((target, command, args))
+            if command == "windows":
+                return {"ok": True, "result": {"windows": [], "tab_groups": []}}
+            if command == "tabs":
+                return {"ok": True, "result": []}
+            return {"ok": True, "result": {}}
+
+    fake = _ScriptedClient()
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_archive")
+    result = await tool.execute({"device_id": "d1", "dest_dir": str(tmp_path), "depth": "L0"})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    assert output["result"]["device_id"] == "d1"
+    assert output["result"]["depth"] == "L0"
+    called_commands = {c for (_t, c, _a) in fake.command_calls}
+    assert called_commands == {"windows", "tabs"}
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_impossible_depth_returns_ok_false_not_adapter_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    class _NoDebuggerClient:
+        async def list_devices(self):
+            return [{"device_id": "d1", "capabilities": {"debugger": False}}]
+
+        async def command(self, target, command, args):
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: _NoDebuggerClient())
+
+    tool = _tool_by_name("browser_archive")
+    result = await tool.execute({"device_id": "d1", "dest_dir": str(tmp_path), "depth": "L4"})
+
+    # An ArchiveError is a legitimate, actionable RESULT (like ok: false for
+    # any other tool) -- not an adapter-level failure.
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is False
+    assert "debugger" in output["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_routes_through_run_archive_convert(tmp_path):
+    archive_dir = tmp_path / "archive_d1_20260815T000000Z"
+    tab_dir = archive_dir / "tabs" / "101"
+    tab_dir.mkdir(parents=True)
+    (tab_dir / "page.mhtml").write_bytes(
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/related; boundary="X"\r\n\r\n'
+        b"--X\r\nContent-Type: text/html\r\nContent-Location: https://example.com/\r\n\r\n"
+        b"<html><body><article><p>Some real synthetic article text for this test.</p>"
+        b"</article></body></html>\r\n--X--\r\n"
+    )
+
+    tool = _tool_by_name("browser_archive_convert")
+    result = await tool.execute({"archive_dir": str(archive_dir)})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    assert output["result"]["tabs"]["101"]["status"] == "ok"
+    # Load-bearing: never markdown BODY text through the tool surface.
+    assert "Some real synthetic article text for this test" not in str(output)
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_convert_bad_archive_dir_returns_ok_false_not_adapter_failure(tmp_path):
+    not_an_archive = tmp_path / "not_an_archive"
+    not_an_archive.mkdir()
+
+    tool = _tool_by_name("browser_archive_convert")
+    result = await tool.execute({"archive_dir": str(not_an_archive)})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is False
+    assert "tabs/" in output["error"]
 
 
 @pytest.mark.asyncio

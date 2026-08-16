@@ -113,8 +113,13 @@ def test_stage_extension_copies_runtime_files(tmp_path: Path) -> None:
     assert (dest / "options.html").is_file()
     assert (dest / "options.js").is_file()
     assert (dest / "config_validate.mjs").is_file()
+    # Build-freshness handshake (build_stamp.py): background.js statically
+    # imports this, so it must be staged like every other .mjs dependency --
+    # same 87ce68d whitelist-omission failure mode as the others.
+    assert (dest / "build_stamp.mjs").is_file()
     # Test files are dev-only and must NOT be staged into a runtime install.
     assert not (dest / "config_validate.test.mjs").exists()
+    assert not (dest / "build_stamp.test.mjs").exists()
 
 
 def test_stage_extension_is_safe_to_rerun_and_preserves_dest_path(tmp_path: Path) -> None:

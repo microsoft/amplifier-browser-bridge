@@ -44,6 +44,24 @@ dependencies = [
 # deliberate, tested upgrade -- not as a side effect of an unrelated `pip install`.
 mcp = ["mcp>=1.6,<2"]
 
+# Optional so the core lib/CLI stay lean, same reasoning as `mcp` above -- MHTML-to-
+# markdown conversion is a distinct, opt-in POLICY a caller invokes explicitly after
+# an archive already exists on disk (see mhtml_convert.py's module docstring and
+# vision.py's "Provider configuration" section for the same mechanism/policy split
+# applied to the vision-extraction feature); most callers of this library never touch
+# it and should not pay for lxml/dateparser/etc. by default.
+#
+# trafilatura does the EXTRACTED-content path (main-content identification, emits
+# markdown directly -- its own published benchmark scores F1 0.924 against a raw-HTML
+# baseline of 0.667, vs. 0.663 for a generic converter with no extraction step at
+# all). html2text does the FULL-PAGE fallback path -- deliberately unfiltered, so a
+# bad main-content extraction is recoverable rather than lossy; chosen over
+# markdownify for that path specifically because it has zero transitive dependencies
+# (markdownify pulls in beautifulsoup4/soupsieve/six for equivalent full-page-dump
+# functionality) -- this output does not need beautifulsoup4's DOM manipulation
+# strength, just a straightforward whole-document HTML-to-markdown pass.
+convert = ["trafilatura>=2.0,<3", "html2text>=2024.2.26"]
+
 # Everything the documented quality gate needs, declared once so `uv run` syncs it
 # automatically. Before this existed, the gate was only runnable after a hand-typed
 # `uv pip install` incantation that lived in TWO places -- README.md's testing section
@@ -62,7 +80,7 @@ dev = [
     "ruff>=0.6",
     "pyright>=1.1.380",
     "amplifier-core",
-    "amplifier-browser-bridge[mcp]",
+    "amplifier-browser-bridge[mcp,convert]",
     "amplifier-module-tool-browser-bridge",
 ]
 

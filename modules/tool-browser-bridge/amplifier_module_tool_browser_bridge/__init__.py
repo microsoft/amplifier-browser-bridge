@@ -48,10 +48,17 @@ try:
 except ImportError as _import_exc:
     reraise_with_diagnosis(_import_exc)
 
+from amplifier_browser_bridge.archive import DEFAULT_DEPTH, ArchiveError
+from amplifier_browser_bridge.archive import run_archive as _run_archive
+from amplifier_browser_bridge.archive_convert import ConversionError
+from amplifier_browser_bridge.archive_convert import run_archive_convert as _run_archive_convert
 from amplifier_browser_bridge.auth import resolve_default_token
 from amplifier_browser_bridge.auto_setup import DEFAULT_WAIT_REACHABLE_S, run_auto_setup
 from amplifier_browser_bridge.doctor import run_doctor
 from amplifier_browser_bridge.hub_location import DEFAULT_PORT, resolve_hub_url
+from amplifier_browser_bridge.paging import DEFAULT_LIMIT, shape_tabs_response
+from amplifier_browser_bridge.update_extension import DEFAULT_RECONNECT_TIMEOUT_S
+from amplifier_browser_bridge.update_extension import run_update_extension as _run_update_extension
 from amplifier_browser_bridge.vision import VisionConfigError, VisionError
 from amplifier_browser_bridge.vision_read import vision_read
 
@@ -206,8 +213,20 @@ def _build_tools() -> list[_HubTool]:
         return await _client().poll(input_data["device_id"], input_data["command_id"])
 
     async def tabs_runner(input_data: dict[str, Any]) -> dict[str, Any]:
-        return await _client().command(
-            Target(device_id=input_data["device_id"], window_id=input_data.get("window_id")), "tabs", {}
+        # window_id is deliberately NOT forwarded to the Target here -- it is a
+        # post-fetch filter applied by shape_tabs_response below, not a wire-level
+        # scope. The hub still returns every tab on the device (paging.py's module
+        # docstring); this is what lets the shaped response report an honest,
+        # unfiltered `total` alongside the filtered `matched` count.
+        raw = await _client().command(Target(device_id=input_data["device_id"]), "tabs", {})
+        return shape_tabs_response(
+            raw,
+            window_id=input_data.get("window_id"),
+            url_contains=input_data.get("url_contains"),
+            title_contains=input_data.get("title_contains"),
+            limit=input_data.get("limit", DEFAULT_LIMIT),
+            offset=input_data.get("offset", 0),
+            summary=bool(input_data.get("summary", False)),
         )
 
     async def tab_open_runner(input_data: dict[str, Any]) -> dict[str, Any]:
@@ -356,6 +375,38 @@ def _build_tools() -> list[_HubTool]:
             ],
         }
 
+    async def update_extension_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        return await _run_update_extension(
+            _client(),
+            input_data["device_id"],
+            reconnect_timeout_s=input_data.get("reconnect_timeout_s", DEFAULT_RECONNECT_TIMEOUT_S),
+        )
+
+    async def archive_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await _run_archive(
+                _client(),
+                input_data["device_id"],
+                input_data["dest_dir"],
+                depth=input_data.get("depth", DEFAULT_DEPTH),
+                tab_ids=input_data.get("tab_ids"),
+                include_cookies=bool(input_data.get("include_cookies", False)),
+                wake=bool(input_data.get("wake", False)),
+                all_frames=bool(input_data.get("all_frames", False)),
+                timeout_s=input_data.get("timeout_s"),
+            )
+        except ArchiveError as e:
+            return {"ok": False, "error": str(e)}
+
+    async def archive_convert_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return _run_archive_convert(
+                input_data["archive_dir"],
+                tab_ids=input_data.get("tab_ids"),
+            )
+        except ConversionError as e:
+            return {"ok": False, "error": str(e)}
+
     return [
         _HubTool(
             "browser_devices",
@@ -368,9 +419,59 @@ def _build_tools() -> list[_HubTool]:
         ),
         _HubTool(
             "browser_tabs",
-            "List open tabs on a device, optionally scoped to one window_id. Use this after "
-            "browser_devices() to discover tab_id values for the other tools. " + _QUEUE_NOTE,
-            {"type": "object", "properties": _DEVICE_ID_PROP, "required": ["device_id"]},
+            "List open tabs on a device. Use this after browser_devices() to discover "
+            "tab_id values for the other tools. Results are PAGED by default (limit=100, "
+            "offset=0) -- on a large profile (hundreds of tabs) an unpaged listing can be "
+            "hundreds of KB, enough to truncate before it ever reaches your context. The "
+            "response's `result` always reports `total` (every tab on the device, "
+            "unfiltered), `matched` (how many passed your filters), `returned` (this page's "
+            "size), `offset`, `limit`, and `has_more` -- so you can tell '3 tabs matched my "
+            "filter' from '3 tabs exist' and page correctly without guessing. Pass limit=0 "
+            "to opt back into the old, unpaged full listing. On a large or unknown-size "
+            "profile, call with summary=true FIRST: it returns ONLY per-window tab counts, "
+            "totals, and how many tabs are discarded/asleep -- no tab list at all -- so you "
+            "can decide how to narrow before paying for the full listing. Filter BEFORE "
+            "paging with window_id (exact match), url_contains, and/or title_contains (both "
+            "case-insensitive substrings) -- filters apply before offset/limit, so "
+            "`matched`/`has_more` reflect the filtered set, not the unfiltered device-wide "
+            "total. " + _QUEUE_NOTE,
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Filter to tabs in this window only (exact match).",
+                    },
+                    "url_contains": {
+                        "type": "string",
+                        "description": "Filter to tabs whose url contains this substring (case-insensitive).",
+                    },
+                    "title_contains": {
+                        "type": "string",
+                        "description": "Filter to tabs whose title contains this substring (case-insensitive).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": DEFAULT_LIMIT,
+                        "description": "Max tabs to return (after filtering). 0 means unlimited.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Skip this many matched tabs before returning a page.",
+                    },
+                    "summary": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Return ONLY per-window counts/totals/discarded/asleep aggregates -- no tab "
+                            "list. Call this first against a large or unknown-size profile."
+                        ),
+                    },
+                },
+                "required": ["device_id"],
+            },
             tabs_runner,
         ),
         _HubTool(
@@ -903,6 +1004,207 @@ def _build_tools() -> list[_HubTool]:
             "browser has connected, or to see exactly what's still missing if it hasn't.",
             {"type": "object", "properties": {}},
             setup_status_runner,
+        ),
+        _HubTool(
+            "browser_archive",
+            "Archive the state of a browser at a chosen depth -- from 'just the URLs' to "
+            "'everything we can physically get' -- and get back a MANIFEST, never the payload. Every "
+            "captured page/profile payload (DOM, screenshots, MHTML, history, ...) is written straight "
+            "to disk under a fresh timestamped directory inside dest_dir; this tool's own return value "
+            "is only paths, counts, byte sizes, and per-tab/profile status -- the same reason "
+            "browser_tabs is paged by default (a raw payload this size would truncate mid-response "
+            "before it ever reached your context).\n\n"
+            "DEPTH LADDER (each level is a strict superset of the one below): L0 -- windows/tab-groups/"
+            "tabs inventory, NO tab wake, NO page contact. L1 -- L0 + visible text per tab. L2 -- L1 + "
+            "DOM/forms/localStorage/sessionStorage/scroll per tab. L3 -- L2 + screenshots per tab. "
+            "L4 -- L3 + MHTML per tab (requires the 'debugger' capability -- CDP-only, no fallback; "
+            "requesting L4/L5 on a device without it fails loud immediately, before anything is "
+            "captured, rather than silently degrading). L5 -- L4 + navigation history per tab, AND "
+            "browser-wide profile data (history/bookmarks/sessions/top_sites/reading_list).\n\n"
+            "NO-WAKE GUARANTEE: at real-world scale (hundreds of tabs) most are discarded/asleep -- "
+            "waking one destroys real, unsaved in-page state. Every tab flagged discarded/asleep in "
+            "the L0 inventory is SKIPPED for L1+ capture (recorded in the manifest, not silently "
+            "dropped) unless wake=true is explicitly passed.\n\n"
+            "tab_ids, if given, restricts L1+ per-tab capture to that subset -- the L0 inventory "
+            "always covers every tab regardless. all_frames, if true, is forwarded to the L1 text "
+            "capture only. include_cookies gates cookie collection at L5 -- defaults to false and is "
+            "NEVER implied by requesting a deeper archive; a caller must opt in explicitly even at "
+            "maximum depth, because a default that silently captures session tokens is a bad default "
+            "regardless of what's permitted.\n\n"
+            "The returned manifest's `status` field is the one key to check: 'ok' only if nothing "
+            "failed or was skipped; 'ok_with_skips' if some tabs were skipped (no-wake guarantee); "
+            "'ok_with_failures' if any capture actually failed. manifest['failures'] lists every "
+            "failure/skip explicitly -- never buried, never silently absorbed into a clean-looking "
+            "result.\n\n"
+            "manifest['summary'] never collapses 'how many tabs/windows/tab-groups exist' into "
+            "'how many had page content captured' -- these are different numbers at every depth. "
+            "tabs_inventoried/windows_inventoried/tab_groups_inventoried are populated even at L0 "
+            "(from the always-run inventory); tabs_captured/tabs_skipped/tabs_failed describe "
+            "per-tab CONTENT capture and are honestly all 0 at L0 -- that is success, not an empty "
+            "archive. An L0 run of 735 tabs reports tabs_inventoried: 735 alongside "
+            "tabs_captured: 0; it never reports tabs_inventoried: 0.\n\n"
+            "Per-tab status is likewise not binary: 'ok' only when every attempted capture "
+            "succeeded, 'failed' only when every attempted capture failed, and 'partial' when "
+            "some succeeded and some failed (e.g. a browser error page where CDP-based captures "
+            "-- mhtml/screenshot/nav_history -- succeed even though JS-injection captures -- "
+            "text/dom -- cannot run at all). 'skipped' (no-wake guarantee) stays a distinct "
+            "fourth state. manifest['summary']['tabs_partial'] counts partial tabs explicitly, "
+            "and a run containing any partial tab is never reported as plain 'ok'.\n\n"
+            "A tab_id named in tab_ids that no longer exists in the live inventory (closed "
+            "between the caller reading it and this call -- or never existed at all) is a "
+            "FIFTH state, 'not_found' -- manifest['tabs'][tab_id] gets a {'status': "
+            "'not_found', 'reason': ...} entry so every requested id is accounted for, never "
+            "silently dropped, at every depth including L0: this accounting is computed once "
+            "against the live inventory and does not depend on any per-tab capture actually "
+            "running. This is benign (nothing failed -- there was just nothing left to "
+            "capture) so it never adds to manifest['failures'], but it still moves "
+            "manifest['status'] away from plain 'ok' (to 'ok_with_skips', the same bucket "
+            "'skipped' tabs use) and is counted explicitly in "
+            "manifest['summary']['tabs_not_found'].",
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "dest_dir": {
+                        "type": "string",
+                        "description": "Base directory to write the timestamped archive directory into.",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["L0", "L1", "L2", "L3", "L4", "L5"],
+                        "default": DEFAULT_DEPTH,
+                        "description": "Archive depth -- see the tool description's depth ladder.",
+                    },
+                    "tab_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Restrict L1+ per-tab capture to this subset. Omit for every tab.",
+                    },
+                    "include_cookies": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Opt-in to cookie collection at L5. Never implied by depth alone -- see "
+                            "the tool description."
+                        ),
+                    },
+                    "wake": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Allow waking a discarded/asleep tab to capture it. Default: such tabs are "
+                            "skipped, never woken implicitly."
+                        ),
+                    },
+                    "all_frames": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Forwarded to the L1 text capture only -- gather every frame's text.",
+                    },
+                    "timeout_s": {
+                        "type": "number",
+                        "description": "Optional per-command device-round-trip timeout override, in seconds.",
+                    },
+                },
+                "required": ["device_id", "dest_dir"],
+            },
+            archive_runner,
+        ),
+        _HubTool(
+            "browser_archive_convert",
+            "Convert an existing browser_archive output's captured MHTML pages into markdown, AFTER "
+            "THE FACT, from what is already on disk. archive_dir is the same directory browser_archive's "
+            "own manifest reported (manifest['archive_dir']), not an individual tab directory. This is a "
+            "distinct, later, OPT-IN step: it never runs automatically as part of browser_archive itself, "
+            "and does no browser interaction at all -- pure local CPU work over MHTML files already "
+            "captured.\n\n"
+            "For each tab with a page.mhtml on disk (written by browser_archive at depth L4 or deeper), "
+            "this writes TWO markdown files -- page.extracted.md (trafilatura's best-effort main-content "
+            "extraction) and page.full_page.md (a deliberately unfiltered whole-page conversion, so a bad "
+            "extraction is recoverable rather than lossy) -- plus content-addressed asset sidecars "
+            "(images/CSS/fonts) under a SHARED archive_dir/assets/ directory, so identical assets across "
+            "pages (a shared logo/icon/font) dedupe rather than being duplicated per tab.\n\n"
+            "Like browser_archive, this returns only a MANIFEST -- paths, byte counts, per-tab status, "
+            "warnings -- NEVER the markdown text itself; a converted page can be many KB of markdown, and "
+            "returning it as this tool's return value would recreate the exact context-truncation failure "
+            "browser_archive itself exists to avoid.\n\n"
+            "tab_ids, if given, restricts conversion to that subset -- a requested id with no page.mhtml "
+            "on disk (never captured at MHTML depth, or a typo) gets a {'status': 'not_captured', ...} "
+            "entry rather than being silently dropped, mirroring browser_archive's own 'not_found' "
+            "per-tab state. If omitted, every tab directory under archive_dir/tabs/ with a page.mhtml is "
+            "converted.\n\n"
+            "A table with merged cells (colspan/rowspan) cannot be represented as a markdown pipe table "
+            "-- a format limitation, not a tooling gap. Affected tables are named explicitly in each tab's "
+            "result['tabs'][tab_id]['tables_with_merged_cells'] list rather than silently mangled with no "
+            "trace. A page containing more than one text/html body (an iframe-heavy page captured as "
+            "separate frame documents) is the documented hard case this converter does not attempt to "
+            "merge -- that tab's entry reports {'status': 'failed', 'error': ...} naming every frame "
+            "found, rather than silently converting only the first frame as if it were the whole page.",
+            {
+                "type": "object",
+                "properties": {
+                    "archive_dir": {
+                        "type": "string",
+                        "description": "The archive directory browser_archive's manifest reported.",
+                    },
+                    "tab_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Restrict conversion to this subset. Omit to convert every captured tab.",
+                    },
+                },
+                "required": ["archive_dir"],
+            },
+            archive_convert_runner,
+        ),
+        _HubTool(
+            "browser_update_extension",
+            "Verify-or-guide update for one device's extension (the version-skew story). ALWAYS "
+            "attempts the automatic path first, then VERIFIES it actually worked by re-reading the "
+            "device's reported command set after it reconnects -- this tool never reports success "
+            "without that proof. Detecting up front whether this browser's unpacked extension lives "
+            "on THIS machine or a genuinely remote one is unreliable (a network mount can look "
+            "local), so this tool does not try: it restages a fresh build from this hub's own "
+            "source (the same mechanism `amplifier-browser-bridge init` uses) and sends the device "
+            "a `reload` command, which drops its websocket -- chrome.runtime.reload() re-reads "
+            "files from disk close to immediately. It then polls (never a bare sleep) for the "
+            "device to reconnect with a NEW connection (not the stale pre-reload one) within "
+            "reconnect_timeout_s, and compares its command set before and after.\n\n"
+            "If the device was already reporting every command this hub knows, this is a "
+            "no-op (already_current: true, updated: false). If the command set genuinely "
+            "changed after reload, the automatic update reached this device's real extension "
+            "files (updated: true). If reload succeeded and the device reconnected but its "
+            "set is UNCHANGED, this hub's restage did not reach wherever the browser actually loads "
+            "its extension from (most likely a different machine) -- reported plainly, with a "
+            "`guided` block: a real `download_url` (this hub's own GET /setup/extension.zip, "
+            "resolvable from wherever this tool is being called from) plus the manual unzip/reload "
+            "steps to follow on the machine actually running that browser. If the device never "
+            "acknowledges `reload` at all, its extension predates self-service reload entirely (a "
+            "one-time bootstrap limit, not a bug) -- also guided, with that reason named "
+            "explicitly. If the device isn't currently connected, or never reconnects within "
+            "reconnect_timeout_s, this fails loud naming exactly which of those happened -- never "
+            "silently treated as success.\n\n"
+            "A device that has NEVER reported a command set at all (every extension shipped before "
+            'this feature) is not a crash and not "unknown" -- it is a definitively stale '
+            "extension, and this tool still attempts the automatic path for it: seeing its command "
+            "set go from unreported to a real, populated set after reload IS the proof the "
+            "automatic update worked.",
+            {
+                "type": "object",
+                "properties": {
+                    **_DEVICE_ID_PROP,
+                    "reconnect_timeout_s": {
+                        "type": "number",
+                        "default": DEFAULT_RECONNECT_TIMEOUT_S,
+                        "description": (
+                            "How long to wait for the device to reconnect after sending reload "
+                            "before failing loud, in seconds."
+                        ),
+                    },
+                },
+                "required": ["device_id"],
+            },
+            update_extension_runner,
         ),
     ]
 

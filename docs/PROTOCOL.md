@@ -65,9 +65,18 @@ Sent once, immediately after the WebSocket opens. Establishes device identity an
     "capture_visible_tab": true,
     "downloads": true,
     "alarms": true,
-    "scripting": true
+    "scripting": true,
+    "history": true,
+    "bookmarks": true,
+    "sessions": true,
+    "top_sites": true,
+    "reading_list": true,
+    "cookies": true
   },
   "protocol_version": 1,
+  "commands": ["snapshot", "click", "type", "...", "reload"],
+  "manifest_version": "0.5.0",
+  "build_stamp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "token": "shared secret, validated against the hub's TokenStore"
 }
 ```
@@ -87,6 +96,76 @@ device where the API throws.
 **`capture_visible_tab`/`scripting` can under-report `false` here** if no real tab existed yet
 at connect time (a fresh browser launch can have zero tabs). See `capabilities_update` below for
 the correction path -- don't treat a `false` here as final if the device has only just connected.
+
+**`commands` and `manifest_version` (Tier 0 handshake -- the version-skew story).** Before this
+existed, there was zero version awareness of the extension anywhere -- `protocol_version` was a
+hardcoded constant nothing ever compared against anything, and version strings were hand-
+maintained and had already drifted (`pyproject.toml` said `0.1.0`, `manifest.json` said `0.4.0`,
+same repo, same day, no CI). `commands` fixes this by making the extension self-describe *what
+it can actually do*, rather than a version number that can lie or decay: it is the literal,
+current contents of `extension/background.js`'s `SUPPORTED_COMMANDS` set -- mirrored by hand
+from this file's own `COMMANDS`, guarded against drift by
+`tests/test_extension_command_parity.py`, the same discipline already applied to
+`PAGE_WORLD_COMMANDS`.
+
+The hub (`skew.py`) diffs a device's self-reported `commands` against its own `COMMANDS`
+**bidirectionally**: `device_behind` (the extension is missing commands the hub knows -- the
+common case, an unupdated install) and `hub_behind` (the device reports commands the hub
+doesn't recognize -- the hub itself is older than the extension) are reported separately,
+because they need different fixes. A device that omits `commands` entirely -- every extension
+shipped before this feature, including whatever is connected to a hub the moment it's upgraded
+-- is not treated as "supports nothing"; it is a distinct, definitively-stale state
+(`SkewReport.known = False`), surfaced in every `devices`/`browser_devices` listing (see
+"Reporting command-set skew to an agent" below) so an agent can see staleness *before* ever
+failing a command. See `update_extension.py`'s module docstring for how the
+`browser_update_extension` tool uses this to verify-or-guide an update.
+
+`manifest_version` (`chrome.runtime.getManifest().version`) travels alongside `commands` purely
+as **diagnostic color** -- useful for a human glancing at a `devices` listing -- and is **never**
+consulted for skew detection; only the self-reported command set is authoritative, for exactly
+the reason above (it cannot drift the way a version string already has).
+
+**`build_stamp` (build-freshness handshake -- the sibling story `commands` does NOT cover).**
+`commands` answers "what can this device DO" -- capability skew. It does NOT answer "IS this
+device running the CURRENT build": a change that adds or removes zero commands (a bug fix, a UI
+fix, a security fix -- this repo's own commits `6175ce4`/`cc140c5` touched only `options.js`) is
+completely invisible to it. Proven live: pointing `browser_update_extension` at a real,
+genuinely-outdated browser that had already caught up on commands returned `already_current:
+true` -- false. `build_stamp` closes this gap: it is a SHA-256 over the bytes of every file this
+build actually ships (`extension/background.js`'s `computeBuildStamp()`, hashing the same file
+set `setup.py`'s `_EXTENSION_FILES` stages/zips -- see `build_stamp.py`'s module docstring for the
+exact byte layout). Nobody has to remember to bump it, and unlike `manifest_version`, it cannot
+lie: if a single byte of a single shipped file changes, the stamp changes.
+
+The hub (`build_stamp.py`) compares a device's self-reported `build_stamp` against
+`current_build_stamp()` -- this hub's own currently-loaded extension source, hashed the same way.
+A device that omits `build_stamp` entirely -- every extension shipped before this feature -- is
+not treated as "unknown, assume current"; it is a distinct, definitively-stale state
+(`BuildFreshness.known = False`), the same discipline `commands` already applies. See "Reporting
+build freshness to an agent" below, and `update_extension.py`'s module docstring for how
+`browser_update_extension` now requires BOTH `commands` and `build_stamp` to check out before
+reporting `already_current`.
+
+A command the hub's own `COMMANDS` recognizes but a device has **positively** reported it
+doesn't support (`known=True`, command absent from `commands`) now fails **fast, at the hub**,
+before ever reaching the device:
+
+```json
+{
+  "ok": false,
+  "error": "'some_new_command' is not in this device's reported command set -- the EXTENSION is behind this hub. Update the extension (browser_update_extension tool, or see INSTALL.md's \"Updating\" section), then retry.",
+  "reason_code": "device_command_unsupported"
+}
+```
+
+This replaces the previous, useless failure mode: dispatching the command anyway and letting
+`background.js`'s own if-chain fall through to a bare `{"ok": false, "error": "unsupported
+command: X"}` with no hint the extension was stale. **Deliberately, this fast-fail does NOT
+apply when a device's command set is unknown** (`known=False`, every currently-connected
+pre-Tier-0 extension the moment this ships) -- see `skew.py`'s module docstring for why: it
+would also block `reload` itself for every one of those devices, breaking the very mechanism
+the automatic-update path depends on. An unknown-command-set device dispatches exactly as
+before this feature existed.
 
 ### `capabilities_update` (ext -> hub)
 
@@ -213,7 +292,22 @@ Response:
       "platform": "MacIntel",
       "capabilities": {"...": "..."},
       "protocol_version": 1,
+      "commands": ["snapshot", "click", "...", "reload"],
+      "manifest_version": "0.5.0",
+      "build_stamp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "skew": {
+        "known": true, "in_sync": false,
+        "device_behind": ["a_new_command"], "hub_behind": [],
+        "summary": "the EXTENSION is behind this hub -- missing ['a_new_command']; update the extension (browser_update_extension)"
+      },
+      "build_freshness": {
+        "known": true, "current": false,
+        "device_stamp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "hub_stamp": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "summary": "this extension's build stamp does not match the hub's current build -- the shipped files differ from what this hub would install (a bug fix, UI change, or other update not reflected in the command set). Update the extension (browser_update_extension)."
+      },
       "connected": true,
+      "connected_at": "2026-07-25T18:03:11.480+00:00",
       "tier": "live",
       "last_seen": "2026-07-25T18:03:11.482+00:00",
       "queue_length": 0
@@ -221,6 +315,35 @@ Response:
   ]
 }
 ```
+
+### Reporting command-set skew and build freshness to an agent (Tier 0 handshake)
+
+Every `devices`/`browser_devices` entry above carries `commands` (the device's raw
+self-reported set, or `null` if it has never reported one -- see the `hello` section's
+"`commands` and `manifest_version`"), `manifest_version` (diagnostic only), `build_stamp` (the
+device's raw self-reported content hash, or `null` if it has never reported one -- see the
+`hello` section's "`build_stamp`"), `connected_at` (the moment THIS connection was established --
+distinct from `last_seen`, which a mere heartbeat on an already-live connection also bumps), and
+TWO comparisons against this hub's own current state:
+
+- `skew` (`skew.py`'s `SkewReport.to_summary()`) -- the hub's own comparison of that device's
+  `commands` against its current `COMMANDS`. `skew.known = false` means the device has never
+  reported a command set at all: a definitively stale extension, not a crash and not "unknown."
+  `skew.summary` is `null` only when `in_sync` is `true`; otherwise it is a one-line,
+  human-readable message naming exactly which side is behind and what to do about it. Answers
+  "what can this device DO."
+- `build_freshness` (`build_stamp.py`'s `BuildFreshness.to_summary()`) -- the hub's own
+  comparison of that device's `build_stamp` against `current_build_stamp()` (this hub's own
+  currently-loaded extension source, hashed the same way). `build_freshness.known = false` means
+  the device has never reported a build stamp at all: a definitively stale build, the same
+  discipline `skew.known` already applies. `build_freshness.current` can be `false` even when
+  `skew.in_sync` is `true` -- a device can be command-complete and still running a stale build (a
+  bug/UI/security fix that touched zero commands). Answers "IS this device running the CURRENT
+  build."
+
+Both are deliberately surfaced in the device listing itself -- an agent (or a human running
+`amplifier-browser-bridge devices`) can see staleness on EITHER axis *before* ever failing a
+command against it, not only after.
 
 ### `command` (agent -> hub) / `result` (hub -> agent)
 
@@ -538,7 +661,7 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 | `back` / `forward` | injected.js | `history.back()`/`forward()`; top frame only |
 | `wait_for` | injected.js | `args.selector`, `args.timeout_ms`; polls, never sleeps blindly; top frame only -- see "Frames" below |
 | `wait_text` | injected.js | `args.text`, `args.timeout_ms`; polls, never sleeps blindly; top frame only -- see "Frames" below |
-| `tabs` | background.js (`chrome.tabs.query`) | optionally scoped by `target.window_id`; each entry now also carries `discarded`/`status` -- see "Discarded tabs" below |
+| `tabs` | background.js (`chrome.tabs.query`) | optionally scoped by `target.window_id`; each entry now also carries `discarded`/`status` -- see "Discarded tabs" below. **Unchanged by the agent-facing pagination fix below**: the wire-level `result` is still the full, unfiltered list of every tab on the device -- see "Agent-facing tabs pagination (not a wire change)". |
 | `tab_open` | background.js (`chrome.tabs.create`) | target is device-only; `args.url`, `args.active` (default background) |
 | `tab_close` | background.js (`chrome.tabs.remove`) | |
 | `tab_activate` | background.js (`chrome.tabs.update`) | the one command that's explicitly *allowed* to steal focus, because it was asked to |
@@ -551,11 +674,45 @@ Deliberately mirrors Playwright MCP's tool names -- models already expect these:
 | `downloads_list` | background.js (`chrome.downloads.search`) | `args.limit` (optional, default 20). Target is device-only. |
 | `download` | background.js (`chrome.downloads.download`) | `args.url`, `args.filename` (optional). Target is device-only. |
 | `wait_download` | background.js (`chrome.downloads.search`, polled) | `args.download_id` XOR `args.since_id` (+ optional `args.pattern`), `args.timeout_ms`. Target is device-only. See "Content-extraction mechanisms" below. |
+| `windows` | background.js (`chrome.windows.getAll` + `chrome.tabGroups.query`) | Target is device-only. Full window metadata (incl. `incognito`) and tab-group metadata. No tab_id/page contact -- see "Browser-state archive" below. |
+| `page_state` | injected.js | Per-tab `outer_html` (capped, honest `truncated` flag), `forms` (field values -- password values always excluded), `local_storage`/`session_storage`, `scroll`. Top frame only by default (same narrower limitation as `scroll`/`wait_for`); `args.frame_id` targets one known frame. |
+| `mhtml` | background.js (CDP `Page.captureSnapshot`) | Unconditionally CDP-requiring -- no injection-only alternative exists. Returns the raw MHTML document as `result.data` (a string, not base64). |
+| `nav_history` | background.js (CDP `Page.getNavigationHistory`) | Unconditionally CDP-requiring, same as `mhtml`. |
+| `history_list` | background.js (`chrome.history.search`) | `args.query` (default `""`), `args.max_results` (default 1000), `args.start_time` (ms epoch, optional). Target is device-only. |
+| `bookmarks_list` | background.js (`chrome.bookmarks.getTree`) | Target is device-only. Returns a flattened list, not the nested tree. |
+| `sessions_list` | background.js (`chrome.sessions.getRecentlyClosed` + `getDevices`) | `args.max_results` (default 25). Target is device-only. |
+| `top_sites` | background.js (`chrome.topSites.get`) | Target is device-only. |
+| `reading_list` | background.js (`chrome.readingList.query`) | Target is device-only. |
+| `cookies_list` | background.js (`chrome.cookies.getAll`) | `args.url`/`args.domain` (optional filters). Target is device-only. **Not gated at this wire-command level** -- a direct caller gets cookies like any other command; the opt-in gate lives at the archive orchestrator level (see below). |
 
 Every `PAGE_WORLD_COMMAND` (`snapshot`, `read`, `click`, `type`, `key`, `scroll`, `back`, `forward`,
 `wait_for`, `wait_text`) also accepts an optional `args.wake` -- see "Discarded tabs" below -- and
 an optional `args.activate` -- see "Foregrounding a tab for DOM injection (`args.activate`)" below.
 Every command accepts an optional `args.timeout_s` -- see "Command timeout" below.
+
+### Agent-facing tabs pagination (not a wire change)
+
+Real-world finding: on the maintainer's own device (~728 open tabs), an unpaged `tabs` result was
+~640KB -- large enough to truncate mid-response before it ever reached an agent's context window.
+The hub -> agent wire transfer that produces that payload is cheap (machine to machine); what's
+expensive is a payload that size entering an LLM's context.
+
+**This device protocol is deliberately unchanged.** `background.js`'s `listTabs()` still returns
+every tab on the device in one `result` list, exactly as documented in the table above -- there is
+no `args.limit`/`args.offset`/`args.window_id` filtering added to the `tabs` command, and
+`protocol.py`/`extension/background.js` gained no new fields for this. Adding wire-level paging
+would grow the hand-synced `protocol.py` <-> `extension/background.js` surface this document's own
+header warns is kept in sync manually, for no benefit -- the wire transfer was never the expensive
+part.
+
+Instead, pagination, filtering, and a cheap summary mode live entirely in the agent-facing tool
+layer, one level up from this protocol: `amplifier_browser_bridge.paging.shape_tabs_response` (a
+pure function, no I/O) reshapes the hub's full `tabs` response before either agent surface
+(`mcp_server.py`'s `browser_tabs` tool, or the Amplifier tool module's `browser_tabs`) hands
+anything back to the calling agent. See `docs/AGENT_SURFACES.md` for the resulting tool-level
+behavior (paging defaults, filters, summary mode). A `{"status": "queued", ...}` or `{"ok": false,
+...}` `tabs` response is passed through by that layer completely untouched, per this document's
+existing tier pass-through and fail-loud guarantees.
 
 ### Frames
 
@@ -640,12 +797,17 @@ on navigation), so this is not a new class of staleness, just a stricter, unambi
 never frame 0 by default, never a guess. A ref whose frame no longer exists in the tab (navigated
 away, reloaded, or removed) fails loud, naming the frame id, rather than a bare "stale ref".
 
-**Documented narrower limitation:** `scroll`, `back`, `forward`, `wait_for`, `wait_text`, and a
-ref-less `key` press still operate on the top frame (frameId 0) only, in this phase. A
-`wait_for`/`wait_text` selector or text that only exists inside an iframe will not be found. This
-is a scope decision, not an oversight -- these are page/tab-level operations (or, for `key`, have
-no ref to resolve a frame from) where multi-frame semantics are considerably less obviously
-correct (e.g. "scroll which frame?"). Revisit if a real need for frame-scoped waits emerges.
+**Documented narrower limitation:** `scroll`, `back`, `forward`, `wait_for`, `wait_text`, a
+ref-less `key` press, and `page_state` (D2, browser-state archive) still operate on the top
+frame (frameId 0) only by default, in this phase. A `wait_for`/`wait_text` selector or text that
+only exists inside an iframe will not be found; `page_state` will not capture an embedded
+document's own outerHTML/storage without an explicit `args.frame_id`. This is a scope decision,
+not an oversight -- these are page/tab-level operations (or, for `key`, have no ref to resolve a
+frame from) where multi-frame semantics are considerably less obviously correct (e.g. "scroll
+which frame?"). `page_state` accepts `args.frame_id` (the same generic single-frame-targeting
+branch `read`/`snapshot` use) to reach one known frame explicitly, without needing its own
+MULTI_FRAME_COMMANDS combine strategy. Revisit if a real need for frame-scoped waits/page_state
+emerges.
 
 ### Snapshot generations and ref staleness
 
@@ -993,6 +1155,21 @@ already be running code that understands the `reload` command before it can relo
 version that understands it -- there is no way around that single bootstrap step. Every subsequent
 iteration is self-service via `amplifier-browser-bridge reload <device_id>`.
 
+**`browser_update_extension` (Tier 1 + Tier 2, `update_extension.py`) -- composed, not a wire
+command**, the same way `vision_read`/`browser_archive` compose wire commands without being one
+themselves. It restages a fresh build (`setup.stage_extension`, the same function
+`amplifier-browser-bridge init` uses) and sends this `reload` command, but never reports success
+on the ack alone -- `chrome.runtime.reload()` drops the websocket, so it polls `list_devices`
+until this device reconnects with a NEW `connected_at` (a real, bounded timeout, never a bare
+sleep-and-hope) and only then compares its self-reported `commands` (see the `hello` section's
+"Tier 0 handshake") before and after. If the set changed, the automatic update reached this
+device's real extension files -- verified, not assumed. If reload succeeded and the device
+reconnected but its command set is unchanged, this hub's restage did not reach wherever that
+browser actually loads its extension from (most likely a different machine) -- reported plainly,
+with guided manual instructions and a real `GET /setup/extension.zip` download URL (see
+`extension_zip.py`) rather than a false "done." See `update_extension.py`'s module docstring for
+the full design and docs/AGENT_SURFACES.md for the tool's exact shape.
+
 Commands are partitioned into `PAGE_WORLD_COMMANDS` (dispatched into `injected.js` running in
 the page's isolated world) and `BROWSER_LEVEL_COMMANDS` (handled directly by
 `background.js` against `chrome.tabs`/`chrome.windows`/`chrome.debugger`, which are not
@@ -1124,6 +1301,14 @@ When either is set and the hub determines CDP is genuinely required (`cdp.requir
    capability-binding discipline policy.py applies to denylisted targets applies here: the hub
    decides CDP usage from its own state, never from anything the caller asserts).
 
+**Unconditionally CDP-requiring commands (browser-state archive, D2):** `mhtml` and
+`nav_history` have no `args` key to opt in -- `cdp.requires_cdp` treats both as
+CDP-requiring unconditionally (`_ALWAYS_CDP_COMMANDS`), because neither has an
+injection-only alternative at all (`Page.captureSnapshot`/`Page.getNavigationHistory`
+are CDP methods with no `chrome.scripting` equivalent). The same three-step sequence
+above still applies: capability check first (fails loud, no silent fallback, on a
+device without `debugger`), then attach, then dispatch.
+
 ### `attach` / `detach` (agent -> hub -> ext)
 
 Explicit escalation, independent of any specific command -- useful for a caller that wants to
@@ -1178,6 +1363,121 @@ Two places (design doc §7: "report CDP attach state per tab so an agent can rea
   bool, "attached_at": iso8601|null, "last_activity": iso8601|null, "last_detach_reason":
   str|null}}` for every tab this hub has ever attached to on that device.
 - `tabs`: each entry in the result gains `"cdp_attached": bool` for its current state.
+
+### Browser-state archive (D2) -- composed, not a wire command
+
+The ten commands above this section (`windows`, `page_state`, `mhtml`, `nav_history`,
+`history_list`, `bookmarks_list`, `sessions_list`, `top_sites`, `reading_list`,
+`cookies_list`) are real wire-protocol commands, individually. But the agent-facing
+**archive** capability -- "capture the state of a browser at a chosen depth, get back a
+manifest" -- is not itself a wire command, the same way `vision_read` composes
+`screenshot` + a vision-model call without being a wire command of its own (see "Vision-based
+extraction" above).
+
+`amplifier_browser_bridge.archive.run_archive` (hub-side Python, no extension changes) composes
+these ten commands into a depth ladder (L0 windows/groups/tabs inventory through L5 MHTML +
+navigation history + browser-wide profile data), writes every captured payload straight to a
+timestamped directory on disk, and returns a **manifest** -- paths, counts, byte sizes, per-tab
+status, failures -- never the payloads themselves. This is the direct fix for the same class of
+bug the tabs-pagination fix (above) addressed: a raw MHTML document, a full outerHTML dump, or a
+browser's entire history can each individually be many megabytes, and returning any of them as an
+agent tool's return value would recreate the exact context-truncation failure `browser_tabs`
+hit. See `archive.py`'s module docstring for the full depth-ladder contract (no-wake guarantee,
+per-tab failure recording, impossible-depth fail-loud behavior) and `docs/AGENT_SURFACES.md` for
+the single agent-facing tool (`browser_archive`) both surfaces expose for it.
+
+`manifest["summary"]` never collapses the INVENTORY axis (what actually exists in the browser --
+`windows_inventoried`/`tab_groups_inventoried`/`tabs_inventoried`, populated at every depth
+including L0) into the CAPTURE axis (what had page content pulled down --
+`tabs_capture_attempted`/`tabs_captured`/`tabs_skipped`/`tabs_failed`, legitimately all `0` at
+L0 by design; `profile`, `None` below L5). An L0 archive of 735 real tabs reports
+`tabs_inventoried: 735` alongside `tabs_captured: 0` -- a caller must never read the latter as
+"nothing was archived" when the former says otherwise.
+
+Per-tab status is not binary either: `manifest["tabs"][tab_id]["status"]` is `"ok"` only when
+every attempted capture (`text`/`dom`/`screenshot`/`mhtml`/`nav_history`, whichever ran at this
+depth) succeeded, `"failed"` only when every attempted capture failed, and `"partial"` -- a
+third, middle state -- when some succeeded and some failed; `"skipped"` (no-wake guarantee)
+remains a separate, fourth state. `summary["tabs_partial"]` counts partial tabs explicitly,
+alongside `tabs_captured`/`tabs_skipped`/`tabs_failed`. Observed live: a tab on a browser error
+page failed `text`/`dom` (JS injection cannot run on an error page) while `mhtml`/`screenshot`/
+`nav_history` (CDP-based, an independent capture route -- see `archive.py`'s module docstring)
+all succeeded, landing ~147KB of real artifacts on disk; reporting that tab `"failed"` (the
+prior, binary behavior) discarded that fact. A `"partial"` (or `"failed"`) tab always
+contributes at least one entry to `manifest["failures"]`, so a run containing any partial tab
+is never reported as plain `"ok"`.
+
+A `tab_id` named in `tab_ids` can also vanish (tab closed) between when the caller read the
+tab inventory and when the archive ran -- or simply never have existed at all -- a FIFTH
+per-tab state, `"not_found"`, distinct from `"ok"`/`"partial"`/`"failed"`/`"skipped"`. Observed
+live: a caller requesting 4 tab_ids got manifest entries for only 3 -- the vanished tab
+appeared in no `manifest["tabs"]` entry, no `manifest["failures"]` entry, and no `"skipped"`
+record, so nothing told the caller their fourth tab was ever requested. `manifest["tabs"][tab_id]`
+now always gets a `{"status": "not_found", "reason": ...}` entry for a vanished id, **at every
+depth, including L0** -- this accounting is computed once from `tab_ids` against the live
+inventory and does not depend on any per-tab capture running (an earlier version of this fix
+computed it only alongside L1+ capture, so an L0 request for a nonexistent `tab_id` still
+silently reported plain `"ok"`), so every id in `tab_ids` is accounted for one way or another
+regardless of depth. This is benign (there is no tab left to capture, so it is
+not a capture failure) and never adds to `manifest["failures"]`, but -- like `"skipped"`
+tabs -- it is never silently folded into a plain `"ok"` run either: `summary["tabs_not_found"]`
+counts it explicitly, `summary["tabs_capture_attempted"]` excludes it (a vanished tab was never
+actually attempted), and `manifest["status"]` becomes `"ok_with_skips"`, the same bucket
+`"skipped"` tabs use since both are benign, non-failure gaps. The top-level
+`manifest["requested_tab_ids_not_found"]` list remains a convenience summary of the same ids.
+
+## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
+
+Like the archive capability itself, converting a captured page's MHTML into markdown --
+`amplifier_browser_bridge.mhtml_convert.convert_mhtml`, composed by `archive_convert.run_archive_convert`
+-- is not a wire command; it does no browser interaction at all, and runs entirely against
+`.mhtml` files a prior `run_archive` (at depth L4+) already wrote to disk. It is exposed as
+exactly one agent-facing tool, `browser_archive_convert` (`docs/AGENT_SURFACES.md`'s "Browser-state
+archive: MHTML -> markdown conversion" section), invoked as a distinct, later, OPT-IN step -- never
+automatically as part of `run_archive`/`browser_archive` itself, the same mechanism/policy split
+`vision_read`/`vision.py` establish for the vision-extraction feature.
+
+**Why MHTML, not `outer_html`**: measured live, on the same real tabs, the JS-injection capture
+route (`read`/`page_state` -> `outer_html`) failed on 7 of 7 real tabs -- including a browser
+error page it could not touch at all -- timing out at both 90s and 120s budgets; the CDP-based
+route (`mhtml`/`screenshot`/`nav_history`) succeeded 3 of 3 on those same tabs. Published
+extraction-research benchmarks recommend converting from live-rendered `outer_html`, not a saved
+MHTML snapshot -- but every one of those benchmarks measured server-rendered HTML, not a
+post-hydration DOM fetched over a websocket from a remote browser (a configuration nobody has
+benchmarked), and in THIS system `outer_html` is not reliably obtainable at all. MHTML is the
+only full-page capture this converter can depend on.
+
+`convert_mhtml` parses the MHTML document as ordinary MIME (Python's own `email` module -- MHTML
+is RFC 2557 multipart/related, no custom parser needed) and produces, for each archived tab, TWO
+markdown files: `page.extracted.md` (trafilatura's main-content extraction -- its own published
+benchmark scores F1 0.924 against a raw-HTML do-nothing baseline of 0.667, and it emits markdown
+directly, so this is an extract-then-convert pipeline, not convert-then-clean) and
+`page.full_page.md` (a deliberately unfiltered whole-page conversion via html2text, so a bad
+extraction -- main-content quality swings 0.42-0.93 by page type per the WCXB benchmark, and 47%
+of real pages are non-articles -- is recoverable rather than lossy). Every non-HTML MIME part
+(images/CSS/fonts) is written as a content-addressed sidecar (`<sha256-of-bytes><ext>`) under a
+SHARED `archive_dir/assets/` directory -- shared across every tab converted into the same
+archive, so identical assets dedupe -- and the HTML's own `Content-Location`/`cid:` asset
+references are rewritten to the sidecar's relative path BEFORE conversion, never base64-inlined.
+
+A table with merged cells (`colspan`/`rowspan`) cannot be expressed as a markdown pipe table -- a
+FORMAT limitation, not a tooling gap this converter tries to work around. Affected tables are
+named explicitly in the result's `tables_with_merged_cells` list (table index + a short text
+preview) rather than silently producing wrong-looking output. A page containing more than one
+`text/html` body (an `<iframe>`-heavy page captured as separate frame documents) is the documented
+hard case this converter does not attempt to merge -- `convert_mhtml` raises `ConversionError`
+naming every frame's `Content-Location` rather than silently converting only the first body as if
+it were the whole page; `run_archive_convert` catches this per tab (recorded as that tab's
+`{"status": "failed", "error": ...}`) so one unconvertible tab does not abort the whole archive's
+conversion run, mirroring `run_archive`'s own no-abort-on-one-bad-tab behavior.
+
+Like `browser_archive`, `browser_archive_convert` returns only a MANIFEST -- paths, byte counts,
+per-tab status, warnings -- never the markdown text itself, written to
+`archive_dir/conversion_manifest.json` as well as returned. A `tab_ids` id with no `page.mhtml` on
+disk gets a `{"status": "not_captured", ...}` entry (counted in `summary["tabs_not_captured"]`,
+moving `manifest["status"]` to `"ok_with_skips"`) rather than being silently absent from
+`manifest["tabs"]` -- the same discipline `run_archive`'s own `"not_found"` per-tab state applies
+to a vanished `tab_id` (see above).
 
 ## The three-tier connectivity model
 

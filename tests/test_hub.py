@@ -885,3 +885,118 @@ def test_serve_hub_raises_hub_bind_error_on_port_already_in_use(tmp_path: Any) -
 
     asyncio.run(run())
     assert bound_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Tier 0 handshake -- dispatch-time capability fast-fail + devices skew summary
+# ---------------------------------------------------------------------------
+
+
+def test_fast_fails_a_command_the_device_positively_reports_lacking(tmp_path: Any) -> None:
+    """The core version-skew fix: a device that reported a real command set
+    NOT including the requested command must be refused BEFORE dispatch --
+    never sent to the device to fall through its own `unsupported command`
+    fallback."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record)
+    record.ws = fake_ws
+    record.commands = frozenset({"snapshot", "click", "tabs"})  # no "reload"
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1"), "reload", {})
+
+    result = asyncio.run(run())
+    assert result["ok"] is False
+    assert result["reason_code"] == "device_command_unsupported"
+    assert "EXTENSION is behind" in result["error"]
+    # Never actually sent to the device.
+    assert fake_ws.sent == []
+
+
+def test_does_not_fast_fail_a_command_the_device_reports_supporting(tmp_path: Any) -> None:
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record, canned_result={"ok": True, "result": {"reloading": True}})
+    record.ws = fake_ws
+    record.commands = frozenset({"snapshot", "click", "tabs", "reload"})
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1"), "reload", {})
+
+    result = asyncio.run(run())
+    assert result == {"ok": True, "result": {"reloading": True}}
+    assert len(fake_ws.sent) == 1
+
+
+def test_does_not_fast_fail_when_device_command_set_is_unknown(tmp_path: Any) -> None:
+    """A pre-Tier-0 device (never reported ANY command set) must dispatch
+    exactly as before this feature shipped -- otherwise `reload` itself
+    could never reach it, breaking the automatic-update path for every
+    currently-connected browser the moment this ships (skew.py's module
+    docstring)."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    fake_ws = FakeDeviceSocket(record, canned_result={"ok": True, "result": {"reloading": True}})
+    record.ws = fake_ws
+    assert record.commands is None
+    record.touch()
+
+    async def run() -> dict[str, Any]:
+        return await hub.send_command(Target(device_id="d1"), "reload", {})
+
+    result = asyncio.run(run())
+    assert result == {"ok": True, "result": {"reloading": True}}
+    assert len(fake_ws.sent) == 1
+
+
+def test_devices_snapshot_surfaces_skew_for_pre_handshake_device(tmp_path: Any) -> None:
+    """Staleness must be visible in a device listing BEFORE any command is
+    ever attempted against it -- the pre-handshake case is the first thing
+    every existing deployment hits the moment this ships."""
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    record.touch()
+    assert record.commands is None
+
+    snapshot = hub._devices_snapshot()
+    assert len(snapshot) == 1
+    skew = snapshot[0]["skew"]
+    assert skew["known"] is False
+    assert skew["in_sync"] is False
+    assert "stale" in skew["summary"]
+
+
+def test_devices_snapshot_surfaces_bidirectional_skew_for_known_device(tmp_path: Any) -> None:
+    from amplifier_browser_bridge.protocol import COMMANDS
+
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    # Missing one real command, reporting one the hub doesn't recognize.
+    record.commands = (frozenset(COMMANDS) - {"reload"}) | {"a_future_command"}
+    record.touch()
+
+    snapshot = hub._devices_snapshot()
+    skew = snapshot[0]["skew"]
+    assert skew["known"] is True
+    assert skew["in_sync"] is False
+    assert "reload" in skew["device_behind"]
+    assert "a_future_command" in skew["hub_behind"]
+
+
+def test_devices_snapshot_reports_in_sync_for_fully_current_device(tmp_path: Any) -> None:
+    from amplifier_browser_bridge.protocol import COMMANDS
+
+    hub = _hub(tmp_path)
+    record = hub.registry.get_or_create("d1")
+    record.ws = FakeDeviceSocket(record)
+    record.commands = frozenset(COMMANDS)
+    record.touch()
+
+    snapshot = hub._devices_snapshot()
+    assert snapshot[0]["skew"]["in_sync"] is True
+    assert snapshot[0]["skew"]["summary"] is None

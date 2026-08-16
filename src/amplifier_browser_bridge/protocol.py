@@ -98,6 +98,57 @@ COMMANDS: frozenset[str] = frozenset(
         "downloads_list",
         "download",
         "wait_download",
+        # Browser-state archive capability (design doc's "Mechanism, not
+        # policy" section still applies -- each of these is a distinct,
+        # named capture mechanism the ARCHIVE ORCHESTRATOR (archive.py,
+        # hub-side Python) composes; none is exposed as its own agent-facing
+        # tool in this phase -- see archive.py's module docstring for why
+        # (deep-capture payloads must go hub-side -> disk, never back
+        # through an agent tool's return value).
+        #
+        #   windows        -- BROWSER_LEVEL. chrome.windows.getAll +
+        #                     chrome.tabGroups.query: full window metadata
+        #                     (incl. incognito) and tab-group metadata. No
+        #                     tab_id/page contact at all -- the L0 (cheapest)
+        #                     rung of the archive depth ladder.
+        #   page_state     -- PAGE_WORLD (injected.js). Per-tab outerHTML,
+        #                     form field values (password values excluded,
+        #                     always), localStorage/sessionStorage, and
+        #                     scroll position. Top frame only by default,
+        #                     same documented narrower limitation as
+        #                     scroll/wait_for/etc ("Frames" section) --
+        #                     args.frame_id targets one known frame.
+        #   mhtml          -- BROWSER_LEVEL, CDP-only (Page.captureSnapshot).
+        #                     No injection-only alternative exists at all --
+        #                     see cdp.py's requires_cdp, which treats this
+        #                     command as unconditionally CDP-requiring.
+        #   nav_history    -- BROWSER_LEVEL, CDP-only
+        #                     (Page.getNavigationHistory). Same
+        #                     unconditional-CDP treatment as mhtml.
+        #   history_list, bookmarks_list, sessions_list, top_sites,
+        #   reading_list   -- BROWSER_LEVEL, device-only target. Browser-wide
+        #                     profile data (chrome.history/bookmarks/
+        #                     sessions/topSites/readingList) -- not scoped to
+        #                     any one tab.
+        #   cookies_list   -- BROWSER_LEVEL, device-only target.
+        #                     chrome.cookies.getAll. Deliberately NOT gated
+        #                     at the wire-command level (a caller invoking
+        #                     this command directly gets cookies, same as
+        #                     any other command) -- the opt-in gate lives at
+        #                     the ARCHIVE ORCHESTRATOR level (archive.py's
+        #                     `include_cookies`, default False, never
+        #                     included even at the deepest archive level
+        #                     unless explicitly requested).
+        "windows",
+        "page_state",
+        "mhtml",
+        "nav_history",
+        "history_list",
+        "bookmarks_list",
+        "sessions_list",
+        "top_sites",
+        "reading_list",
+        "cookies_list",
     }
 )
 
@@ -117,6 +168,11 @@ PAGE_WORLD_COMMANDS: frozenset[str] = frozenset(
         "forward",
         "wait_for",
         "wait_text",
+        # Archive capability (see COMMANDS' comment above): per-tab
+        # outerHTML/forms/storage/scroll, dispatched into injected.js like
+        # every other page-world command. Top frame only by default -- same
+        # documented narrower limitation as scroll/wait_for/wait_text.
+        "page_state",
     }
 )
 BROWSER_LEVEL_COMMANDS: frozenset[str] = COMMANDS - PAGE_WORLD_COMMANDS
@@ -178,6 +234,25 @@ CAPABILITY_KEYS: tuple[str, ...] = (
     "downloads",
     "storage",
     "alarms",
+    # Archive capability (see COMMANDS' comment): browser-wide profile-data
+    # permissions, each a real behavioral probe in background.js's
+    # probeCapabilities() -- never a `typeof` check. `debugger` (above)
+    # already gates the two CDP-only capture commands (mhtml, nav_history);
+    # these five gate the profile-data commands the archive orchestrator's
+    # deepest level (L5) collects. Unlike `debugger`, none of these is known
+    # to be genuinely absent on Edge Android -- manifest.android.json
+    # requests all five.
+    "history",
+    "bookmarks",
+    "sessions",
+    "top_sites",
+    "reading_list",
+    # `cookies` is reported the same behavioral way as every other capability
+    # here -- capability reporting is never the gate. The actual opt-in gate
+    # for cookie collection lives at the archive orchestrator level
+    # (archive.py's `include_cookies`, default False) -- see COMMANDS'
+    # comment on `cookies_list`.
+    "cookies",
 )
 
 

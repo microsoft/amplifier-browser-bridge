@@ -68,6 +68,8 @@ from .android_pack import AndroidPackError, PackerUnavailableError, build_androi
 from .args_bool import truthy
 from .audit import AuditLog
 from .auth import TokenStore, persist_device_token
+from .build_stamp import BuildStampError, current_build_stamp
+from .build_stamp import compute_freshness as _freshness_compute
 from .cdp import DEFAULT_SOFT_DETACH_IDLE_SECONDS, CdpRegistry, requires_cdp
 from .effects import EffectsReport
 from .extension_integrity import ExtensionIntegrityError
@@ -82,6 +84,8 @@ from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .scope import SCOPE_FIELDS, ScopeError, SessionScope
 from .setup import ExtensionSourceNotFoundError
 from .setup import generate_token as generate_device_token
+from .skew import capability_error as _skew_capability_error
+from .skew import compute_skew as _skew_compute
 from .tiers import LIVE_SILENCE_TIMEOUT_SECONDS, Tier
 
 logger = logging.getLogger("amplifier_browser_bridge.hub")
@@ -1391,6 +1395,20 @@ class Hub:
         if record is None:
             return {"ok": False, "error": f"unknown device: {target.device_id!r}"}
 
+        # Tier 0 handshake fast-fail (skew.py): refuse a command this device
+        # has POSITIVELY reported it cannot execute, before it is ever
+        # dispatched -- instead of letting `background.js`'s own if-chain
+        # fall through to a bare "unsupported command: X" with no hint the
+        # extension is stale (the common, useless case this feature exists
+        # to fix). Deliberately a no-op (returns `None`) when the device's
+        # command set isn't known yet (pre-Tier-0 extension) -- see
+        # skew.py's module docstring for why blocking dispatch on unknown
+        # commands would also block `reload` itself for every
+        # currently-connected browser the moment this ships.
+        skew_error = _skew_capability_error(command, record.commands)
+        if skew_error is not None:
+            return skew_error
+
         cmd = QueuedCommand(
             id=new_id(),
             target=target,
@@ -1905,7 +1923,47 @@ class Hub:
     # ------------------------------------------------------------------
 
     def _devices_snapshot(self) -> list[dict[str, Any]]:
+        # Build-freshness handshake (build_stamp.py): this hub's own currently
+        # expected stamp is the SAME value for every device in this snapshot
+        # (it depends only on this hub's own extension source, never on any
+        # one device), so it's computed once per call rather than once per
+        # device. Computed fresh each call (see `current_build_stamp`'s
+        # docstring) -- cheap (a couple dozen small file reads), and never
+        # allowed to take down the whole listing: a hub-side source problem
+        # is named via `hub_error` on every entry instead of raising out of
+        # `_devices_snapshot` (which previously had zero filesystem
+        # dependency -- `browser_devices` must keep working even when this
+        # hub's own extension source is broken).
+        try:
+            hub_stamp: str | None = current_build_stamp()
+            hub_stamp_error: str | None = None
+        except (ExtensionSourceNotFoundError, BuildStampError) as e:
+            hub_stamp = None
+            hub_stamp_error = str(e)
+
         summaries = self.registry.snapshot()
         for summary in summaries:
             summary["cdp"] = self.cdp.snapshot(summary["device_id"])
+            # Tier 0 handshake (skew.py): compare THIS device's self-reported
+            # `commands` against the hub's own vocabulary (`COMMANDS`) and
+            # attach the result -- surfaced in every `devices`/
+            # `browser_devices` listing so an agent (or `update_extension.py`,
+            # over the same wire response) can see a stale device BEFORE
+            # ever failing a command against it. Comparison lives here, not
+            # on `DeviceRecord`, for the same reason `cdp` is enriched here:
+            # both compare a device against HUB-owned state (registry.py's
+            # module docstring pattern).
+            raw_commands = summary["commands"]
+            device_commands = frozenset(raw_commands) if raw_commands is not None else None
+            summary["skew"] = _skew_compute(device_commands, COMMANDS).to_summary()
+            # Build-freshness handshake (build_stamp.py) -- the sibling of
+            # `skew` above: "is this device running the CURRENT build" is a
+            # DIFFERENT question from "what can this device DO", and a
+            # device can be command-complete (skew.in_sync) while still
+            # running a stale build (a bug/UI/security fix that touched zero
+            # commands -- see build_stamp.py's module docstring for the real
+            # incident that motivated this).
+            summary["build_freshness"] = _freshness_compute(
+                summary["build_stamp"], hub_stamp, hub_error=hub_stamp_error
+            ).to_summary()
         return summaries

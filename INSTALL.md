@@ -231,7 +231,7 @@ Opening that link (on the browser being paired) shows the same code with a live
 countdown. Usually you don't need to do anything else: the moment the
 extension's options page opens (Step 2 above), it scans open tabs and the
 clipboard for that same code and redeems it on its own -- the options page's
-step 2 flips straight to "Connected" with no paste required. If it doesn't
+step 2 flips straight to "Paired" with no paste required. If it doesn't
 connect within a few seconds, open **"It didn't connect on its own"** on the
 setup page (or **"Enter a code by hand"** on the options page) and paste the
 code manually, then click **Pair**. Either way, the Hub URL and a
@@ -346,13 +346,42 @@ which you are running.
 
 ## Updating
 
-When a new version arrives:
+**Using Amplifier? There's a one-call path that tries the automatic route for
+you and only falls back to the manual steps below if it genuinely can't reach
+your extension's files.** Call the `browser_update_extension` tool
+(`device_id` from `browser_devices`) -- it restages a fresh build on the hub
+and reloads the device, then VERIFIES the result by re-reading the device's
+reported command set after it reconnects. It never reports success on the
+reload ack alone:
+
+- If the device was already current, it does nothing and says so.
+- If the automatic path genuinely reached this browser's extension files
+  (commonly: hub and browser on the SAME machine, or a shared/mounted staging
+  path), you're done -- verified, not assumed.
+- **If hub and browser are on DIFFERENT machines** (the common remote setup --
+  see docs/designs/browser-bridge.md), the automatic restage has no way to
+  reach the browser's actual files. The tool detects this honestly (the
+  device reconnects, but its reported commands are unchanged) and hands back
+  a `guided` block with a real download URL for the hub you're actually
+  running -- follow the manual steps below ON THE MACHINE RUNNING THAT
+  BROWSER, using that URL instead of the `/setup` page.
+- If the extension is old enough to predate self-service reload entirely, it
+  cannot reload itself no matter what -- the tool reports this plainly
+  (`reason: "reload_unsupported"`) rather than retrying forever; do the
+  manual steps below once, and every subsequent update can use this tool.
+
+**The manual path** (no Amplifier, or the automatic path above reported it
+couldn't verify) -- when a new version arrives:
 
 1. Download and unzip the new version over the existing folder (or to a
    fresh folder, then update `edge://extensions/`'s "Load unpacked" path).
+   Get the zip from the hub's own `GET /setup/extension.zip` (it builds a
+   fresh copy on every request -- the same URL `browser_update_extension`'s
+   `guided` block hands back) or the `/setup` page's download button.
 2. In `edge://extensions/`, click the reload icon under the extension, or use
    the extension's own `reload` command once connected
-   (`amplifier-browser-bridge reload <device_id>`).
+   (`amplifier-browser-bridge reload <device_id>`, or the
+   `browser_update_extension` tool, which does exactly this and verifies it).
 
 Your Hub URL and token are **not** stored in any file this update touches --
 they live in the extension's `chrome.storage.local`, keyed to its install

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from amplifier_browser_bridge.protocol import (
     BROWSER_LEVEL_COMMANDS,
+    CAPABILITY_KEYS,
     COMMANDS,
     PAGE_WORLD_COMMANDS,
     envelope,
@@ -75,6 +76,17 @@ def test_command_vocabulary_matches_design_doc() -> None:
         "downloads_list",
         "download",
         "wait_download",
+        # Browser-state archive capability (D2).
+        "windows",
+        "page_state",
+        "mhtml",
+        "nav_history",
+        "history_list",
+        "bookmarks_list",
+        "sessions_list",
+        "top_sites",
+        "reading_list",
+        "cookies_list",
     }
     assert COMMANDS == expected
 
@@ -94,3 +106,41 @@ def test_reload_is_a_browser_level_command() -> None:
     not be dispatched into injected.js's page-world path."""
     assert "reload" in BROWSER_LEVEL_COMMANDS
     assert "reload" not in PAGE_WORLD_COMMANDS
+
+
+def test_page_state_is_a_page_world_command() -> None:
+    """`page_state` (D2, browser-state archive) needs DOM/storage access, so it
+    must dispatch into injected.js like snapshot/read -- not directly against
+    chrome.tabs/chrome.windows."""
+    assert "page_state" in PAGE_WORLD_COMMANDS
+    assert "page_state" not in BROWSER_LEVEL_COMMANDS
+
+
+def test_capability_keys_include_archive_profile_data_keys() -> None:
+    """D2 (browser-state archive): the five profile-data capabilities plus
+    `cookies` must be reportable, alongside the pre-existing keys -- see
+    background.js's probeCapabilities() for the matching behavioral probes."""
+    expected_new = {"history", "bookmarks", "sessions", "top_sites", "reading_list", "cookies"}
+    assert expected_new <= set(CAPABILITY_KEYS)
+    # No duplicates -- each key appears exactly once.
+    assert len(CAPABILITY_KEYS) == len(set(CAPABILITY_KEYS))
+
+
+def test_archive_browser_level_commands_are_not_page_world() -> None:
+    """None of the remaining archive commands touch injected.js -- windows/
+    mhtml/nav_history are dispatched directly against chrome.windows/
+    chrome.tabGroups/chrome.debugger, and the profile-data commands are
+    device-only, exactly like downloads_list/download/wait_download."""
+    for name in (
+        "windows",
+        "mhtml",
+        "nav_history",
+        "history_list",
+        "bookmarks_list",
+        "sessions_list",
+        "top_sites",
+        "reading_list",
+        "cookies_list",
+    ):
+        assert name in BROWSER_LEVEL_COMMANDS
+        assert name not in PAGE_WORLD_COMMANDS
