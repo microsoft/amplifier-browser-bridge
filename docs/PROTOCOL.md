@@ -1503,6 +1503,38 @@ A caller must never be able to silently get less than they asked for: a capture 
 `captures` is always distinct from one attempted-and-failed, exactly as `"skipped"`/`"not_found"`
 already are at the tab level.
 
+#### Queued commands and pacing (large archives)
+
+`run_archive` is one caller among several that issues ordinary `command()` requests over the
+`/agent` route -- so it is fully subject to the queued-command contract above ("This is the
+load-bearing non-blocking guarantee"): a per-tab/profile-data command dispatched to a non-live
+device returns `{"status": "queued", ...}` immediately. `run_archive` follows a queued response
+with `poll` until it resolves to a real result -- or gives up after `poll_max_wait_s` (default
+90s, checked every `poll_interval_s`, default 2s) and records an honest failure rather than
+hanging the archive indefinitely. This closes a real-world gap: a prior version treated the
+queued response ITSELF as the final, failed outcome and never called `poll` at all, so when a
+126-tab archive's own command volume pushed the device off `live` partway through, ~200
+commands the device went on to actually execute were all recorded as failures -- the work was
+done; the answers were discarded. `manifest["pacing"]["queued_waits"]`/`["queued_wait_total_s"]`/
+`["queued_timeouts"]` summarize how much of this happened during a given run.
+
+The same real-world archive is also why `run_archive` paces its own CDP-requiring per-tab
+dispatches (`mhtml`, `nav_history`, and `screenshot` when using `capture_hidden` -- see
+"Unconditionally CDP-requiring commands" above): nothing previously limited how fast these were
+fired, and doing so back-to-back with zero gap is what overwhelmed the device's extension in the
+first place. `cdp_pace_s` (default 0.2s) enforces a floor on the interval between successive CDP
+dispatches; independently, before each one, a cheap hub-local `list_devices()` tier check waits
+(bounded exponential backoff, cap `cdp_backpressure_max_wait_s`, default 20s) for a
+non-`live` device to recover before proceeding, rather than adding more commands to a device that
+has already shown it cannot keep up. Both are advisory pacing, not a correctness gate -- the
+queued/poll handling above is what guarantees a correct eventual outcome regardless of whether
+pacing was enough. `run_archive`'s optional `on_progress` callback receives structured events
+(`tab_done`, `queued_wait_started`/`_resolved`/`_gave_up`, `backpressure_waiting`/`_resumed`,
+`archive_finished`) live as the run progresses -- a small sample (e.g. 5 tabs) never saturates
+anything, so a live signal during a large run is worth more than a happy-path number measured on
+a handful of tabs. See `archive.py`'s module docstring ("Queued means wait, not fail" and
+"Pacing") for the full design and the measured incident both respond to.
+
 ## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
 
 Like the archive capability itself, converting a captured page's MHTML into markdown --

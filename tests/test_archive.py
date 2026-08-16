@@ -14,13 +14,15 @@ shape.
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from amplifier_browser_bridge.addressing import Target
-from amplifier_browser_bridge.archive import ArchiveError, run_archive
+from amplifier_browser_bridge.archive import _CDP_PACED_COMMANDS, ArchiveError, run_archive
 from amplifier_browser_bridge.client import HubError
 
 # ---------------------------------------------------------------------------
@@ -118,19 +120,49 @@ class FakeArchiveClient:
     network/websocket of any kind. `by_command` maps a command name to either
     a single canned response (returned for every call) or a list of
     responses (consumed in order, one per call -- for a command invoked once
-    per tab)."""
+    per tab).
 
-    def __init__(self, devices: list[dict[str, Any]], by_command: dict[str, Any]) -> None:
+    `devices` may also be a zero-arg callable, so a test can make `tier`
+    change across successive `list_devices()` calls (needed to exercise
+    `_CdpPacer`'s tier-reactive backpressure -- see the "Pacing" tests below).
+
+    `poll_script` maps a `command_id` (the one the TEST itself embeds in a
+    scripted `{"status": "queued", "command_id": ...}` response) to either a
+    single canned poll response or a list of responses consumed in order --
+    the same scripting convention as `by_command`. This is what lets a test
+    prove a queued command resolves to a real result via a SUBSEQUENT poll
+    (see test_queued_response_resolves_via_poll_and_lands_as_success below),
+    rather than only ever exercising the immediate, `live`-device response.
+    """
+
+    def __init__(
+        self,
+        devices: list[dict[str, Any]] | Callable[[], list[dict[str, Any]]],
+        by_command: dict[str, Any],
+        *,
+        poll_script: dict[str, Any] | None = None,
+    ) -> None:
         self._devices = devices
         self._by_command = by_command
+        self._poll_script = poll_script or {}
         self._call_index: dict[str, int] = {}
+        self._poll_call_index: dict[str, int] = {}
         self.calls: list[tuple[str, str, dict[str, Any]]] = []  # (device_id, command, args)
+        self.poll_calls: list[tuple[str, str]] = []  # (device_id, command_id)
+        self.list_devices_calls: int = 0
+        # Wall-clock timestamp of every `command()` call whose `args` marks it
+        # as CDP (`_cdp_marker` -- set by the tests below, never a real wire
+        # arg), for pacing-interval assertions.
+        self.cdp_dispatch_times: list[float] = []
 
     async def list_devices(self) -> list[dict[str, Any]]:
-        return self._devices
+        self.list_devices_calls += 1
+        return self._devices() if callable(self._devices) else self._devices
 
     async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((target.device_id, command, dict(args)))
+        if command in _CDP_PACED_COMMANDS or args.get("capture_hidden"):
+            self.cdp_dispatch_times.append(time.monotonic())
         scripted = self._by_command.get(command, {"ok": True, "result": {}})
         if isinstance(scripted, list):
             idx = self._call_index.get(command, 0)
@@ -148,12 +180,27 @@ class FakeArchiveClient:
             raise scripted
         return scripted
 
+    async def poll(self, device_id: str, command_id: str) -> dict[str, Any]:
+        self.poll_calls.append((device_id, command_id))
+        scripted = self._poll_script.get(command_id)
+        if scripted is None:
+            return {"ok": False, "error": f"no poll script for command_id={command_id!r}"}
+        if isinstance(scripted, list):
+            idx = self._poll_call_index.get(command_id, 0)
+            self._poll_call_index[command_id] = idx + 1
+            scripted = scripted[idx] if idx < len(scripted) else scripted[-1]
+        if isinstance(scripted, BaseException):
+            raise scripted
+        return scripted
+
 
 def _basic_client(
     *,
     tabs: list[dict[str, Any]] | None = None,
     capabilities: dict[str, bool] | None = None,
     extra_commands: dict[str, Any] | None = None,
+    poll_script: dict[str, Any] | None = None,
+    devices: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> FakeArchiveClient:
     tabs = tabs if tabs is not None else [_tab(101), _tab(102)]
     by_command: dict[str, Any] = {
@@ -205,8 +252,9 @@ def _basic_client(
     }
     if extra_commands:
         by_command.update(extra_commands)
-    devices = [_device_record(**(capabilities or {}))]
-    return FakeArchiveClient(devices, by_command)
+    device_source: Callable[[], list[dict[str, Any]]] | list[dict[str, Any]]
+    device_source = devices if devices is not None else [_device_record(**(capabilities or {}))]
+    return FakeArchiveClient(device_source, by_command, poll_script=poll_script)
 
 
 # ---------------------------------------------------------------------------
@@ -905,18 +953,284 @@ async def test_profile_summary_counts_a_real_profile_item_failure(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_queued_response_mid_run_is_recorded_as_a_failure_not_a_hang(tmp_path: Path) -> None:
-    """A device that goes non-live mid-archive returns {"status": "queued", ...}
-    for a per-tab command -- this must be recorded as a failure, never
-    awaited/polled/retried (which would risk hanging the whole archive)."""
+async def test_queued_response_resolves_via_poll_and_lands_as_success(tmp_path: Path) -> None:
+    """The load-bearing regression test for the real-world bug: a device that
+    is not live returns {"status": "queued", ...} immediately, but the hub
+    goes on to actually execute the command and the real result becomes
+    retrievable via `poll`. This capture must land in the manifest as a
+    SUCCESS (the work the device actually did), not a failure -- the prior
+    behavior (treating `queued` itself as the final, failed outcome) is
+    exactly the bug that discarded ~90 real captures in the live 126-tab
+    archive this fix responds to. A test where every command returns
+    immediately (the OLD version of this test) cannot catch this bug."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        extra_commands={
+            "read": {"status": "queued", "command_id": "c1", "tier": "intermittent", "queue_position": 1}
+        },
+        poll_script={
+            "c1": [
+                {"status": "queued", "queue_position": 1, "tier": "intermittent"},
+                {"status": "pending"},
+                {
+                    "ok": True,
+                    "result": {"url": "https://example.com", "title": "Test Page", "text": "hello"},
+                },
+            ]
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", poll_interval_s=0.01)
+    entry = result["result"]["tabs"]["101"]
+    assert entry["status"] == "ok"
+    assert entry["captures"]["text"]["status"] == "ok"
+    # The poll mechanism was actually exercised -- not a coincidental pass.
+    assert client.poll_calls == [(_DEVICE_ID, "c1"), (_DEVICE_ID, "c1"), (_DEVICE_ID, "c1")]
+    manifest = result["result"]
+    assert manifest["status"] == "ok"
+    assert manifest["pacing"]["queued_waits"] == 1
+    assert manifest["pacing"]["queued_timeouts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_realistic_fraction_of_commands_queued_all_land_as_successes(tmp_path: Path) -> None:
+    """Multiple tabs, each queued at least once, each resolving via poll to a
+    real success -- proving the fix holds across a whole run, not just one
+    lucky capture."""
+    tabs = [_tab(101), _tab(102), _tab(103)]
+
+    def _queued(command_id: str) -> dict[str, Any]:
+        return {"status": "queued", "command_id": command_id, "tier": "intermittent"}
+
+    client = _basic_client(
+        tabs=tabs,
+        extra_commands={"read": [_queued("c-101"), _queued("c-102"), _queued("c-103")]},
+        poll_script={
+            "c-101": {"ok": True, "result": {"url": "https://example.com", "title": "t", "text": "a"}},
+            "c-102": [
+                {"status": "pending"},
+                {"ok": True, "result": {"url": "https://example.com", "title": "t", "text": "b"}},
+            ],
+            "c-103": {"ok": False, "error": "device reconnected but the tab was closed"},
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", poll_interval_s=0.01)
+    manifest = result["result"]
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["status"] == "ok"
+    # 103's queued command genuinely resolved to a real failure -- this must
+    # still be reported honestly as failed, never miscounted as a success.
+    assert manifest["tabs"]["103"]["status"] == "failed"
+    assert manifest["pacing"]["queued_waits"] == 3
+
+
+@pytest.mark.asyncio
+async def test_queued_command_that_never_resolves_fails_loud_not_hangs_forever(tmp_path: Path) -> None:
+    """A queued command whose poll NEVER resolves (always "queued"/"pending")
+    must not hang the archive indefinitely -- it must give up after
+    `poll_max_wait_s` and record an honest failure. Uses tiny poll_interval_s/
+    poll_max_wait_s so the test itself completes quickly while still proving
+    the timeout path (not just asserting behavior by inspection)."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        extra_commands={"read": {"status": "queued", "command_id": "stuck", "tier": "dormant"}},
+        poll_script={"stuck": {"status": "queued", "queue_position": 1, "tier": "dormant"}},
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client, _DEVICE_ID, tmp_path, depth="L1", poll_interval_s=0.01, poll_max_wait_s=0.05
+    )
+    elapsed = time.monotonic() - started
+    # The load-bearing assertion: this returned at all, and quickly -- a bug
+    # that polled forever would hang this test (and the real archive) rather
+    # than ever reaching this line.
+    assert elapsed < 5.0
+    entry = result["result"]["tabs"]["101"]
+    assert entry["status"] == "failed"
+    assert "gave up waiting" in entry["captures"]["text"]["error"]
+    assert result["result"]["pacing"]["queued_timeouts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_on_progress_receives_queued_wait_events(tmp_path: Path) -> None:
+    """`on_progress` (module docstring's "Pacing" section) is a cheap, live
+    signal of real activity -- a small sample never saturates anything, so a
+    caller archiving hundreds of tabs should be able to see queued-wait
+    activity as it happens, not only in the final manifest."""
     client = _basic_client(
         tabs=[_tab(101)],
         extra_commands={"read": {"status": "queued", "command_id": "c1", "tier": "intermittent"}},
+        poll_script={"c1": {"ok": True, "result": {"url": "https://example.com", "title": "t", "text": "x"}}},
     )
-    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1")
-    entry = result["result"]["tabs"]["101"]
-    assert entry["status"] == "failed"
-    assert "queued" in entry["captures"]["text"]["error"]
+    events: list[dict[str, Any]] = []
+    await run_archive(
+        client, _DEVICE_ID, tmp_path, depth="L1", poll_interval_s=0.01, on_progress=events.append
+    )
+    event_names = [e["event"] for e in events]
+    assert "queued_wait_started" in event_names
+    assert "queued_wait_resolved" in event_names
+    assert "tab_done" in event_names
+    assert "archive_finished" in event_names
+
+
+# ---------------------------------------------------------------------------
+# Pacing -- CDP dispatches must never fire back-to-back with zero gap, and
+# must back off when the device shows signs of degrading. See module
+# docstring's "Pacing" section for the real-world incident (a 126-tab archive
+# firing ~378 CDP-heavy commands as fast as it could, knocking the device off
+# `live` mid-run) this closes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cdp_pace_s_bounds_the_dispatch_rate_of_cdp_commands(tmp_path: Path) -> None:
+    """The load-bearing pacing assertion: successive CDP-requiring dispatches
+    (`mhtml`, here) must be spaced at least `cdp_pace_s` apart -- proving the
+    pacer actually throttles the rate at which commands reach the device,
+    not just that it exists. Three tabs -> three `mhtml` dispatches -> two
+    enforced gaps."""
+    client = _basic_client(
+        tabs=[_tab(101), _tab(102), _tab(103)],
+        capabilities={"debugger": True},
+    )
+    await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.05,
+        cdp_backpressure_max_wait_s=0,
+    )
+    assert len(client.cdp_dispatch_times) == 3
+    gaps = [b - a for a, b in zip(client.cdp_dispatch_times, client.cdp_dispatch_times[1:])]
+    for gap in gaps:
+        assert gap >= 0.045, f"CDP dispatches were not paced apart: gap={gap:.4f}s"
+
+
+@pytest.mark.asyncio
+async def test_cdp_pace_s_zero_disables_the_floor(tmp_path: Path) -> None:
+    """`cdp_pace_s=0` (opt-out) must not add any artificial delay -- confirms
+    the floor is a real, disableable knob, not a hardcoded minimum."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    started = time.monotonic()
+    await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0,
+        cdp_backpressure_max_wait_s=0,
+    )
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.asyncio
+async def test_only_cdp_commands_are_paced_not_injection_or_profile_commands(tmp_path: Path) -> None:
+    """Lightweight JS-injection captures (`text`/`dom`) and browser-wide
+    profile-data commands must never be paced -- only `mhtml`/`nav_history`/
+    `screenshot` (capture_hidden) are, per module docstring's "Pacing"
+    section. A large `cdp_pace_s` here would make this test slow if pacing
+    leaked onto the wrong commands."""
+    client = _basic_client(tabs=[_tab(101), _tab(102), _tab(103)], capabilities={"debugger": True})
+    started = time.monotonic()
+    await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L2",
+        cdp_pace_s=5.0,
+        cdp_backpressure_max_wait_s=0,
+    )
+    assert time.monotonic() - started < 2.0
+    assert client.cdp_dispatch_times == []
+
+
+@pytest.mark.asyncio
+async def test_backpressure_pauses_cdp_dispatch_until_tier_recovers(tmp_path: Path) -> None:
+    """The device reports `intermittent` for the first two tier checks, then
+    recovers to `live` -- the pacer must wait (not proceed immediately) and
+    must resume once tier reports `live` again, rather than either blocking
+    forever or ignoring the degraded tier entirely.
+
+    The first `"intermittent"` is consumed by `run_archive`'s OWN up-front
+    `list_devices()` call (to resolve capabilities, before any dispatch or
+    pacing happens at all) -- the second is what the pacer itself actually
+    observes on its first tier check."""
+    tier_sequence = iter(["intermittent", "intermittent", "live", "live", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    client = _basic_client(tabs=[_tab(101)], capabilities={"debugger": True}, devices=_devices)
+    events: list[dict[str, Any]] = []
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=5.0,
+        on_progress=events.append,
+    )
+    assert result["result"]["tabs"]["101"]["status"] == "ok"
+    event_names = [e["event"] for e in events]
+    assert "backpressure_waiting" in event_names
+    assert "backpressure_resumed" in event_names
+    assert result["result"]["pacing"]["cdp_backpressure_events"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backpressure_gives_up_after_max_wait_and_dispatches_anyway(tmp_path: Path) -> None:
+    """A device stuck non-live for longer than `cdp_backpressure_max_wait_s`
+    must not block the archive forever -- the pacer gives up and lets
+    dispatch proceed (whatever happens next, e.g. a queued response, is
+    `_resolve_queued`'s job to handle correctly, not the pacer's)."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        devices=lambda: [{**_device_record(debugger=True), "tier": "dormant"}],
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.05,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0  # gave up -- did not hang waiting for a tier that never recovers
+    assert result["result"]["pacing"]["cdp_backpressure_events"] == 1
+    # Dispatch proceeded despite the still-degraded tier -- one real command
+    # actually reached the (fake) device.
+    assert len(client.cdp_dispatch_times) == 1
+
+
+@pytest.mark.asyncio
+async def test_cdp_backpressure_max_wait_s_zero_disables_tier_checking(tmp_path: Path) -> None:
+    """`cdp_backpressure_max_wait_s=0` must skip tier checking entirely -- no
+    `list_devices()` calls beyond the one `run_archive` itself always makes
+    up front to resolve capabilities."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    before = client.list_devices_calls
+    await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0,
+    )
+    # Exactly the one up-front call in `run_archive` itself -- the pacer never
+    # calls `list_devices()` when backpressure is disabled.
+    assert client.list_devices_calls - before == 1
 
 
 # ---------------------------------------------------------------------------

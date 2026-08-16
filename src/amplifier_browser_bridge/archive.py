@@ -153,13 +153,85 @@ opt-in gate lives HERE: `include_cookies` defaults to `False` and is never impli
 requesting a deeper archive level, including L5. A default that silently exfiltrates
 session tokens into an archive directory on disk is a bad default regardless of what
 the manifest permits (see `docs/permission-justifications.md` section 6).
+
+## Queued means wait, not fail
+
+Real-world finding (a live 126-tab archive, measured): a `command()` call to a device
+that is not `live` (docs/PROTOCOL.md's three-tier model) does not fail -- it returns
+`{"status": "queued", "command_id": ..., "tier": ...}` *immediately*, and the hub goes
+on to actually execute it once the device reconnects, with the real result retrievable
+via `poll` (docs/PROTOCOL.md's "This is the load-bearing non-blocking guarantee"). A
+prior version of this module treated a queued response as an immediate per-capture
+failure and never called `poll` -- so when a large archive's own command volume pushed
+the device from `live` to `intermittent` partway through (see "Pacing" below), every
+remaining capture came back `queued`, was recorded as `"failed"`, and the run reported
+`tabs_failed: 101` out of 111 attempted -- while the device went on to actually execute
+most of those 200+ "failed" commands, whose real results were retrieved by nothing and
+discarded. The work was done; the answers were thrown away.
+
+The fix: `_safe_command` (the single choke point every wire call in this module already
+goes through) now follows a queued response with `client.poll(device_id, command_id)`,
+on a fixed interval (`poll_interval_s`), until it resolves to a real `{"ok": ...}`
+result -- or until `poll_max_wait_s` elapses, at which point it gives up and returns an
+honest, clearly-worded failure (never a silent hang -- see `_resolve_queued`). Every
+downstream capture recorder (`_record_read_capture`, `_record_mhtml_capture`, etc.) and
+`_command_outcome` itself are UNCHANGED by this fix: they already only ever see a
+resolved `{"ok": true/false, ...}` shape, so the entire correctness fix lives in one
+function. `_command_outcome`'s own `status == "queued"` branch becomes a defensive
+fallback for a queued response that is missing `command_id` (a protocol violation) --
+see its docstring.
+
+This is a correctness fix independent of *why* a device is non-live: it holds whether
+the orchestrator itself caused the degradation (see "Pacing" below) or the device went
+non-live for any other reason (network blip, browser backgrounded, laptop lid closed).
+
+## Pacing: giving the device room to breathe
+
+The same live 126-tab archive: nothing in this module limited how fast per-tab
+commands were dispatched, and CDP-based captures (`mhtml` especially -- routinely
+multi-megabyte, `Page.captureSnapshot` -- and `nav_history`) are the ones observed to
+be heavy enough, fired back-to-back with zero gap, to overwhelm the browser
+extension's single-threaded service worker and knock the device off `live` mid-run --
+the archive caused the very condition the previous section's bug then mishandled.
+
+`_CdpPacer` addresses this with two independent, narrowly-scoped guards, applied only
+before the three CDP-requiring per-tab captures (`mhtml`, `nav_history`, and
+`screenshot` when it is using `capture_hidden` -- see `cdp.py`'s `requires_cdp`); the
+lightweight JS-injection captures (`text`/`dom`) and the browser-wide profile-data
+commands are never paced, since they are not what the real-world incident implicates:
+
+1. **A floor on the interval since the previous CDP dispatch** (`cdp_pace_s`) --
+   enforced unconditionally, so a large archive can never fire CDP-heavy commands
+   back-to-back with zero gap, regardless of what the device's last-reported tier
+   says (tier only updates on the device's own heartbeat/hello, so it can lag real-time
+   degradation by seconds).
+2. **A live tier check immediately before dispatch** (`client.list_devices()` -- a
+   cheap, hub-local call; no device round trip). If the device has already fallen off
+   `live`, this waits, with exponential backoff capped at `cdp_backpressure_max_wait_s`,
+   for it to recover before allowing the next CDP dispatch -- rather than adding more
+   commands to a device that has already shown it cannot keep up. This is advisory,
+   never a correctness gate: if the wait budget is exhausted, or the `list_devices()`
+   check itself fails, dispatch proceeds anyway -- the previous section's poll-until-
+   resolved handling is what guarantees a correct eventual outcome regardless.
+
+Both are diagnostics-friendly, not just silent: `run_archive`'s optional `on_progress`
+callback (if given) is invoked with structured events as pacing/backpressure/queued-
+wait activity happens -- live, as the run progresses, not only in the final manifest
+(a small sample never saturates anything, so a live signal is worth more than a faster
+happy path measured on five tabs). `manifest["pacing"]` also summarizes the whole run's
+pacing activity (tier checks, backpressure pauses, queued-command waits) for a caller
+that only reads the manifest after the fact.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -203,6 +275,45 @@ _CAPTURE_OWNING_DEPTH: dict[str, str] = {
 # CDP-based routes succeeded on the same tabs.
 _INJECTION_CAPTURE_NAMES: frozenset[str] = frozenset({"text", "dom"})
 
+# ---------------------------------------------------------------------------
+# Pacing / queued-resolution defaults -- see module docstring's "Queued means
+# wait, not fail" and "Pacing" sections for the real-world incident these
+# close and the reasoning behind each number.
+# ---------------------------------------------------------------------------
+
+# Wire commands this module treats as CDP-requiring for PACING purposes --
+# `mhtml`/`nav_history` are unconditionally so (cdp.py's `_ALWAYS_CDP_COMMANDS`);
+# `screenshot` is CDP-based only when dispatched with `capture_hidden` (see
+# `_capture_tab`'s `use_capture_hidden`), so it is paced via an explicit
+# `is_cdp` argument at its own call site rather than membership here.
+_CDP_PACED_COMMANDS: frozenset[str] = frozenset({"mhtml", "nav_history"})
+
+# Floor on the interval between successive CDP-requiring dispatches. Fired
+# unconditionally (not just reactively) because the real-world incident this
+# closes was CAUSED by zero-gap dispatch of heavy CDP captures, not merely
+# revealed after the fact -- see `_CdpPacer`.
+DEFAULT_CDP_PACE_S: float = 0.2
+
+# Cap on how long `_CdpPacer` will wait (exponential backoff) for a degraded
+# device to return to `live` before giving up and allowing dispatch to proceed
+# anyway. Advisory only: `_resolve_queued` (below) is what guarantees a correct
+# eventual outcome regardless of whether this budget was enough.
+DEFAULT_CDP_BACKPRESSURE_MAX_WAIT_S: float = 20.0
+
+# How often `_resolve_queued` polls a still-queued/pending command for its
+# real result.
+DEFAULT_POLL_INTERVAL_S: float = 2.0
+
+# Total time `_resolve_queued` will spend polling ONE queued command before
+# giving up and recording it as a failure -- never an unbounded/silent hang
+# (module docstring's "Queued means wait, not fail" section). A caller
+# archiving a device known to be dormant for a long stretch can raise this;
+# the default is generous relative to the measured intermittent dark-window
+# ceiling (tiers.py's `INTERMITTENT_MAX_SECONDS`, 150s) without matching it
+# exactly -- a single stuck capture should not be allowed to dominate an
+# entire large archive's wall-clock time.
+DEFAULT_POLL_MAX_WAIT_S: float = 90.0
+
 
 class ArchiveError(ValueError):
     """Raised for a PRE-FLIGHT failure that stops the whole run before anything is
@@ -218,14 +329,19 @@ class ArchiveError(ValueError):
 
 
 class _ArchiveClient(Protocol):
-    """Structural type for the two `HubClient` methods this module actually needs --
+    """Structural type for the three `HubClient` methods this module actually needs --
     `HubClient` itself satisfies this, and so does a duck-typed test double (see
     tests/test_archive.py), the same pattern `vision_read.py`'s `_CommandClient`
-    already establishes."""
+    already establishes. `poll` was added alongside "Queued means wait, not fail"
+    (module docstring) -- it is what lets `_resolve_queued` retrieve a queued
+    command's eventual real result instead of treating the queued response itself
+    as the final outcome."""
 
     async def command(self, target: Target, command: str, args: dict[str, Any]) -> dict[str, Any]: ...
 
     async def list_devices(self) -> list[dict[str, Any]]: ...
+
+    async def poll(self, device_id: str, command_id: str) -> dict[str, Any]: ...
 
 
 def _depth_index(depth: str) -> int:
@@ -299,14 +415,17 @@ def _write_json(path: Path, data: Any) -> int:
 def _command_outcome(result: Any) -> tuple[bool, Any, str | None]:
     """Classifies a raw hub command result into `(ok, data, error)`.
 
-    `ok=False` for BOTH an explicit `{"ok": false, ...}` failure AND a queued
-    (non-live device) `{"status": "queued", ...}` response -- an archive capture
-    that cannot complete synchronously is recorded as a failure with an
-    actionable reason, never silently retried or awaited. This module never
-    polls for a queued command to drain; that would turn one flaky/sleeping
-    device into the whole archive run hanging indefinitely, which is exactly
-    the kind of blocking behavior this project's tier model exists to avoid
-    (docs/PROTOCOL.md's "This is the load-bearing non-blocking guarantee").
+    By the time this is called, `result` has ALREADY been through
+    `_safe_command`'s queued-resolution (module docstring's "Queued means wait,
+    not fail" section) -- so in normal operation it only ever sees a terminal
+    shape: an explicit `{"ok": true, ...}` success, an explicit
+    `{"ok": false, ...}` failure, or a synthetic `{"ok": false, ...}` produced
+    by `_resolve_queued` giving up after `poll_max_wait_s`. The `status ==
+    "queued"` branch below is therefore a DEFENSIVE fallback, not the primary
+    path: it only triggers for a queued response missing `command_id` (a
+    protocol violation -- docs/PROTOCOL.md's queued response always includes
+    one), which `_resolve_queued` cannot poll and returns unresolved. Treated
+    as an ordinary capture failure, same as any other -- never a silent hang.
     """
     if not isinstance(result, dict):
         return False, None, f"unexpected non-dict response: {result!r}"
@@ -316,9 +435,9 @@ def _command_outcome(result: Any) -> tuple[bool, Any, str | None]:
             None,
             (
                 f"device is not live -- this command was queued (tier={result.get('tier')!r}, "
-                f"command_id={result.get('command_id')!r}) instead of executing. The archive "
-                "orchestrator does not wait for a queued command to drain; it requires a live "
-                "device for per-tab/profile-data capture."
+                f"command_id={result.get('command_id')!r}) and could not be resolved (missing a "
+                "pollable command_id, which is a protocol violation -- docs/PROTOCOL.md's queued "
+                "response always includes one)."
             ),
         )
     if result.get("ok") is True:
@@ -330,15 +449,231 @@ def _capture_failed(error: str) -> dict[str, Any]:
     return {"status": "failed", "error": error}
 
 
+@dataclass
+class _RunSupport:
+    """Bundles the run-level pacing/polling knobs `_safe_command` needs beyond
+    the ordinary per-call `(client, target, command, args)` -- so `run_archive`'s
+    many per-tab/per-profile helper functions thread ONE extra parameter instead
+    of four or five. One instance is created per `run_archive` call and shared
+    across every capture in that run (see module docstring's "Queued means wait,
+    not fail" and "Pacing" sections).
+
+    `on_progress`, if given, is called synchronously with a structured event
+    dict as pacing/backpressure/queued-wait activity happens DURING the run --
+    not only reflected in the final manifest. A caller's callback raising is NOT
+    caught here: a broken callback is the caller's own bug and must fail loud,
+    same as this project's convention for every other genuine-bug case
+    (CONTRIBUTING.md) -- it is never silently swallowed just because it happens
+    to be attached to an optional diagnostics hook.
+
+    The `queued_*` counters are cumulative diagnostics `_resolve_queued` writes
+    into, surfaced verbatim in `manifest["pacing"]` at the end of the run.
+    """
+
+    pacer: _CdpPacer
+    poll_interval_s: float
+    poll_max_wait_s: float
+    on_progress: Callable[[dict[str, Any]], None] | None = None
+    queued_waits: int = 0
+    queued_wait_total_s: float = 0.0
+    queued_timeouts: int = 0
+
+    def emit(self, event: dict[str, Any]) -> None:
+        if self.on_progress is not None:
+            self.on_progress(event)
+
+
+class _CdpPacer:
+    """Backpressure for CDP-requiring per-tab captures only (`mhtml`,
+    `nav_history`, and `screenshot` when using `capture_hidden`) -- see module
+    docstring's "Pacing" section for why these three, and only these three, are
+    implicated by the real-world incident this closes.
+
+    Two independent guards, both applied before every CDP dispatch:
+
+    1. A floor on the interval since the previous CDP dispatch
+       (`min_interval_s`) -- enforced unconditionally, so a large archive can
+       never fire CDP-heavy commands back-to-back with zero gap, regardless of
+       what the device's last-reported tier says (tier only updates on the
+       device's own heartbeat/hello, so it can lag real-time degradation by
+       seconds).
+    2. A live tier check (`client.list_devices()` -- a cheap, hub-local call;
+       no device round trip) immediately before dispatch. If the device has
+       already fallen off `live`, this waits (bounded exponential backoff, cap
+       `max_wait_s`) for it to recover before allowing the dispatch to proceed,
+       instead of adding yet another command to a device that has already
+       shown it cannot keep up.
+
+    Advisory, never a correctness gate: if the wait budget is exhausted, or the
+    `list_devices()` check itself fails (`HubError`), dispatch proceeds anyway
+    -- `_resolve_queued` is what guarantees a correct eventual outcome
+    regardless of whether this budget was enough.
+    """
+
+    def __init__(self, *, min_interval_s: float, max_wait_s: float) -> None:
+        self._min_interval_s = max(0.0, min_interval_s)
+        self._max_wait_s = max(0.0, max_wait_s)
+        self._last_dispatch_at: float | None = None
+        # Cumulative diagnostics -- surfaced in `manifest["pacing"]`, never
+        # load-bearing for correctness.
+        self.tier_checks: int = 0
+        self.backpressure_events: int = 0
+        self.total_paused_s: float = 0.0
+
+    async def before_dispatch(
+        self,
+        client: _ArchiveClient,
+        device_id: str,
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> None:
+        if self._last_dispatch_at is not None and self._min_interval_s > 0:
+            remaining = self._min_interval_s - (time.monotonic() - self._last_dispatch_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        await self._wait_for_recovery(client, device_id, on_event=on_event)
+        self._last_dispatch_at = time.monotonic()
+
+    async def _wait_for_recovery(
+        self, client: _ArchiveClient, device_id: str, *, on_event: Callable[[dict[str, Any]], None]
+    ) -> None:
+        if self._max_wait_s <= 0:
+            return
+        deadline = time.monotonic() + self._max_wait_s
+        backoff = max(self._min_interval_s, 0.5)
+        announced = False
+        while True:
+            self.tier_checks += 1
+            try:
+                devices = await client.list_devices()
+            except HubError:
+                return  # advisory only -- never block correctness on this check
+            record = next((d for d in devices if d.get("device_id") == device_id), None)
+            tier = (record or {}).get("tier", "live")
+            if tier == "live":
+                if announced:
+                    on_event({"event": "backpressure_resumed", "device_id": device_id})
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if not announced:
+                announced = True
+                self.backpressure_events += 1
+                on_event({"event": "backpressure_waiting", "device_id": device_id, "tier": tier})
+            wait_s = min(backoff, remaining)
+            self.total_paused_s += wait_s
+            await asyncio.sleep(wait_s)
+            backoff = min(backoff * 2, self._max_wait_s)
+
+
+async def _resolve_queued(
+    client: _ArchiveClient,
+    device_id: str,
+    result: Any,
+    *,
+    command: str,
+    support: _RunSupport,
+) -> Any:
+    """Follows a `{"status": "queued", ...}` response with `client.poll()` until
+    it resolves to a real terminal result, or gives up after `poll_max_wait_s`
+    and returns an honest failure -- see module docstring's "Queued means wait,
+    not fail" section. Passes any non-queued `result` through UNCHANGED (the
+    overwhelmingly common case: a `live` device's immediate response).
+
+    Never hangs indefinitely: `poll_max_wait_s` is a hard budget on THIS ONE
+    command's wait, checked before every poll. A queued response missing
+    `command_id` (a protocol violation) cannot be polled at all and is returned
+    unresolved -- `_command_outcome`'s defensive fallback reports that honestly.
+    """
+    if not isinstance(result, dict) or result.get("status") != "queued":
+        return result
+    command_id = result.get("command_id")
+    if not isinstance(command_id, str) or not command_id:
+        return result
+    started = time.monotonic()
+    deadline = started + support.poll_max_wait_s
+    tier = result.get("tier", "unknown")
+    support.queued_waits += 1
+    support.emit(
+        {
+            "event": "queued_wait_started",
+            "device_id": device_id,
+            "command": command,
+            "command_id": command_id,
+            "tier": tier,
+        }
+    )
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            waited_s = time.monotonic() - started
+            support.queued_timeouts += 1
+            support.queued_wait_total_s += waited_s
+            support.emit(
+                {
+                    "event": "queued_wait_gave_up",
+                    "device_id": device_id,
+                    "command": command,
+                    "command_id": command_id,
+                    "waited_s": waited_s,
+                }
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"gave up waiting for queued command {command_id!r} ({command!r}) to resolve "
+                    f"after {support.poll_max_wait_s:.0f}s (device tier last observed: {tier!r}). The "
+                    "device may still complete this command later -- this archive treats an "
+                    "unresolved wait as a failure rather than hanging indefinitely. Raise "
+                    "poll_max_wait_s to wait longer."
+                ),
+            }
+        await asyncio.sleep(min(support.poll_interval_s, remaining))
+        try:
+            polled = await client.poll(device_id, command_id)
+        except HubError as e:
+            support.queued_wait_total_s += time.monotonic() - started
+            return {"ok": False, "error": str(e)}
+        if not isinstance(polled, dict):
+            support.queued_wait_total_s += time.monotonic() - started
+            return {"ok": False, "error": f"unexpected poll response: {polled!r}"}
+        status = polled.get("status")
+        if status in ("queued", "pending"):
+            tier = polled.get("tier", tier)
+            continue
+        waited_s = time.monotonic() - started
+        support.queued_wait_total_s += waited_s
+        support.emit(
+            {
+                "event": "queued_wait_resolved",
+                "device_id": device_id,
+                "command": command,
+                "command_id": command_id,
+                "waited_s": waited_s,
+                "ok": polled.get("ok"),
+            }
+        )
+        return polled
+
+
 async def _safe_command(
-    client: _ArchiveClient, target: Target, command: str, args: dict[str, Any]
+    client: _ArchiveClient,
+    target: Target,
+    command: str,
+    args: dict[str, Any],
+    support: _RunSupport,
+    *,
+    is_cdp: bool = False,
 ) -> dict[str, Any]:
     """The single choke point every per-capture/per-profile-item `client.command()`
     call in this module goes through, so a TRANSPORT-level failure (`HubError` --
     e.g. a connection refused, a timeout, or a device/hub/client rejecting an
     oversized message -- see client.py's/hub.py's/protocol.py's "WebSocket
     message-size ceiling" section) becomes an ordinary `{"ok": False, "error":
-    ...}` result instead of an exception.
+    ...}` result instead of an exception, and a queued response is followed to
+    its eventual real result rather than treated as a failure (module
+    docstring's "Queued means wait, not fail" section).
 
     Real-world finding: `client.command()` previously raised `HubError` straight
     out of `_capture_tab`/`_capture_profile`/`run_archive`'s own top-level
@@ -356,11 +691,20 @@ async def _safe_command(
     documented to raise for a connection-level failure) is caught here -- any
     other exception is a genuine bug and must keep propagating loudly, per this
     project's fail-loud convention (CONTRIBUTING.md).
+
+    `is_cdp`, if True, routes this dispatch through `support.pacer` first (see
+    module docstring's "Pacing" section) -- set by the caller for `mhtml`,
+    `nav_history`, and `screenshot` when it is using `capture_hidden`; every
+    other command (JS-injection captures, browser-wide profile-data commands,
+    the top-level `windows`/`tabs` inventory) is never paced.
     """
+    if is_cdp:
+        await support.pacer.before_dispatch(client, target.device_id, on_event=support.emit)
     try:
-        return await client.command(target, command, args)
+        result = await client.command(target, command, args)
     except HubError as e:
         return {"ok": False, "error": str(e)}
+    return await _resolve_queued(client, target.device_id, result, command=command, support=support)
 
 
 def _inventoried_count(entry: dict[str, Any]) -> int | None:
@@ -606,6 +950,7 @@ async def _capture_tab(
     injection_timeout_s: float | None,
     captures: frozenset[str] | None,
     failures: list[dict[str, Any]],
+    support: _RunSupport,
 ) -> dict[str, Any]:
     tab_id = tab.get("tab_id")
     entry: dict[str, Any] = {
@@ -655,14 +1000,14 @@ async def _capture_tab(
             read_args = {**injection_args}
             if all_frames:
                 read_args["all_frames"] = True
-            result = await _safe_command(client, target, "read", read_args)
+            result = await _safe_command(client, target, "read", read_args, support)
             record("text", _record_read_capture(tab_dir, result))
         else:
             record("text", _capture_skipped_by_config("text"))
 
     if depth_idx >= _DEPTH_INDEX["L2"]:
         if allowed("dom"):
-            result = await _safe_command(client, target, "page_state", dict(injection_args))
+            result = await _safe_command(client, target, "page_state", dict(injection_args), support)
             record("dom", _record_page_state_capture(tab_dir, result))
         else:
             record("dom", _capture_skipped_by_config("dom"))
@@ -672,21 +1017,25 @@ async def _capture_tab(
             screenshot_args = {**base_args}
             if use_capture_hidden:
                 screenshot_args["capture_hidden"] = True
-            result = await _safe_command(client, target, "screenshot", screenshot_args)
+            # `screenshot` is CDP-based only when it carries `capture_hidden` --
+            # see module docstring's "Pacing" section and `_CdpPacer`.
+            result = await _safe_command(
+                client, target, "screenshot", screenshot_args, support, is_cdp=use_capture_hidden
+            )
             record("screenshot", _record_screenshot_capture(tab_dir, result))
         else:
             record("screenshot", _capture_skipped_by_config("screenshot"))
 
     if depth_idx >= _DEPTH_INDEX["L4"]:
         if allowed("mhtml"):
-            result = await _safe_command(client, target, "mhtml", dict(base_args))
+            result = await _safe_command(client, target, "mhtml", dict(base_args), support, is_cdp=True)
             record("mhtml", _record_mhtml_capture(tab_dir, result))
         else:
             record("mhtml", _capture_skipped_by_config("mhtml"))
 
     if depth_idx >= _DEPTH_INDEX["L5"]:
         if allowed("nav_history"):
-            result = await _safe_command(client, target, "nav_history", dict(base_args))
+            result = await _safe_command(client, target, "nav_history", dict(base_args), support, is_cdp=True)
             record("nav_history", _record_json_capture(tab_dir, "nav_history.json", result))
         else:
             record("nav_history", _capture_skipped_by_config("nav_history"))
@@ -714,20 +1063,21 @@ async def _capture_profile(
     *,
     include_cookies: bool,
     failures: list[dict[str, Any]],
+    support: _RunSupport,
 ) -> dict[str, Any]:
     profile_dir = archive_dir / "profile"
     target = Target(device_id=device_id)
     profile: dict[str, Any] = {}
 
     for key, command, filename, count_of in _PROFILE_SPECS:
-        result = await _safe_command(client, target, command, {})
+        result = await _safe_command(client, target, command, {}, support)
         capture_entry = _record_json_capture(profile_dir, filename, result, count_of=count_of)
         profile[key] = capture_entry
         if capture_entry.get("status") != "ok":
             failures.append({"scope": "profile", "item": key, "error": capture_entry.get("error")})
 
     if include_cookies:
-        result = await _safe_command(client, target, "cookies_list", {})
+        result = await _safe_command(client, target, "cookies_list", {}, support)
         capture_entry = _record_json_capture(profile_dir, "cookies.json", result, count_of="entries")
         profile["cookies"] = capture_entry
         if capture_entry.get("status") != "ok":
@@ -757,6 +1107,11 @@ async def run_archive(
     timeout_s: float | None = None,
     injection_timeout_s: float | None = None,
     captures: list[str] | None = None,
+    cdp_pace_s: float = DEFAULT_CDP_PACE_S,
+    cdp_backpressure_max_wait_s: float = DEFAULT_CDP_BACKPRESSURE_MAX_WAIT_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    poll_max_wait_s: float = DEFAULT_POLL_MAX_WAIT_S,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Capture `device_id`'s browser state at `depth` (see module docstring's depth
     ladder), writing every payload under a fresh timestamped directory inside
@@ -814,6 +1169,32 @@ async def run_archive(
     ordinary per-tab/profile-data capture failure; those are recorded in the
     returned manifest (`manifest["failures"]`, `manifest["status"]`) and the
     run continues.
+
+    `cdp_pace_s`/`cdp_backpressure_max_wait_s` and `poll_interval_s`/
+    `poll_max_wait_s` are the pacing/queued-resolution knobs from module
+    docstring's "Pacing" and "Queued means wait, not fail" sections:
+
+        - `cdp_pace_s`: floor on the interval between successive CDP-requiring
+          dispatches (`mhtml`, `nav_history`, `screenshot` with
+          `capture_hidden`) -- 0 disables the floor entirely (still subject to
+          the tier-check backpressure below unless `cdp_backpressure_max_wait_s`
+          is also 0).
+        - `cdp_backpressure_max_wait_s`: cap on how long a CDP dispatch will
+          wait (bounded exponential backoff) for a device that has fallen off
+          `live` to recover before proceeding anyway -- 0 disables tier
+          checking entirely, leaving only the `cdp_pace_s` floor.
+        - `poll_interval_s`/`poll_max_wait_s`: how often, and for how long in
+          total, a single queued command is polled before this archive gives
+          up on it and records a failure -- never an unbounded/silent hang.
+
+    `on_progress`, if given, is called synchronously with a structured event
+    dict (`{"event": ..., ...}`) as the run progresses -- per-tab completion,
+    pacing/backpressure pauses, and queued-command waits -- rather than only
+    reflected in the manifest once the whole run finishes. A raised exception
+    from the callback itself is NOT caught (a broken callback is a caller
+    bug, per this project's fail-loud convention). The same activity is also
+    summarized, cumulatively, in the returned `manifest["pacing"]` for a
+    caller that only inspects the manifest after the fact.
     """
     depth_idx = _depth_index(depth)
     captures_set = _validate_captures(captures, depth=depth, depth_idx=depth_idx)
@@ -855,8 +1236,14 @@ async def run_archive(
     }
 
     device_target = Target(device_id=device_id)
+    support = _RunSupport(
+        pacer=_CdpPacer(min_interval_s=cdp_pace_s, max_wait_s=cdp_backpressure_max_wait_s),
+        poll_interval_s=poll_interval_s,
+        poll_max_wait_s=poll_max_wait_s,
+        on_progress=on_progress,
+    )
 
-    windows_result = await _safe_command(client, device_target, "windows", {})
+    windows_result = await _safe_command(client, device_target, "windows", {}, support)
     ok, windows_data, error = _command_outcome(windows_result)
     if ok and isinstance(windows_data, dict):
         windows_path = archive_dir / "windows.json"
@@ -878,7 +1265,7 @@ async def run_archive(
         manifest["tab_groups"] = _capture_failed(windows_error or "unknown error")
         failures.append({"scope": "windows", "error": windows_error})
 
-    tabs_result = await _safe_command(client, device_target, "tabs", {})
+    tabs_result = await _safe_command(client, device_target, "tabs", {}, support)
     ok, tab_list, error = _command_outcome(tabs_result)
     if ok and isinstance(tab_list, list):
         tabs_path = archive_dir / "tabs.json"
@@ -926,6 +1313,16 @@ async def run_archive(
                 injection_timeout_s=injection_timeout_s,
                 captures=captures_set,
                 failures=failures,
+                support=support,
+            )
+            support.emit(
+                {
+                    "event": "tab_done",
+                    "tab_id": tab_id,
+                    "status": tab_manifest[str(tab_id)].get("status"),
+                    "tabs_done": len(tab_manifest),
+                    "tabs_total": len(selected_tabs),
+                }
             )
     # A requested tab_id that vanished (closed) between inventory and capture --
     # or simply never existed at all -- is NEVER just absent; see module
@@ -949,7 +1346,12 @@ async def run_archive(
     profile_result: dict[str, Any] | None
     if depth_idx >= _DEPTH_INDEX["L5"]:
         profile_result = await _capture_profile(
-            client, device_id, archive_dir, include_cookies=include_cookies, failures=failures
+            client,
+            device_id,
+            archive_dir,
+            include_cookies=include_cookies,
+            failures=failures,
+            support=support,
         )
     else:
         profile_result = None
@@ -1019,7 +1421,28 @@ async def run_archive(
     else:
         manifest["status"] = "ok"
 
+    # Pacing/backpressure/queued-wait diagnostics for this run -- see module
+    # docstring's "Pacing" and "Queued means wait, not fail" sections. Purely
+    # observational: never consulted by any correctness decision above, only
+    # surfaced so an operator reading the manifest after the fact (or an
+    # `on_progress` consumer, live) can tell whether this run had to slow down
+    # for the device, and whether any capture had to wait on a queued command.
+    manifest["pacing"] = {
+        "cdp_pace_s": cdp_pace_s,
+        "cdp_backpressure_max_wait_s": cdp_backpressure_max_wait_s,
+        "cdp_tier_checks": support.pacer.tier_checks,
+        "cdp_backpressure_events": support.pacer.backpressure_events,
+        "cdp_backpressure_paused_s": round(support.pacer.total_paused_s, 3),
+        "poll_interval_s": poll_interval_s,
+        "poll_max_wait_s": poll_max_wait_s,
+        "queued_waits": support.queued_waits,
+        "queued_wait_total_s": round(support.queued_wait_total_s, 3),
+        "queued_timeouts": support.queued_timeouts,
+    }
+
     manifest_path = archive_dir / "manifest.json"
     _write_json(manifest_path, manifest)
+
+    support.emit({"event": "archive_finished", "status": manifest["status"], "archive_dir": str(archive_dir)})
 
     return {"ok": True, "result": manifest}
