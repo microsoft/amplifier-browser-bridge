@@ -380,6 +380,16 @@ itself. A converted page can be many KB of markdown; returning it as this
 tool's return value would recreate the exact context-truncation failure
 `browser_archive` itself exists to avoid.
 
+**Requires the optional `convert` extra -- lazily, never at load time**:
+`trafilatura`/`html2text` (and `lxml`, arriving transitively through
+trafilatura) are declared only in this repo's optional `convert` extra
+(`pip install 'amplifier-browser-bridge[convert]'`), so the core lib/CLI and
+every OTHER tool in this module stay lean. Every browser-bridge tool --
+including this one -- loads and registers successfully regardless of whether
+that extra is installed; only actually calling `browser_archive_convert`
+without it installed fails, loudly, naming the exact remediation (never a
+bare `ModuleNotFoundError` that gives no indication what to do next).
+
 ## Browser-state archive: tab cataloging
 
 `browser_archive_catalog` is the ONE agent-facing tool for cataloging an existing

@@ -1588,6 +1588,14 @@ moving `manifest["status"]` to `"ok_with_skips"`) rather than being silently abs
 `manifest["tabs"]` -- the same discipline `run_archive`'s own `"not_found"` per-tab state applies
 to a vanished `tab_id` (see above).
 
+`html2text`/`trafilatura`/`lxml` are imported LAZILY inside `mhtml_convert.py`'s conversion
+functions, never at module import time (`pyproject.toml`'s optional `convert` extra keeps the
+core lib/CLI lean). Every browser-bridge tool, including `browser_archive_convert` itself, still
+loads and registers with zero optional deps installed; only actually invoking the conversion path
+without the extra installed raises `ImportError` naming the exact fix
+(`pip install 'amplifier-browser-bridge[convert]'`) -- never a bare, unexplained
+`ModuleNotFoundError`.
+
 ## Browser-state archive: tab cataloging (composed, not a wire command)
 
 Like MHTML-to-markdown conversion (above), cataloging an archive's tabs --

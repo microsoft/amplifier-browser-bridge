@@ -333,9 +333,13 @@ def test_convert_mhtml_records_empty_status_when_extraction_finds_nothing(
     is third-party behavior this test does not need to (and should not try
     to) re-verify; every other test in this file uses the real pipeline
     end-to-end."""
-    import amplifier_browser_bridge.mhtml_convert as mod
+    import trafilatura
 
-    monkeypatch.setattr(mod.trafilatura, "extract", lambda *a, **k: None)
+    # `trafilatura` is imported lazily now (see mhtml_convert.py's "Optional
+    # dependency" section) -- patching the real, cached module object in
+    # sys.modules still reaches convert_mhtml's lazy `_import_or_raise` call,
+    # since both resolve to the same singleton module.
+    monkeypatch.setattr(trafilatura, "extract", lambda *a, **k: None)
     mhtml_bytes = _build_mhtml(html=_ARTICLE_HTML)
     assets_dir, markdown_dir = _fixture_dirs(tmp_path)
 
