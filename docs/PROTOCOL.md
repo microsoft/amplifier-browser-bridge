@@ -1582,6 +1582,73 @@ counts (`device_health_signals`, `device_health_trips`, `device_health_recoverie
 `burst_cooldown` events. See `archive.py`'s module docstring ("Device health: recovering
 from a real disconnect, not just a slow one") for the full design.
 
+#### Chunking: keeping the device under its drop threshold, proactively
+
+Two clean eval data points (same physical device/tabs, CDP-only L4 --
+`mhtml`+`screenshot`+`nav_history` -- current `cdp_burst_size`/`cdp_burst_cooldown_s`
+defaults) made the failure above LOAD-DEPENDENT, not merely time-dependent or random:
+
+```
+12 tabs:  rate 0.75,  0 health_trips,  48s   -- device not stressed at small N
+28 tabs:  rate 0.571, 5 health_trips, 295s   -- device overwhelmed: 6x duration,
+                                                rate collapsed recovering drops
+                                                that should never have happened
+```
+
+`cdp_burst_size`/`cdp_burst_cooldown_s` is real but WEAKER than this finding calls for: it
+pauses every `cdp_burst_size` (default 25) dispatches WITHIN one continuous loop, and never
+confirms the device is actually healthy before resuming -- a breather, not a checkpoint. 25
+is also far above the drop threshold these two data points bracket (fine at 12, overwhelmed
+at 28): a burst cooldown at the default size never engages at all before a run of this size
+is already in the failure zone.
+
+`cdp_chunk_size` is the PROACTIVE fix: `run_archive`'s per-tab capture loop (L1+) splits the
+selected tab list into sequential sub-batches of at most `cdp_chunk_size` tabs, processing
+one chunk to completion before the next starts. Between chunks (never within one), the
+archive inserts a settle:
+
+- **`cdp_chunk_cooldown_s`** (default 5s): an unconditional pause -- the same "give the
+  device a fixed breather" rationale as `cdp_burst_cooldown_s`, but a coarser,
+  between-WHOLE-CHUNKS unit rather than a within-loop one.
+- A bounded tier-confirmation wait that the device reads `live` again, reusing the exact
+  same `client.list_devices()` tier-check path the reactive recovery above already uses (no
+  new device-health mechanism, just a new checkpoint). The wait budget is
+  `device_recovery_max_wait_s` itself -- the SAME budget the reactive mid-chunk recovery
+  uses -- so there is no separate knob to tune for this.
+
+Unlike every other wait in this protocol's pacing model, this ONE is not merely advisory: if
+the device never confirms `live` again within that budget, the archive does not dispatch the
+remaining chunks at all. Every tab in every not-yet-started chunk gets an honest `"failed"`
+entry in `manifest["tabs"]` (added to `manifest["failures"]` like any other real failure) --
+never a silent drop, never a hang, and never a one-by-one cascade through tabs that were
+never going to succeed anyway. A device-health trip and recovery INSIDE a single chunk is
+unaffected by chunking and handled exactly as described above -- chunking composes with that
+reactive machinery rather than replacing it.
+
+`cdp_chunk_size<=0` (or `None`, default `8`) disables chunking entirely -- the whole tab list
+becomes a single chunk, so the capture loop is byte-for-byte the pre-chunking single
+continuous loop (no settle ever runs). The same holds, with zero code path difference,
+whenever the run's own tab count is already `<= cdp_chunk_size`: a small run is exactly one
+chunk and behaves exactly as it did before this feature existed.
+
+**Chosen defaults**: the two eval data points bracket the drop threshold between 12 (safe)
+and 28 (overwhelmed) tabs of continuous CDP dispatch. `cdp_chunk_size=8` keeps every chunk
+comfortably below even the safe end of that bracket -- a real margin, not just barely under
+the line -- while still splitting a 28-tab run into a modest ~4 chunks, so the fix does not
+itself dominate wall-clock time on a large run. `cdp_chunk_cooldown_s=5.0` reuses
+`cdp_burst_cooldown_s`'s own default for the same rationale, as an independently tunable
+knob. `manifest["pacing"]` reports both configured values alongside cumulative counts
+(`chunks_total`, `chunks_completed`, `chunk_settle_waits`, `chunk_settle_wait_total_s`,
+`chunk_settle_gave_up`); `on_progress` also receives live `chunk_completed`/
+`chunk_settle_recovered`/`chunk_settle_gave_up` events. See `archive.py`'s module docstring
+("Chunking: keeping the device under its drop threshold in the first place") for the full
+design.
+
+These two data points make the failure load-dependent and this fix mechanically sound; they
+do not, by themselves, prove a specific improved capture rate on a real device -- that
+requires a live eval run of the same 28-tab scenario with chunking engaged, measured the
+same way the two baseline numbers above were.
+
 ## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
 
 Like the archive capability itself, converting a captured page's MHTML into markdown --

@@ -26,9 +26,12 @@ from amplifier_browser_bridge.archive import (
     _CDP_PACED_COMMANDS,
     DEFAULT_CDP_BURST_COOLDOWN_S,
     DEFAULT_CDP_BURST_SIZE,
+    DEFAULT_CDP_CHUNK_COOLDOWN_S,
+    DEFAULT_CDP_CHUNK_SIZE,
     DEFAULT_DEVICE_HEALTH_TRIP_THRESHOLD,
     DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S,
     ArchiveError,
+    _chunk_tabs,
     _is_device_health_error,
     run_archive,
 )
@@ -1872,3 +1875,423 @@ async def test_small_healthy_run_is_unaffected_by_device_health_defaults(tmp_pat
     assert pacing["device_health_recoveries"] == 0
     assert pacing["cdp_burst_cooldowns"] == 0
     assert pacing["cdp_slowdown_multiplier"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Chunking -- see module docstring's "Chunking: keeping the device under its
+# drop threshold in the first place" section. Two measured eval data points
+# (same device/tabs, CDP-only L4, current cdp_burst_size/cooldown defaults):
+#
+#   12 tabs:  rate 0.75,  0 health_trips,  48s   -- device not stressed
+#   28 tabs:  rate 0.571, 5 health_trips, 295s   -- device overwhelmed
+#
+# The failure is LOAD-DEPENDENT: dispatching ~28 CDP captures back-to-back
+# drives the device past its drop threshold. `cdp_chunk_size` proactively
+# keeps every burst well below that threshold by splitting a large tab_ids
+# list into sequential sub-batches with a real settle (cooldown + tier
+# confirmation) between them -- never within one.
+#
+# No live browser is exercised in any of these tests -- only the same
+# duck-typed `FakeArchiveClient` used throughout this file.
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_tabs_splits_into_expected_number_of_chunks() -> None:
+    """Unit-level proof of `_chunk_tabs`'s own splitting arithmetic, isolated
+    from the async run_archive machinery: 28 tabs at chunk_size 8 must split
+    into exactly 4 chunks (8, 8, 8, 4), matching the task's own 28-tab eval
+    scenario."""
+    tabs = [_tab(100 + i) for i in range(28)]
+    chunks = _chunk_tabs(tabs, 8)
+    assert len(chunks) == 4
+    assert [len(c) for c in chunks] == [8, 8, 8, 4]
+    # Every original tab appears in exactly one chunk, in order -- chunking
+    # must never drop, duplicate, or reorder a tab.
+    assert [t["tab_id"] for chunk in chunks for t in chunk] == [t["tab_id"] for t in tabs]
+
+
+def test_chunk_tabs_disabled_by_zero_or_none_is_a_single_chunk() -> None:
+    """`chunk_size<=0` or `None` must disable chunking entirely -- the whole
+    list becomes ONE chunk, matching this module's established "0/None
+    disables" convention."""
+    tabs = [_tab(100 + i) for i in range(28)]
+    assert _chunk_tabs(tabs, 0) == [tabs]
+    assert _chunk_tabs(tabs, -1) == [tabs]
+    assert _chunk_tabs(tabs, None) == [tabs]
+
+
+def test_chunk_tabs_empty_list_is_zero_chunks() -> None:
+    """An empty tab list produces zero chunks regardless of chunk_size, so
+    callers can iterate the result unconditionally."""
+    assert _chunk_tabs([], 8) == []
+    assert _chunk_tabs([], None) == []
+
+
+@pytest.mark.asyncio
+async def test_large_run_splits_into_chunks_with_settle_between_not_within(tmp_path: Path) -> None:
+    """THE load-bearing mechanism test: a 12-tab run (matching the task's own
+    "did fine at 12" data point) with cdp_chunk_size=4 must split into exactly
+    3 chunks, and a settle (cooldown + tier confirmation) must occur BETWEEN
+    chunks (2 settles for 3 chunks) and NEVER within one -- proven by counting
+    `list_devices()` calls attributable to the settle (a healthy device with
+    `cdp_backpressure_max_wait_s=0` makes no OTHER tier-check calls once pacing
+    itself is otherwise disabled)."""
+    tabs = [_tab(100 + i) for i in range(12)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    events: list[dict[str, Any]] = []
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=4,
+        cdp_chunk_cooldown_s=0.0,
+        device_recovery_max_wait_s=1.0,
+        on_progress=events.append,
+    )
+    manifest = result["result"]
+
+    assert manifest["status"] == "ok"
+    for i in range(12):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 3
+    assert pacing["chunks_completed"] == 3
+    assert pacing["chunk_settle_waits"] == 2  # between 3 chunks -- never after the last
+    assert pacing["chunk_settle_gave_up"] is False
+
+    # Every chunk boundary emitted a "chunk_completed" event followed by a
+    # settle-recovered event -- never a "chunk_completed" for the last chunk
+    # (there is nothing to settle before -- there is no next chunk).
+    chunk_completed_events = [e for e in events if e["event"] == "chunk_completed"]
+    settle_recovered_events = [e for e in events if e["event"] == "chunk_settle_recovered"]
+    assert len(chunk_completed_events) == 2
+    assert len(settle_recovered_events) == 2
+    assert [e["chunk_index"] for e in chunk_completed_events] == [0, 1]
+
+    # The settle's tier-confirmation reuses `_CdpPacer`'s own tier-check path
+    # (`pacing["cdp_tier_checks"]`, incremented only by the pacer itself --
+    # NOT by run_archive's own one-time initial device lookup). A healthy
+    # device confirms live on the FIRST check every time (no backoff looping
+    # needed), so exactly one tier check per settle: 2 settles -> 2 checks --
+    # never within a chunk (backpressure/burst are both disabled here, so
+    # these two are attributable to chunking alone).
+    assert pacing["cdp_tier_checks"] == 2
+    # The one-time device lookup at the top of run_archive is a plain
+    # `list_devices()` call outside the pacer entirely -- so the raw call
+    # count is the pacer's tier checks PLUS that one.
+    assert client.list_devices_calls == pacing["cdp_tier_checks"] + 1
+
+
+@pytest.mark.asyncio
+async def test_non_live_tier_at_chunk_boundary_waits_then_proceeds_once_live(tmp_path: Path) -> None:
+    """If the fake device reports a non-live tier right at a chunk boundary,
+    the run must WAIT (bounded) rather than proceed immediately, and only
+    dispatch the next chunk once tier reads live again -- the settle is a
+    real gate, not a no-op. Only ONE list_devices() call happens outside the
+    settle (run_archive's own one-time initial device lookup) -- everything
+    after that is either per-tab dispatch (unpaced here: backpressure/burst
+    are both disabled) or the settle's own tier-check loop, so the tier
+    sequence below is consumed 1 (initial) + N (settle checks)."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    tabs = [_tab(100 + i) for i in range(6)]  # 2 chunks of 3
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True}, devices=_devices)
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=3,
+        cdp_chunk_cooldown_s=0.0,
+        device_recovery_max_wait_s=5.0,
+    )
+    manifest = result["result"]
+
+    # Every tab in both chunks still captured successfully -- the settle
+    # waited for recovery rather than giving up or proceeding blindly.
+    for i in range(6):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 2
+    assert pacing["chunks_completed"] == 2
+    assert pacing["chunk_settle_gave_up"] is False
+    # The settle had to poll more than once (tier was "intermittent" for a
+    # stretch: the 2nd and 3rd scripted tier values) before confirming live
+    # (the 4th) -- proof this was a real bounded wait, not an instant
+    # pass-through. `cdp_tier_checks` is the pacer's OWN counter (excludes
+    # run_archive's one-time initial device lookup, which is a plain
+    # `list_devices()` call outside the pacer).
+    assert pacing["cdp_tier_checks"] >= 2
+    assert client.list_devices_calls == pacing["cdp_tier_checks"] + 1
+
+
+@pytest.mark.asyncio
+async def test_chunk_settle_gives_up_and_records_remaining_tabs_as_honest_failures(
+    tmp_path: Path,
+) -> None:
+    """If the device NEVER recovers within device_recovery_max_wait_s, the run
+    must not hang, must not silently drop the remaining tabs, and must not
+    cascade one-by-one failures through them either: every tab in every
+    not-yet-started chunk gets ONE honest 'failed' entry, and the run stops
+    dispatching further chunks entirely."""
+    tabs = [_tab(100 + i) for i in range(9)]  # 3 chunks of 3
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=lambda: [{**_device_record(debugger=True), "tier": "dormant"}],
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=3,
+        cdp_chunk_cooldown_s=0.01,
+        device_recovery_max_wait_s=0.3,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 10.0  # bounded -- never hangs waiting for a device that never recovers
+    manifest = result["result"]
+
+    # First chunk (tabs 100-102) captured normally -- the device was live for it.
+    for i in range(3):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+
+    # Every tab in every LATER chunk (103-108) is an honest, distinct failure --
+    # never silently dropped, never absent from the manifest.
+    for i in range(3, 9):
+        tab_id = str(100 + i)
+        assert manifest["tabs"][tab_id]["status"] == "failed"
+        assert "did not confirm" in manifest["tabs"][tab_id]["reason"]
+
+    # Real per-tab failure entries, one per aborted tab -- never a silent drop.
+    tab_failure_ids = {f["tab_id"] for f in manifest["failures"] if f["scope"] == "tab"}
+    assert tab_failure_ids == {103, 104, 105, 106, 107, 108}
+
+    assert manifest["status"] == "ok_with_failures"
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 3
+    assert pacing["chunks_completed"] == 1  # only the first chunk ever finished
+    assert pacing["chunk_settle_gave_up"] is True
+    assert pacing["chunk_settle_waits"] == 1  # stopped after the FIRST failed settle
+
+    # Summary accounting must stay honest: 3 captured, 6 failed, 9 attempted total.
+    assert manifest["summary"]["tabs_captured"] == 3
+    assert manifest["summary"]["tabs_failed"] == 6
+    assert manifest["summary"]["tabs_capture_attempted"] == 9
+
+
+@pytest.mark.asyncio
+async def test_chunking_composes_with_mid_chunk_device_recovery(tmp_path: Path) -> None:
+    """Chunking must COMPOSE with the existing reactive mid-chunk recovery,
+    not fight it: a device-health-signature drop INSIDE a chunk still
+    recovers via the pre-existing `_CdpPacer` escalation, and the run still
+    proceeds through the chunk boundary settle to the next chunk normally."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live", "live", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    # 6 tabs, chunk_size=4 -> chunks = [[101,102,103,104], [105,106]]. The
+    # device-health drop/recovery happens INSIDE chunk 1 (tabs 101/102 fail,
+    # 103/104 succeed once recovered) -- proving chunking doesn't interfere
+    # with the reactive escalation. Chunk 2 (105/106) then succeeds normally
+    # after an ordinary (already-live) settle.
+    tabs = [_tab(101), _tab(102), _tab(103), _tab(104), _tab(105), _tab(106)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=_devices,
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": "Detached while handling command."},
+                {"ok": False, "error": "Detached while handling command."},
+                {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "D"}},
+                {"ok": True, "result": {"tab_id": 104, "format": "mhtml", "bytes": 5, "data": "D"}},
+                {"ok": True, "result": {"tab_id": 105, "format": "mhtml", "bytes": 5, "data": "D"}},
+                {"ok": True, "result": {"tab_id": 106, "format": "mhtml", "bytes": 5, "data": "D"}},
+            ]
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+        cdp_chunk_size=4,
+        cdp_chunk_cooldown_s=0.0,
+    )
+    manifest = result["result"]
+
+    # Mid-chunk reactive recovery is unaffected: the two tabs during the trip
+    # window keep their honest failure, the two after recovery succeed --
+    # exactly the pre-existing device-health-recovery behavior.
+    assert manifest["tabs"]["101"]["status"] == "failed"
+    assert manifest["tabs"]["102"]["status"] == "failed"
+    assert manifest["tabs"]["103"]["status"] == "ok"
+    assert manifest["tabs"]["104"]["status"] == "ok"
+
+    # The chunk boundary settle (between chunk 1 and chunk 2) then succeeds
+    # normally (device already live by then), and chunk 2 captures fine.
+    assert manifest["tabs"]["105"]["status"] == "ok"
+    assert manifest["tabs"]["106"]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 2
+    assert pacing["chunks_completed"] == 2
+    assert pacing["chunk_settle_gave_up"] is False
+    assert pacing["device_health_trips"] == 1
+    assert pacing["device_health_recoveries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cdp_chunk_size_zero_disables_chunking(tmp_path: Path) -> None:
+    """`cdp_chunk_size=0` must disable chunking entirely: the whole tab_ids
+    list is processed as a single continuous loop, exactly the pre-chunking
+    behavior -- one chunk, zero settles, regardless of how large the run is."""
+    tabs = [_tab(100 + i) for i in range(20)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=0,
+    )
+    manifest = result["result"]
+    assert manifest["summary"]["tabs_captured"] == 20
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 1
+    assert pacing["chunks_completed"] == 1
+    assert pacing["chunk_settle_waits"] == 0
+    assert pacing["chunk_settle_gave_up"] is False
+
+
+@pytest.mark.asyncio
+async def test_cdp_chunk_size_none_disables_chunking(tmp_path: Path) -> None:
+    """`cdp_chunk_size=None` must behave identically to `0` -- both are the
+    documented "disable chunking" spellings."""
+    tabs = [_tab(100 + i) for i in range(20)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=None,
+    )
+    manifest = result["result"]
+    assert manifest["summary"]["tabs_captured"] == 20
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 1
+    assert pacing["chunks_completed"] == 1
+    assert pacing["chunk_settle_waits"] == 0
+
+
+@pytest.mark.asyncio
+async def test_small_run_at_or_under_chunk_size_is_a_single_chunk(tmp_path: Path) -> None:
+    """A run with tabs <= cdp_chunk_size must be exactly ONE chunk with NO
+    inter-chunk settle -- behaving exactly as it did before chunking existed,
+    even with chunking enabled at its default size."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_chunk_size=8,
+    )
+    manifest = result["result"]
+    assert manifest["status"] == "ok"
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 1
+    assert pacing["chunks_completed"] == 1
+    assert pacing["chunk_settle_waits"] == 0
+    assert pacing["chunk_settle_gave_up"] is False
+
+
+@pytest.mark.asyncio
+async def test_chunking_defaults_used_when_unspecified(tmp_path: Path) -> None:
+    """A run that doesn't pass cdp_chunk_size/cdp_chunk_cooldown_s at all
+    must report the module's real DEFAULT values in the manifest -- proving
+    the defaults are actually wired into run_archive's signature, not just
+    documented."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L4", captures=["mhtml"])
+    pacing = result["result"]["pacing"]
+    assert pacing["cdp_chunk_size"] == DEFAULT_CDP_CHUNK_SIZE
+    assert pacing["cdp_chunk_cooldown_s"] == DEFAULT_CDP_CHUNK_COOLDOWN_S
+
+
+@pytest.mark.asyncio
+async def test_chunking_manifest_accounts_for_every_requested_tab_id(tmp_path: Path) -> None:
+    """Manifest honesty must hold under chunking exactly as it does without
+    it: every id in tab_ids gets an entry (ok or not_found), even when some
+    ids are split across chunk boundaries and others don't exist at all."""
+    tabs = [_tab(100 + i) for i in range(10)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    requested = [100 + i for i in range(10)] + [999]  # 999 does not exist
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        tab_ids=requested,
+        cdp_chunk_size=4,
+        cdp_chunk_cooldown_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+    )
+    manifest = result["result"]
+    for i in range(10):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+    assert manifest["tabs"]["999"]["status"] == "not_found"
+    assert manifest["requested_tab_ids_not_found"] == [999]
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 3  # 10 tabs at chunk_size 4 -> 4,4,2
+    assert pacing["chunks_completed"] == 3
+    assert "chunk_settle_waits" in pacing
+    assert "chunk_settle_wait_total_s" in pacing

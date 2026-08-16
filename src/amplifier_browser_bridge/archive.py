@@ -287,6 +287,89 @@ alongside cumulative counts (`device_health_signals`, `device_health_trips`,
 caller that only reads the manifest after the fact; `on_progress` also receives live
 `device_health_signal`/`device_health_trip`/`device_recovered`/`device_recovery_gave_up`/
 `burst_cooldown` events as they happen.
+
+## Chunking: keeping the device under its drop threshold in the first place
+
+Two clean eval data points (same physical device, same tabs, CDP-only L4 --
+`mhtml`+`screenshot`+`nav_history` -- current `cdp_burst_size`/`cdp_burst_cooldown_s`
+defaults) made the LOAD-DEPENDENT shape of the failure explicit, rather than merely
+time-dependent or random:
+
+    12 tabs:  rate 0.75,  0 health_trips,  48s   -- device not stressed at small N
+    28 tabs:  rate 0.571, 5 health_trips, 295s   -- device overwhelmed: 6x duration,
+                                                    rate collapsed recovering drops
+                                                    that should never have happened
+
+`cdp_burst_size`/`cdp_burst_cooldown_s` (above) is real but WEAKER than this finding
+calls for: it pauses every `cdp_burst_size` (default 25) dispatches WITHIN one
+continuous loop, and never confirms the device is actually healthy before resuming --
+a breather, not a checkpoint. 25 is also far above the drop threshold these two data
+points bracket (fine at 12, overwhelmed at 28): a burst cooldown at the default size
+never engages at all before a run of this size is already in the failure zone.
+
+`cdp_chunk_size` is the PROACTIVE fix this finding calls for: `run_archive`'s per-tab
+capture loop (L1+) splits `selected_tabs` into sequential sub-batches of at most
+`cdp_chunk_size` tabs (`_chunk_tabs`) instead of one continuous loop over the whole
+list. Each chunk is processed to completion; then, BEFORE the next chunk starts (never
+WITHIN one), `_settle_between_chunks` inserts:
+
+1. An unconditional `cdp_chunk_cooldown_s` (default 5s) pause -- the same "give the
+   device a fixed breather" rationale as `cdp_burst_cooldown_s`, but a coarser,
+   between-WHOLE-CHUNKS unit rather than a within-loop one.
+2. A bounded tier-confirmation wait (`_CdpPacer.wait_until_live`) that the device
+   reads `live` again -- REUSING the exact same `client.list_devices()` tier-check
+   path `_wait_for_recovery`/`_wait_for_device_recovery` above already use, no new
+   device-health mechanism invented, just applied at a new checkpoint. The wait
+   budget is `device_recovery_max_wait_s` ITSELF (the same "sized for a real
+   reconnect, not a stale tier reading" budget the reactive mid-chunk recovery
+   already uses above) -- no new knob for this either.
+
+Unlike every other wait in this module, this ONE is not merely advisory: if the device
+never confirms `live` again within that budget, `run_archive` does not dispatch the
+remaining chunks at all. Every tab in every not-yet-started chunk gets an honest
+`"failed"` entry (`_chunk_aborted_tab_entry`) with a reason naming exactly what
+happened, and is added to `manifest["failures"]` like any other real failure -- never a
+silent drop, never a hang, and never a one-by-one cascade through tabs that were never
+going to succeed anyway. A tab that WAS already attempted keeps whatever honest outcome
+it already had (module docstring's "No silent partial success" section is otherwise
+unaffected by this feature).
+
+Chunking COMPOSES with, rather than replaces, the reactive recovery machinery above: a
+device-health trip and recovery INSIDE a chunk is handled exactly as before -- chunking
+never touches `_CdpPacer`'s per-dispatch pacing or its `before_dispatch`/`record_result`
+logic at all. Chunking's whole purpose is to make that mid-chunk case rare, by never
+letting one continuous dispatch run climb into the overwhelmed zone the 28-tab data
+point measured, in the first place.
+
+`cdp_chunk_size<=0` (or `None`) disables chunking entirely, mirroring this module's
+established "0 disables" convention -- `_chunk_tabs` then returns the WHOLE tab list as
+a single chunk, so the capture loop is byte-for-byte the pre-chunking single continuous
+loop (no settle ever runs, since there is only ever one chunk to finish). The same is
+true, with zero code path difference, whenever `len(selected_tabs) <= cdp_chunk_size`:
+a small run is exactly one chunk and behaves exactly as it did before this feature
+existed.
+
+**Chosen defaults** (`DEFAULT_CDP_CHUNK_SIZE = 8`, `DEFAULT_CDP_CHUNK_COOLDOWN_S = 5.0`):
+the two eval data points bracket the drop threshold between 12 (safe) and 28
+(overwhelmed) tabs of continuous CDP dispatch; 8 keeps every chunk comfortably below
+even the SAFE end of that bracket -- a real margin, not just barely under the line --
+while still splitting a 28-tab run into a modest ~4 chunks, so the proactive fix does
+not itself dominate wall-clock time on a large run. `cdp_chunk_cooldown_s` reuses
+`cdp_burst_cooldown_s`'s own default (5s) for the same "give the device a breather"
+rationale, as an independently tunable knob (burst cooldown paces WITHIN one
+continuous dispatch loop; this paces BETWEEN whole chunks, a coarser and more
+conservative unit). Both new knobs are surfaced in `manifest["pacing"]`
+(`cdp_chunk_size`, `cdp_chunk_cooldown_s`, `chunks_total`, `chunks_completed`,
+`chunk_settle_waits`, `chunk_settle_wait_total_s`, `chunk_settle_gave_up`) for a caller
+that only reads the manifest after the fact.
+
+**What this does NOT prove**: these two data points make the failure LOAD-dependent
+and this fix mechanically sound -- proactively bounding burst size below the measured
+safe/overwhelmed boundary, using the device's own already-existing health signal to
+confirm it before continuing -- but they do not, by themselves, prove a specific
+improved capture rate on a real device. That requires a live eval run of the same
+28-tab scenario with chunking engaged, measured the same way the two baseline numbers
+above were.
 """
 
 from __future__ import annotations
@@ -410,6 +493,35 @@ DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S: float = 120.0
 # exceeds this needs it.
 DEFAULT_CDP_BURST_SIZE: int = 25
 DEFAULT_CDP_BURST_COOLDOWN_S: float = 5.0
+
+# ---------------------------------------------------------------------------
+# Chunking -- see module docstring's "Chunking: keeping the device under its
+# drop threshold in the first place" section for the two measured eval data
+# points (12 tabs: 0 trips, 48s; 28 tabs: 5 trips, 295s) this responds to.
+# Unlike `cdp_burst_size` above (a breather WITHIN one continuous dispatch
+# loop, never confirming health before resuming), chunking is a PROACTIVE
+# checkpoint BETWEEN whole sub-batches of the tab list -- it never fires a
+# burst large enough to reach the observed drop threshold in the first place.
+# ---------------------------------------------------------------------------
+
+# Maximum number of tabs processed per chunk before `run_archive` pauses for
+# an inter-chunk settle (`_settle_between_chunks`) -- see module docstring.
+# The two eval data points bracket the drop threshold between 12 (measured
+# safe) and 28 (measured overwhelmed) tabs of continuous CDP dispatch; 8
+# keeps every chunk comfortably below even the safe end of that bracket (a
+# real margin, not just barely under the line) while still splitting a
+# 28-tab run into a modest ~4 chunks, so the fix does not itself dominate
+# wall-clock time on a large run. `<=0` (or `None`) disables chunking
+# entirely -- `_chunk_tabs` returns the whole tab list as a single chunk, so
+# the capture loop is byte-for-byte the pre-chunking single continuous loop.
+# Never engages at all for a run whose tab count is already `<= cdp_chunk_size`.
+DEFAULT_CDP_CHUNK_SIZE: int = 8
+
+# Unconditional pause inserted BETWEEN chunks (never within one), before the
+# tier-confirmation wait -- same "give the device a fixed breather" rationale
+# as `cdp_burst_cooldown_s` (whose default this mirrors), but an
+# independently tunable knob operating at a coarser, whole-chunk unit.
+DEFAULT_CDP_CHUNK_COOLDOWN_S: float = 5.0
 
 # How often `_resolve_queued` polls a still-queued/pending command for its
 # real result.
@@ -617,6 +729,15 @@ class _RunSupport:
 
     The `queued_*` counters are cumulative diagnostics `_resolve_queued` writes
     into, surfaced verbatim in `manifest["pacing"]` at the end of the run.
+
+    The `chunk_*` counters are the RUN-level chunking accounting (module
+    docstring's "Chunking" section) -- deliberately kept here rather than on
+    `_CdpPacer`, which owns only per-DISPATCH pacing; chunking operates one
+    level up, on the whole per-tab capture loop, and applies regardless of
+    whether any individual tab in a chunk happens to need a CDP-paced capture
+    at all. `chunks_total`/`chunks_completed` are populated by `run_archive`
+    itself; `chunk_settles`/`chunk_settle_wait_total_s`/`chunk_gave_up` are
+    written by `_settle_between_chunks`.
     """
 
     pacer: _CdpPacer
@@ -626,6 +747,11 @@ class _RunSupport:
     queued_waits: int = 0
     queued_wait_total_s: float = 0.0
     queued_timeouts: int = 0
+    chunks_total: int = 0
+    chunks_completed: int = 0
+    chunk_settles: int = 0
+    chunk_settle_wait_total_s: float = 0.0
+    chunk_gave_up: bool = False
 
     def emit(self, event: dict[str, Any]) -> None:
         if self.on_progress is not None:
@@ -882,6 +1008,63 @@ class _CdpPacer:
             )
         else:
             self._consecutive_health_failures = 0
+
+    async def wait_until_live(
+        self,
+        client: _ArchiveClient,
+        device_id: str,
+        *,
+        budget_s: float,
+        on_event: Callable[[dict[str, Any]], None],
+    ) -> bool:
+        """Bounded wait for `device_id` to report tier `"live"`, reusing the
+        exact same `client.list_devices()` tier-check call and bounded-
+        exponential-backoff shape `_wait_for_recovery`/`_wait_for_device_recovery`
+        above already use -- module docstring's "Chunking" section. Used by
+        `run_archive`'s inter-chunk settle (`_settle_between_chunks`), NOT by
+        the reactive per-DISPATCH pacing those two methods implement -- this
+        is a proactive, between-chunks checkpoint, not a before-a-single-
+        dispatch one.
+
+        Returns whether tier was confirmed `"live"` within `budget_s`. UNLIKE
+        `_wait_for_recovery`/`_wait_for_device_recovery`, this is NOT purely
+        advisory from the caller's point of view: `run_archive` treats a
+        `False` return as a reason to stop dispatching further chunks
+        entirely (module docstring's "Chunking" section) rather than
+        proceeding anyway. Accordingly, a `HubError` from `list_devices()`
+        here is treated as an INCONCLUSIVE read -- retried on the next
+        backoff tick, same as a non-`"live"` tier -- rather than the
+        immediate "give up and proceed anyway" those two methods use: we
+        would rather keep checking, within budget, than let a caller
+        silently resume dispatch into a device we were never able to
+        confirm as healthy.
+
+        `budget_s <= 0` means a single, immediate check with no waiting --
+        the same "0 disables the wait" convention every other budget in this
+        module already follows -- while still performing that one tier read
+        (never skipped outright).
+        """
+        deadline = time.monotonic() + max(0.0, budget_s)
+        backoff = max(self._min_interval_s, 0.5)
+        while True:
+            self.tier_checks += 1
+            tier: str | None
+            try:
+                devices = await client.list_devices()
+            except HubError:
+                tier = None  # inconclusive -- retried below, same as non-live
+            else:
+                record = next((d for d in devices if d.get("device_id") == device_id), None)
+                tier = (record or {}).get("tier", "live")
+            if tier == "live":
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait_s = min(backoff, remaining)
+            self.total_paused_s += wait_s
+            await asyncio.sleep(wait_s)
+            backoff = min(backoff * 2, max(budget_s, 0.5))
 
 
 async def _resolve_queued(
@@ -1263,6 +1446,94 @@ def _capture_skipped_by_config(name: str) -> dict[str, Any]:
     }
 
 
+def _chunk_tabs(tabs: list[dict[str, Any]], chunk_size: int | None) -> list[list[dict[str, Any]]]:
+    """Splits `tabs` into sequential sub-batches of at most `chunk_size` tabs each
+    -- module docstring's "Chunking" section. `chunk_size` being `None` or `<= 0`
+    means chunking is DISABLED: the whole list becomes a single chunk, so
+    `run_archive`'s per-tab capture loop is byte-for-byte the pre-chunking single
+    continuous loop (no inter-chunk settle ever runs, since there is only ever one
+    chunk to finish) -- the same "0/None disables" convention this module already
+    established for `cdp_burst_size`/`device_health_trip_threshold`. An empty
+    `tabs` list produces zero chunks either way, so callers can iterate the result
+    unconditionally without a separate empty-list special case.
+    """
+    if not tabs:
+        return []
+    if chunk_size is None or chunk_size <= 0:
+        return [tabs]
+    return [tabs[i : i + chunk_size] for i in range(0, len(tabs), chunk_size)]
+
+
+_CHUNK_ABORTED_REASON = (
+    "this tab was never attempted: the device did not confirm 'live' again within "
+    "device_recovery_max_wait_s after a prior chunk finished, so run_archive stopped "
+    "dispatching further chunks rather than throwing more load at a device that could not "
+    "be confirmed healthy (module docstring's 'Chunking' section). This is a real failure, "
+    "not a benign skip -- unlike a 'skipped' (no-wake) or 'not_found' tab, it is counted in "
+    "manifest['failures']."
+)
+
+
+def _chunk_aborted_tab_entry(tab: dict[str, Any]) -> dict[str, Any]:
+    """Synthetic `manifest["tabs"][tab_id]` entry for a tab in a chunk that was
+    never even started because `_settle_between_chunks` gave up waiting for the
+    device to confirm `"live"` again -- module docstring's "Chunking" section.
+    Deliberately reuses the ordinary `"failed"` status (not a new sixth state):
+    from the manifest reader's point of view this tab simply failed, for an
+    honestly-named reason, exactly like any other capture failure -- the
+    distinction that matters (proactively stopped vs. attempted-and-failed) lives
+    in `reason`/`error`, not in a new status string a caller would have to learn.
+    """
+    return {
+        "url": tab.get("url"),
+        "title": tab.get("title"),
+        "window_id": tab.get("window_id"),
+        "captures": {},
+        "status": "failed",
+        "reason": _CHUNK_ABORTED_REASON,
+    }
+
+
+async def _settle_between_chunks(
+    client: _ArchiveClient,
+    device_id: str,
+    support: _RunSupport,
+    *,
+    cooldown_s: float,
+    recovery_budget_s: float,
+) -> bool:
+    """The inter-chunk settle itself (module docstring's "Chunking" section):
+    an unconditional `cooldown_s` pause, THEN a bounded tier-confirmation wait
+    via `_CdpPacer.wait_until_live` (reusing the same `client.list_devices()`
+    tier-check path the reactive recovery waits already use). Returns whether
+    the device confirmed `"live"` within `recovery_budget_s` -- UNLIKE the
+    reactive waits, this return value IS a correctness gate for the caller:
+    `run_archive` stops dispatching further chunks if it is `False`.
+
+    Every second spent here (the fixed cooldown AND any backoff waiting inside
+    `wait_until_live`) is accounted into `support.chunk_settle_wait_total_s`,
+    surfaced in `manifest["pacing"]` for a caller who only reads the manifest
+    after the fact.
+    """
+    started = time.monotonic()
+    if cooldown_s > 0:
+        await asyncio.sleep(cooldown_s)
+    support.chunk_settles += 1
+    recovered = await support.pacer.wait_until_live(
+        client, device_id, budget_s=recovery_budget_s, on_event=support.emit
+    )
+    support.chunk_settle_wait_total_s += time.monotonic() - started
+    support.emit(
+        {
+            "event": "chunk_settle_recovered" if recovered else "chunk_settle_gave_up",
+            "device_id": device_id,
+        }
+    )
+    if not recovered:
+        support.chunk_gave_up = True
+    return recovered
+
+
 async def _capture_tab(
     client: _ArchiveClient,
     device_id: str,
@@ -1440,6 +1711,8 @@ async def run_archive(
     device_recovery_max_wait_s: float = DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S,
     cdp_burst_size: int = DEFAULT_CDP_BURST_SIZE,
     cdp_burst_cooldown_s: float = DEFAULT_CDP_BURST_COOLDOWN_S,
+    cdp_chunk_size: int | None = DEFAULT_CDP_CHUNK_SIZE,
+    cdp_chunk_cooldown_s: float = DEFAULT_CDP_CHUNK_COOLDOWN_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     poll_max_wait_s: float = DEFAULT_POLL_MAX_WAIT_S,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
@@ -1546,6 +1819,41 @@ async def run_archive(
         - `poll_interval_s`/`poll_max_wait_s`: how often, and for how long in
           total, a single queued command is polled before this archive gives
           up on it and records a failure -- never an unbounded/silent hang.
+
+    `cdp_chunk_size`/`cdp_chunk_cooldown_s` are the CHUNKING knobs from module
+    docstring's "Chunking" section -- a PROACTIVE bound, applied ONE LEVEL UP
+    from every knob above (which all pace individual dispatches or bursts
+    WITHIN one continuous per-tab capture loop): they split `tab_ids`'s
+    per-tab capture loop itself into sequential sub-batches, so a large
+    archive never fires a burst of CDP-heavy dispatches large enough to reach
+    the device's drop threshold in the first place, rather than only reacting
+    once it has:
+
+        - `cdp_chunk_size`: max tabs processed per chunk before an inter-chunk
+          settle. `<= 0` or `None` (default `8`) disables chunking entirely --
+          `tab_ids` is then processed as a single continuous loop, byte-for-
+          byte the pre-chunking behavior. Never engages for a run whose
+          selected tab count is already `<= cdp_chunk_size` -- a small run is
+          exactly one chunk.
+        - `cdp_chunk_cooldown_s` (default 5.0s): unconditional pause inserted
+          BETWEEN chunks (never within one), before the tier-confirmation
+          wait below.
+
+    Between each pair of chunks (never after the last one), `run_archive`
+    inserts `cdp_chunk_cooldown_s`, THEN waits (bounded by
+    `device_recovery_max_wait_s` -- the SAME budget the reactive mid-chunk
+    recovery above uses, reusing the exact same `client.list_devices()`
+    tier-check path via `_CdpPacer.wait_until_live`) for the device to
+    confirm `"live"` again. UNLIKE every wait above, this one is NOT merely
+    advisory: if the device never confirms `"live"` within that budget, this
+    function stops dispatching further chunks entirely, and every tab in
+    every not-yet-started chunk gets an honest `"failed"` entry in
+    `manifest["tabs"]` (added to `manifest["failures"]` like any other real
+    failure) rather than being silently dropped or attempted into a device
+    that could not be confirmed healthy. A device-health trip and recovery
+    INSIDE a single chunk is unaffected by chunking and handled exactly as
+    described above -- chunking composes with that reactive machinery rather
+    than replacing it.
 
     `on_progress`, if given, is called synchronously with a structured event
     dict (`{"event": ..., ...}`) as the run progresses -- per-tab completion,
@@ -1663,34 +1971,79 @@ async def run_archive(
     tab_manifest: dict[str, Any] = {}
     if depth_idx >= _DEPTH_INDEX["L1"]:
         use_capture_hidden = bool(capabilities.get(_CDP_CAPABILITY))
-        for tab in selected_tabs:
-            tab_id = tab.get("tab_id")
-            if tab_id is None:
+        # See module docstring's "Chunking" section: `selected_tabs` is split into
+        # sequential sub-batches (a no-op split -- one chunk containing the whole
+        # list -- when chunking is disabled or the run is already small; see
+        # `_chunk_tabs`), with a settle BETWEEN chunks (never within one) so a
+        # large archive never fires a burst of CDP-heavy dispatches large enough
+        # to reach the device's drop threshold in the first place.
+        chunks = _chunk_tabs(selected_tabs, cdp_chunk_size)
+        support.chunks_total = len(chunks)
+        for chunk_index, chunk in enumerate(chunks):
+            for tab in chunk:
+                tab_id = tab.get("tab_id")
+                if tab_id is None:
+                    continue
+                tab_manifest[str(tab_id)] = await _capture_tab(
+                    client,
+                    device_id,
+                    tab,
+                    depth_idx=depth_idx,
+                    archive_dir=archive_dir,
+                    wake=wake,
+                    all_frames=all_frames,
+                    use_capture_hidden=use_capture_hidden,
+                    timeout_s=timeout_s,
+                    injection_timeout_s=injection_timeout_s,
+                    captures=captures_set,
+                    failures=failures,
+                    support=support,
+                )
+                support.emit(
+                    {
+                        "event": "tab_done",
+                        "tab_id": tab_id,
+                        "status": tab_manifest[str(tab_id)].get("status"),
+                        "tabs_done": len(tab_manifest),
+                        "tabs_total": len(selected_tabs),
+                    }
+                )
+            support.chunks_completed += 1
+            is_last_chunk = chunk_index == len(chunks) - 1
+            if is_last_chunk:
                 continue
-            tab_manifest[str(tab_id)] = await _capture_tab(
-                client,
-                device_id,
-                tab,
-                depth_idx=depth_idx,
-                archive_dir=archive_dir,
-                wake=wake,
-                all_frames=all_frames,
-                use_capture_hidden=use_capture_hidden,
-                timeout_s=timeout_s,
-                injection_timeout_s=injection_timeout_s,
-                captures=captures_set,
-                failures=failures,
-                support=support,
-            )
             support.emit(
                 {
-                    "event": "tab_done",
-                    "tab_id": tab_id,
-                    "status": tab_manifest[str(tab_id)].get("status"),
-                    "tabs_done": len(tab_manifest),
-                    "tabs_total": len(selected_tabs),
+                    "event": "chunk_completed",
+                    "chunk_index": chunk_index,
+                    "chunks_total": support.chunks_total,
                 }
             )
+            recovered = await _settle_between_chunks(
+                client,
+                device_id,
+                support,
+                cooldown_s=cdp_chunk_cooldown_s,
+                recovery_budget_s=device_recovery_max_wait_s,
+            )
+            if recovered:
+                continue
+            # The device never confirmed `live` again within the recovery budget --
+            # stop dispatching further chunks entirely and record every tab in
+            # every not-yet-started chunk as an honest failure (module docstring's
+            # "Chunking" section): never a silent drop, never a hang, and never a
+            # one-by-one cascade through tabs that were never going to succeed.
+            for remaining_chunk in chunks[chunk_index + 1 :]:
+                for tab in remaining_chunk:
+                    tab_id = tab.get("tab_id")
+                    if tab_id is None:
+                        continue
+                    entry = _chunk_aborted_tab_entry(tab)
+                    tab_manifest[str(tab_id)] = entry
+                    failures.append(
+                        {"scope": "tab", "tab_id": tab_id, "capture": None, "error": entry["reason"]}
+                    )
+            break
     # A requested tab_id that vanished (closed) between inventory and capture --
     # or simply never existed at all -- is NEVER just absent; see module
     # docstring's "not_found" bullet under "No silent partial success". This
@@ -1823,6 +2176,23 @@ async def run_archive(
         "cdp_burst_size": cdp_burst_size,
         "cdp_burst_cooldown_s": cdp_burst_cooldown_s,
         "cdp_burst_cooldowns": support.pacer.burst_cooldowns,
+        # Chunking -- see module docstring's "Chunking" section.
+        # `chunks_total`/`chunks_completed` let a caller see, after the fact,
+        # whether this run engaged chunking at all (`chunks_total <= 1` means
+        # it did not -- either disabled, or the run was already small enough
+        # to be one chunk) and whether it ran to completion
+        # (`chunks_completed == chunks_total`) or stopped early because the
+        # device never confirmed "live" again (`chunk_settle_gave_up: true`).
+        # `chunk_settle_waits` counts every inter-chunk settle attempted;
+        # `chunk_settle_wait_total_s` is the cumulative wall-clock cost of all
+        # of them (fixed cooldowns plus any tier-confirmation backoff).
+        "cdp_chunk_size": cdp_chunk_size,
+        "cdp_chunk_cooldown_s": cdp_chunk_cooldown_s,
+        "chunks_total": support.chunks_total,
+        "chunks_completed": support.chunks_completed,
+        "chunk_settle_waits": support.chunk_settles,
+        "chunk_settle_wait_total_s": round(support.chunk_settle_wait_total_s, 3),
+        "chunk_settle_gave_up": support.chunk_gave_up,
         "poll_interval_s": poll_interval_s,
         "poll_max_wait_s": poll_max_wait_s,
         "queued_waits": support.queued_waits,
