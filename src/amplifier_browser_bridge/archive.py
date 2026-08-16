@@ -221,6 +221,72 @@ wait activity happens -- live, as the run progresses, not only in the final mani
 happy path measured on five tabs). `manifest["pacing"]` also summarizes the whole run's
 pacing activity (tier checks, backpressure pauses, queued-command waits) for a caller
 that only reads the manifest after the fact.
+
+## Device health: recovering from a real disconnect, not just a slow one
+
+Real-world finding, a live 62-tab L4 archive (`captures=["mhtml", "screenshot",
+"nav_history"]`, `wake=true`, macOS Edge over Tailscale): `tabs_captured: 36`,
+`tabs_failed: 24`, `tabs_partial: 2`, `duration_s: 742.9`, `pacing: {cdp_tier_checks:
+126, cdp_backpressure_events: 1, cdp_backpressure_paused_s: 1.5, queued_waits: 0}`. The
+failures clustered into one clear signature: `device ... disconnected mid-command`
+(registry.py's `DeviceRecord.unbind` failing every in-flight future the moment the
+websocket drops), then ~20 tabs in a row of `Detached while handling command` and CDP
+`{"code":-32603,"message":"Internal error"}` (chrome.debugger's own protocol-level
+errors once its session has come loose), then one `could not reach hub ... timed out
+waiting for a response` (client.py's own connection-level failure). The device's CDP
+layer fell over mid-run and never came fully back within the pacing this module already
+had -- `_CdpPacer` did exactly what it was designed to do (126 tier checks, one
+backpressure pause) but that design ASSUMES the device is merely slow: `_wait_for_recovery`
+waits up to `cdp_backpressure_max_wait_s` (default 20s) for tier to read `live` again,
+then dispatches anyway if it doesn't. For a device that is genuinely gone -- not slow,
+gone -- 20s is nowhere near enough for a real websocket + `hello` reconnect, so every one
+of the ~24 remaining dispatches paid that same 20s wait, gave up, and fired straight into
+the same dead connection again: one disconnect cascaded into a batch-wide failure instead
+of a single, contained one.
+
+The fix has three parts, all in `_CdpPacer`, none touching how a genuine per-tab capture
+failure is recorded (module docstring's "No silent partial success" section is
+unaffected -- this is a PACING fix, not a correctness one):
+
+1. **Classify device-health failures, distinct from page-content failures**
+   (`_is_device_health_error`, matched against `_DEVICE_HEALTH_SIGNATURES`). `Detached
+   while handling command`, CDP `-32603` (`Internal error`), `disconnected mid-command`,
+   and `could not reach hub` are properties of the CONNECTION/DEBUGGER SESSION, never of
+   the page being captured -- an ordinary "this page failed to render" error never
+   matches any of these.
+2. **Recover from a genuine disconnect instead of cascading through the rest of the
+   batch** (`_CdpPacer.record_result` + `_wait_for_device_recovery`). Once
+   `device_health_trip_threshold` (default 3) CONSECUTIVE CDP-paced captures fail with a
+   device-health signature, the pacer treats the next CDP dispatch specially: instead of
+   the ordinary `cdp_backpressure_max_wait_s`-bounded wait, it waits up to
+   `device_recovery_max_wait_s` (default 120s -- sized for a real reconnect, not a stale
+   tier reading) for tier to confirm `live` again before letting dispatch proceed. Tabs
+   captured during the trip window keep their honest failure (never retried after the
+   fact -- "a tab that genuinely can't be captured after recovery is still an honest
+   per-tab failure"), but the REMAINING tabs, once the device is actually back, resume
+   capturing normally instead of failing one by one. If the recovery budget is exhausted
+   without confirmation, the pacer does not resume at the cadence that just overwhelmed
+   the device: it doubles its own effective `cdp_pace_s` (capped at 8x,
+   `_slowdown_multiplier`) for the rest of the run -- an adaptive slowdown, applied once
+   real evidence of trouble exists, rather than a blind global change.
+3. **Bound the burst load proactively, before any failure occurs at all**
+   (`cdp_burst_size`/`cdp_burst_cooldown_s`). Independent of tier or any health signal, a
+   mandatory `cdp_burst_cooldown_s` (default 5s) pause is inserted every `cdp_burst_size`
+   (default 25) consecutive CDP dispatches -- giving the device's single-threaded
+   extension service worker recurring breathing room instead of the archive firing every
+   CDP-heavy command it has as fast as the pace floor allows, which is what let the batch
+   tip the device over in the first place.
+
+All three default such that a small archive's behavior and timing are unaffected:
+`device_health_trip_threshold`/`cdp_burst_size` only ever engage past their respective
+count (never for a run smaller than that), and both can be set to `0` to disable
+entirely -- the same "0 disables" convention `cdp_backpressure_max_wait_s`/`cdp_pace_s`
+already established. `manifest["pacing"]` reports every new knob's configured value
+alongside cumulative counts (`device_health_signals`, `device_health_trips`,
+`device_health_recoveries`, `cdp_slowdown_multiplier`, `cdp_burst_cooldowns`) for a
+caller that only reads the manifest after the fact; `on_progress` also receives live
+`device_health_signal`/`device_health_trip`/`device_recovered`/`device_recovery_gave_up`/
+`burst_cooldown` events as they happen.
 """
 
 from __future__ import annotations
@@ -299,6 +365,51 @@ DEFAULT_CDP_PACE_S: float = 0.2
 # anyway. Advisory only: `_resolve_queued` (below) is what guarantees a correct
 # eventual outcome regardless of whether this budget was enough.
 DEFAULT_CDP_BACKPRESSURE_MAX_WAIT_S: float = 20.0
+
+# ---------------------------------------------------------------------------
+# Device-health escalation -- see module docstring's "Device health: recovering
+# from a real disconnect, not just a slow one" section for the real-world
+# incident (a live 62-tab L4 archive, measured: 36 captured, 24 failed, 2
+# partial, 742.9s) this closes. `DEFAULT_CDP_BACKPRESSURE_MAX_WAIT_S` above
+# assumes the device is merely SLOW to answer (a stale tier reading catching
+# up); it has no answer for a device that has genuinely fallen off CDP mid-run
+# and needs real time to reconnect -- that case instead produced a cascade of
+# ~20 back-to-back `Detached while handling command`/CDP -32603 failures, each
+# one paying the ordinary 20s backpressure wait and then dispatching into the
+# same dead connection again.
+# ---------------------------------------------------------------------------
+
+# Consecutive CDP-paced capture failures matching a device-health signature
+# (see `_is_device_health_error`) before `_CdpPacer` stops treating the device
+# as merely slow and starts treating it as genuinely IN TROUBLE -- escalating
+# to `_wait_for_device_recovery`'s much larger budget instead of the ordinary
+# tier-backpressure wait. `<= 0` disables device-health escalation entirely
+# (mirroring the existing "0 disables" convention `cdp_backpressure_max_wait_s`
+# already established) -- every CDP-paced capture is still attempted and
+# recorded normally, just without this extra layer of protection.
+DEFAULT_DEVICE_HEALTH_TRIP_THRESHOLD: int = 3
+
+# Cap on how long `_CdpPacer` will wait (bounded exponential backoff) for the
+# device to report `live` again after tripping the threshold above --
+# deliberately much larger than `cdp_backpressure_max_wait_s`: a genuine
+# extension reconnect (fresh websocket + `hello` handshake) can take real
+# wall-clock time that an ordinary "the tier reading is just stale" backoff
+# was never sized for. If this budget is exhausted without confirmation, the
+# pacer does not resume at the same cadence that just overwhelmed the device --
+# see `_CdpPacer._slowdown_multiplier`.
+DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S: float = 120.0
+
+# Proactive bound on burst load, independent of any failure signal: after this
+# many consecutive CDP-requiring dispatches, `_CdpPacer` forces a
+# `cdp_burst_cooldown_s` pause regardless of tier or device-health state --
+# giving the device's single-threaded extension service worker breathing room
+# before a large batch has any chance to tip it over in the first place,
+# rather than only reacting once it already has. `<= 0` disables burst
+# cooldowns entirely. Never triggers on a small archive (the common case,
+# unaffected by this fix): only a run whose CDP-heavy tab count actually
+# exceeds this needs it.
+DEFAULT_CDP_BURST_SIZE: int = 25
+DEFAULT_CDP_BURST_COOLDOWN_S: float = 5.0
 
 # How often `_resolve_queued` polls a still-queued/pending command for its
 # real result.
@@ -449,6 +560,44 @@ def _capture_failed(error: str) -> dict[str, Any]:
     return {"status": "failed", "error": error}
 
 
+# Device-health failure signatures -- see module docstring's "Device health:
+# recovering from a real disconnect, not just a slow one" section. Matched as
+# plain case-insensitive substrings against a CDP-paced capture's own error
+# text (never against `text`/`dom`/profile-data errors -- those are not paced
+# and are not implicated by the incident this responds to).
+#
+# Deliberately narrow and literal, not a broad heuristic: each one is a
+# property of the CONNECTION/DEBUGGER SESSION, not of the PAGE being
+# captured, and each was observed VERBATIM in the live incident this closes
+# (a 62-tab L4 archive: 36 captured, 24 failed, 2 partial, 742.9s).
+# `"-32603"` matches CDP's own JSON-RPC "Internal error" code
+# (`{"code":-32603,"message":"Internal error"}`) rather than the bare phrase
+# "internal error", which is common enough in unrelated page/server error
+# text to risk false-positively treating an ordinary page failure as a
+# device-health signal.
+_DEVICE_HEALTH_SIGNATURES: tuple[str, ...] = (
+    "detached while handling command",
+    "disconnected mid-command",
+    "-32603",
+    "could not reach hub",
+)
+
+
+def _is_device_health_error(error: Any) -> bool:
+    """True if `error` names a DEVICE-HEALTH failure (the CDP layer/connection
+    itself is in trouble) rather than an ordinary per-page content failure --
+    see `_DEVICE_HEALTH_SIGNATURES` above. Used by `_CdpPacer.record_result`
+    to decide whether a CDP-paced capture's failure should count toward the
+    device-health trip threshold; never changes how the failure itself is
+    recorded in the per-tab manifest (module docstring's "No silent partial
+    success" section still applies unchanged -- this is purely a PACING
+    signal, not a correctness one)."""
+    if not isinstance(error, str) or not error:
+        return False
+    lowered = error.lower()
+    return any(signature in lowered for signature in _DEVICE_HEALTH_SIGNATURES)
+
+
 @dataclass
 class _RunSupport:
     """Bundles the run-level pacing/polling knobs `_safe_command` needs beyond
@@ -489,36 +638,81 @@ class _CdpPacer:
     docstring's "Pacing" section for why these three, and only these three, are
     implicated by the real-world incident this closes.
 
-    Two independent guards, both applied before every CDP dispatch:
+    Three independent guards, applied before every CDP dispatch:
 
     1. A floor on the interval since the previous CDP dispatch
-       (`min_interval_s`) -- enforced unconditionally, so a large archive can
-       never fire CDP-heavy commands back-to-back with zero gap, regardless of
-       what the device's last-reported tier says (tier only updates on the
-       device's own heartbeat/hello, so it can lag real-time degradation by
-       seconds).
-    2. A live tier check (`client.list_devices()` -- a cheap, hub-local call;
+       (`min_interval_s`, scaled by `_slowdown_multiplier` -- see below) --
+       enforced unconditionally, so a large archive can never fire CDP-heavy
+       commands back-to-back with zero gap, regardless of what the device's
+       last-reported tier says (tier only updates on the device's own
+       heartbeat/hello, so it can lag real-time degradation by seconds).
+    2. A proactive burst cooldown (`burst_size`/`burst_cooldown_s`):
+       independent of tier or any failure signal, a mandatory pause every
+       `burst_size` consecutive CDP dispatches -- bounding how much burst load
+       a single archive can throw at the device before it has any chance to
+       tip CDP over, rather than only reacting once it already has (module
+       docstring's "Device health" section, priority 2).
+    3. A live tier check (`client.list_devices()` -- a cheap, hub-local call;
        no device round trip) immediately before dispatch. If the device has
        already fallen off `live`, this waits (bounded exponential backoff, cap
        `max_wait_s`) for it to recover before allowing the dispatch to proceed,
        instead of adding yet another command to a device that has already
-       shown it cannot keep up.
+       shown it cannot keep up. If `record_result` (below) has seen enough
+       consecutive device-health failures to trip, this ordinary wait is
+       preceded by the much larger `_wait_for_device_recovery` escalation.
 
-    Advisory, never a correctness gate: if the wait budget is exhausted, or the
-    `list_devices()` check itself fails (`HubError`), dispatch proceeds anyway
-    -- `_resolve_queued` is what guarantees a correct eventual outcome
-    regardless of whether this budget was enough.
+    Advisory, never a correctness gate: if every wait budget is exhausted, or
+    the `list_devices()` check itself fails (`HubError`), dispatch proceeds
+    anyway -- `_resolve_queued` is what guarantees a correct eventual outcome
+    regardless of whether pacing was enough. `record_result` never touches how
+    a capture's own failure is recorded in the manifest -- it only feeds this
+    pacer's own dispatch-rate decisions for SUBSEQUENT captures.
     """
 
-    def __init__(self, *, min_interval_s: float, max_wait_s: float) -> None:
+    def __init__(
+        self,
+        *,
+        min_interval_s: float,
+        max_wait_s: float,
+        device_health_trip_threshold: int = DEFAULT_DEVICE_HEALTH_TRIP_THRESHOLD,
+        device_recovery_max_wait_s: float = DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S,
+        burst_size: int = DEFAULT_CDP_BURST_SIZE,
+        burst_cooldown_s: float = DEFAULT_CDP_BURST_COOLDOWN_S,
+    ) -> None:
         self._min_interval_s = max(0.0, min_interval_s)
         self._max_wait_s = max(0.0, max_wait_s)
+        self._device_health_trip_threshold = max(0, device_health_trip_threshold)
+        self._device_recovery_max_wait_s = max(0.0, device_recovery_max_wait_s)
+        self._burst_size = max(0, burst_size)
+        self._burst_cooldown_s = max(0.0, burst_cooldown_s)
         self._last_dispatch_at: float | None = None
+        self._consecutive_health_failures: int = 0
+        self._dispatches_since_cooldown: int = 0
+        # Adaptive slowdown -- see `_wait_for_device_recovery`'s docstring.
+        # Multiplies `min_interval_s` for the REST of the run once a recovery
+        # wait gives up without confirming the device is back; never shrinks
+        # mid-run (a run that needed to slow down once stays slowed down --
+        # this is a single archive call's own defensive posture, not a
+        # reusable connection-health model).
+        self._slowdown_multiplier: float = 1.0
+
         # Cumulative diagnostics -- surfaced in `manifest["pacing"]`, never
         # load-bearing for correctness.
         self.tier_checks: int = 0
         self.backpressure_events: int = 0
         self.total_paused_s: float = 0.0
+        self.device_health_signals: int = 0
+        self.device_health_trips: int = 0
+        self.device_health_recoveries: int = 0
+        self.burst_cooldowns: int = 0
+
+    @property
+    def slowdown_multiplier(self) -> float:
+        """Read-only view of the current adaptive-slowdown factor -- surfaced
+        in `manifest["pacing"]["cdp_slowdown_multiplier"]` so a caller can
+        tell, after the fact, whether this run ever had to permanently ease
+        off `cdp_pace_s` (see `_wait_for_device_recovery`'s docstring)."""
+        return self._slowdown_multiplier
 
     async def before_dispatch(
         self,
@@ -527,12 +721,36 @@ class _CdpPacer:
         *,
         on_event: Callable[[dict[str, Any]], None],
     ) -> None:
-        if self._last_dispatch_at is not None and self._min_interval_s > 0:
-            remaining = self._min_interval_s - (time.monotonic() - self._last_dispatch_at)
+        effective_interval = self._min_interval_s * self._slowdown_multiplier
+        if self._last_dispatch_at is not None and effective_interval > 0:
+            remaining = effective_interval - (time.monotonic() - self._last_dispatch_at)
             if remaining > 0:
                 await asyncio.sleep(remaining)
+
+        if (
+            self._device_health_trip_threshold > 0
+            and self._consecutive_health_failures >= self._device_health_trip_threshold
+        ):
+            await self._wait_for_device_recovery(client, device_id, on_event=on_event)
+
+        if self._burst_size > 0 and self._dispatches_since_cooldown >= self._burst_size:
+            self.burst_cooldowns += 1
+            on_event(
+                {
+                    "event": "burst_cooldown",
+                    "device_id": device_id,
+                    "burst_size": self._burst_size,
+                    "paused_s": self._burst_cooldown_s,
+                }
+            )
+            if self._burst_cooldown_s > 0:
+                self.total_paused_s += self._burst_cooldown_s
+                await asyncio.sleep(self._burst_cooldown_s)
+            self._dispatches_since_cooldown = 0
+
         await self._wait_for_recovery(client, device_id, on_event=on_event)
         self._last_dispatch_at = time.monotonic()
+        self._dispatches_since_cooldown += 1
 
     async def _wait_for_recovery(
         self, client: _ArchiveClient, device_id: str, *, on_event: Callable[[dict[str, Any]], None]
@@ -565,6 +783,105 @@ class _CdpPacer:
             self.total_paused_s += wait_s
             await asyncio.sleep(wait_s)
             backoff = min(backoff * 2, self._max_wait_s)
+
+    async def _wait_for_device_recovery(
+        self, client: _ArchiveClient, device_id: str, *, on_event: Callable[[dict[str, Any]], None]
+    ) -> None:
+        """Escalated recovery wait, triggered once `record_result` has counted
+        `device_health_trip_threshold` consecutive CDP-paced failures matching
+        a device-health signature (`_is_device_health_error`) -- i.e. the
+        device itself appears to be in trouble, not merely one page. Uses
+        `device_recovery_max_wait_s` (deliberately much larger than
+        `max_wait_s`/`_wait_for_recovery` above) because a genuine reconnect
+        needs real time for the extension to re-establish its websocket and
+        `hello`, not just for a stale tier reading to catch up.
+
+        Resets the consecutive-failure counter unconditionally on return (a
+        fresh run of failures should retrip from zero, not carry over a stale
+        count). If tier is confirmed `live` again before the budget runs out,
+        dispatch resumes at the ordinary cadence. If the budget is exhausted
+        without confirmation, this is treated as a real signal that the
+        device cannot keep up even after waiting -- `_slowdown_multiplier` is
+        doubled (capped at 8x) so the REST of the run paces itself more
+        gently, rather than resuming at the exact cadence that just
+        overwhelmed the device. Either way, dispatch always eventually
+        proceeds -- this is advisory pacing, not a correctness gate; a tab
+        that still cannot be captured afterward is recorded as an honest
+        per-tab failure like any other (module docstring's "No silent partial
+        success" section).
+        """
+        self.device_health_trips += 1
+        on_event(
+            {
+                "event": "device_health_trip",
+                "device_id": device_id,
+                "consecutive_failures": self._consecutive_health_failures,
+            }
+        )
+        if self._device_recovery_max_wait_s <= 0:
+            self._consecutive_health_failures = 0
+            return
+        deadline = time.monotonic() + self._device_recovery_max_wait_s
+        backoff = max(self._min_interval_s, 0.5)
+        recovered = False
+        while True:
+            self.tier_checks += 1
+            try:
+                devices = await client.list_devices()
+            except HubError:
+                break  # advisory only -- can't confirm recovery; fall through and resume
+            record = next((d for d in devices if d.get("device_id") == device_id), None)
+            tier = (record or {}).get("tier", "live")
+            if tier == "live":
+                recovered = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_s = min(backoff, remaining)
+            self.total_paused_s += wait_s
+            await asyncio.sleep(wait_s)
+            backoff = min(backoff * 2, self._device_recovery_max_wait_s)
+
+        self._consecutive_health_failures = 0
+        if recovered:
+            self.device_health_recoveries += 1
+            self._slowdown_multiplier = 1.0
+            on_event({"event": "device_recovered", "device_id": device_id})
+        else:
+            self._slowdown_multiplier = min(self._slowdown_multiplier * 2, 8.0)
+            on_event(
+                {
+                    "event": "device_recovery_gave_up",
+                    "device_id": device_id,
+                    "slowdown_multiplier": self._slowdown_multiplier,
+                }
+            )
+
+    def record_result(self, result: Any, *, on_event: Callable[[dict[str, Any]], None]) -> None:
+        """Feeds a just-completed CDP-paced capture's OWN outcome back into this
+        pacer -- called by `_safe_command` only for `is_cdp=True` dispatches,
+        after `_resolve_queued` has produced a terminal result. A device-health
+        failure (`_is_device_health_error`) increments the consecutive-failure
+        counter `before_dispatch` checks on the NEXT CDP dispatch; anything
+        else (success, or an ordinary per-page content failure) resets it --
+        only a genuine RUN of device-health signals trips the escalation, not
+        one isolated page failure mixed in among otherwise-healthy captures.
+        """
+        ok = isinstance(result, dict) and result.get("ok") is True
+        error = result.get("error") if isinstance(result, dict) else None
+        if not ok and _is_device_health_error(error):
+            self._consecutive_health_failures += 1
+            self.device_health_signals += 1
+            on_event(
+                {
+                    "event": "device_health_signal",
+                    "consecutive_failures": self._consecutive_health_failures,
+                    "error": error,
+                }
+            )
+        else:
+            self._consecutive_health_failures = 0
 
 
 async def _resolve_queued(
@@ -696,15 +1013,25 @@ async def _safe_command(
     module docstring's "Pacing" section) -- set by the caller for `mhtml`,
     `nav_history`, and `screenshot` when it is using `capture_hidden`; every
     other command (JS-injection captures, browser-wide profile-data commands,
-    the top-level `windows`/`tabs` inventory) is never paced.
+    the top-level `windows`/`tabs` inventory) is never paced. For that same
+    `is_cdp` subset, the RESOLVED result (after the queued-resolution above)
+    is also fed back into `support.pacer.record_result` -- see module
+    docstring's "Device health" section and `_CdpPacer.record_result`'s
+    docstring -- so a run of device-health failures changes how the NEXT CDP
+    dispatch is paced. This never changes the result itself or how it's
+    recorded in the per-tab manifest; it is a pacing signal only.
     """
     if is_cdp:
         await support.pacer.before_dispatch(client, target.device_id, on_event=support.emit)
     try:
         result = await client.command(target, command, args)
     except HubError as e:
-        return {"ok": False, "error": str(e)}
-    return await _resolve_queued(client, target.device_id, result, command=command, support=support)
+        result = {"ok": False, "error": str(e)}
+    else:
+        result = await _resolve_queued(client, target.device_id, result, command=command, support=support)
+    if is_cdp:
+        support.pacer.record_result(result, on_event=support.emit)
+    return result
 
 
 def _inventoried_count(entry: dict[str, Any]) -> int | None:
@@ -1109,6 +1436,10 @@ async def run_archive(
     captures: list[str] | None = None,
     cdp_pace_s: float = DEFAULT_CDP_PACE_S,
     cdp_backpressure_max_wait_s: float = DEFAULT_CDP_BACKPRESSURE_MAX_WAIT_S,
+    device_health_trip_threshold: int = DEFAULT_DEVICE_HEALTH_TRIP_THRESHOLD,
+    device_recovery_max_wait_s: float = DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S,
+    cdp_burst_size: int = DEFAULT_CDP_BURST_SIZE,
+    cdp_burst_cooldown_s: float = DEFAULT_CDP_BURST_COOLDOWN_S,
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     poll_max_wait_s: float = DEFAULT_POLL_MAX_WAIT_S,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
@@ -1170,9 +1501,11 @@ async def run_archive(
     returned manifest (`manifest["failures"]`, `manifest["status"]`) and the
     run continues.
 
-    `cdp_pace_s`/`cdp_backpressure_max_wait_s` and `poll_interval_s`/
-    `poll_max_wait_s` are the pacing/queued-resolution knobs from module
-    docstring's "Pacing" and "Queued means wait, not fail" sections:
+    `cdp_pace_s`/`cdp_backpressure_max_wait_s`, `device_health_trip_threshold`/
+    `device_recovery_max_wait_s`, `cdp_burst_size`/`cdp_burst_cooldown_s`, and
+    `poll_interval_s`/`poll_max_wait_s` are the pacing/queued-resolution knobs
+    from module docstring's "Pacing", "Device health", and "Queued means wait,
+    not fail" sections:
 
         - `cdp_pace_s`: floor on the interval between successive CDP-requiring
           dispatches (`mhtml`, `nav_history`, `screenshot` with
@@ -1182,7 +1515,34 @@ async def run_archive(
         - `cdp_backpressure_max_wait_s`: cap on how long a CDP dispatch will
           wait (bounded exponential backoff) for a device that has fallen off
           `live` to recover before proceeding anyway -- 0 disables tier
-          checking entirely, leaving only the `cdp_pace_s` floor.
+          checking entirely, leaving only the `cdp_pace_s` floor. Assumes the
+          device is merely SLOW; see the next two knobs for a device that has
+          genuinely disconnected.
+        - `device_health_trip_threshold`: consecutive CDP-paced capture
+          failures matching a device-health signature (`Detached while
+          handling command`, CDP `-32603` `Internal error`, `disconnected
+          mid-command`, `could not reach hub` -- see module docstring's
+          "Device health" section) before the pacer escalates to
+          `device_recovery_max_wait_s` instead of the ordinary
+          `cdp_backpressure_max_wait_s` -- 0 disables this escalation
+          entirely (every CDP-paced capture is still attempted and recorded
+          normally, just without this extra layer).
+        - `device_recovery_max_wait_s`: cap on the escalated recovery wait
+          above -- deliberately much larger than `cdp_backpressure_max_wait_s`,
+          since a genuine reconnect needs real time for the extension to
+          re-establish its websocket and `hello`. If this budget is exhausted
+          without the device confirming `live` again, the pacer doubles its
+          own effective `cdp_pace_s` (capped at 8x) for the rest of the run,
+          rather than resuming at the exact cadence that just overwhelmed the
+          device -- an adaptive slowdown, not a retry.
+        - `cdp_burst_size`/`cdp_burst_cooldown_s`: proactive bound on burst
+          load, independent of any failure signal -- after `cdp_burst_size`
+          consecutive CDP dispatches, a mandatory `cdp_burst_cooldown_s` pause
+          is inserted regardless of tier or device health, so a single large
+          archive cannot throw unlimited burst load at the device in the
+          first place. `cdp_burst_size<=0` disables burst cooldowns entirely.
+          Never triggers on a small archive -- the default (25) is well above
+          any run this fix is not concerned with.
         - `poll_interval_s`/`poll_max_wait_s`: how often, and for how long in
           total, a single queued command is polled before this archive gives
           up on it and records a failure -- never an unbounded/silent hang.
@@ -1237,7 +1597,14 @@ async def run_archive(
 
     device_target = Target(device_id=device_id)
     support = _RunSupport(
-        pacer=_CdpPacer(min_interval_s=cdp_pace_s, max_wait_s=cdp_backpressure_max_wait_s),
+        pacer=_CdpPacer(
+            min_interval_s=cdp_pace_s,
+            max_wait_s=cdp_backpressure_max_wait_s,
+            device_health_trip_threshold=device_health_trip_threshold,
+            device_recovery_max_wait_s=device_recovery_max_wait_s,
+            burst_size=cdp_burst_size,
+            burst_cooldown_s=cdp_burst_cooldown_s,
+        ),
         poll_interval_s=poll_interval_s,
         poll_max_wait_s=poll_max_wait_s,
         on_progress=on_progress,
@@ -1433,6 +1800,29 @@ async def run_archive(
         "cdp_tier_checks": support.pacer.tier_checks,
         "cdp_backpressure_events": support.pacer.backpressure_events,
         "cdp_backpressure_paused_s": round(support.pacer.total_paused_s, 3),
+        # Device health -- see module docstring's "Device health" section.
+        # `device_health_signals` is the raw count of CDP-paced failures
+        # classified as device-health (not per-page) signatures;
+        # `device_health_trips` is how many times a RUN of those (per
+        # `device_health_trip_threshold`) actually triggered the escalated
+        # recovery wait; `device_health_recoveries` is how many of those
+        # trips confirmed the device back to `live` before giving up.
+        # `cdp_slowdown_multiplier` reports the pacer's own final adaptive
+        # slowdown factor (1.0 if never needed) -- a caller can see, after the
+        # fact, whether this run had to permanently ease off.
+        "device_health_trip_threshold": device_health_trip_threshold,
+        "device_recovery_max_wait_s": device_recovery_max_wait_s,
+        "device_health_signals": support.pacer.device_health_signals,
+        "device_health_trips": support.pacer.device_health_trips,
+        "device_health_recoveries": support.pacer.device_health_recoveries,
+        "cdp_slowdown_multiplier": support.pacer.slowdown_multiplier,
+        # Proactive burst bound -- see module docstring's "Device health"
+        # section, priority 2. `cdp_burst_cooldowns` is how many times this
+        # run actually paused for a burst cooldown; 0 on any archive smaller
+        # than `cdp_burst_size`.
+        "cdp_burst_size": cdp_burst_size,
+        "cdp_burst_cooldown_s": cdp_burst_cooldown_s,
+        "cdp_burst_cooldowns": support.pacer.burst_cooldowns,
         "poll_interval_s": poll_interval_s,
         "poll_max_wait_s": poll_max_wait_s,
         "queued_waits": support.queued_waits,

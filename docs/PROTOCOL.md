@@ -1535,6 +1535,53 @@ anything, so a live signal during a large run is worth more than a happy-path nu
 a handful of tabs. See `archive.py`'s module docstring ("Queued means wait, not fail" and
 "Pacing") for the full design and the measured incident both respond to.
 
+#### Device health: recovering from a real disconnect, not just a slow one
+
+Real-world finding: a live 62-tab L4 archive (`captures=["mhtml", "screenshot",
+"nav_history"]`, `wake=true`, macOS Edge over Tailscale) reported `tabs_captured: 36`,
+`tabs_failed: 24`, `tabs_partial: 2`, `duration_s: 742.9` -- the failures clustered into a
+cascade of `device ... disconnected mid-command`, ~20 back-to-back `Detached while handling
+command` / CDP `{"code":-32603,"message":"Internal error"}` failures, and one `could not
+reach hub ... timed out waiting for a response`. The device's CDP layer genuinely fell over
+mid-run; `cdp_backpressure_max_wait_s`'s 20s budget (designed for a device that is merely
+SLOW to answer) is nowhere near enough for a real websocket + `hello` reconnect, so every
+remaining dispatch paid that wait, gave up, and fired straight into the same dead connection
+again -- one disconnect cascaded into a batch-wide failure instead of a contained one.
+
+Three additional, independent knobs close this without touching how a genuine per-tab
+failure is recorded (a tab that still can't be captured after recovery is still an honest
+failure -- see "No silent partial success" above):
+
+- **`device_health_trip_threshold`** (default 3): consecutive CDP-paced capture failures
+  matching a DEVICE-HEALTH signature -- `Detached while handling command`, CDP `-32603`
+  (`Internal error`), `disconnected mid-command`, `could not reach hub` -- these are
+  properties of the CONNECTION/DEBUGGER SESSION, distinct from an ordinary per-page content
+  failure, and are never confused with one. Reaching this threshold escalates the NEXT CDP
+  dispatch's wait from the ordinary `cdp_backpressure_max_wait_s` to
+  `device_recovery_max_wait_s` below. `0` disables this escalation entirely.
+- **`device_recovery_max_wait_s`** (default 120s): the escalated wait -- deliberately much
+  larger than `cdp_backpressure_max_wait_s`, sized for a genuine reconnect rather than a
+  stale tier reading. Once the device confirms `live` again, dispatch resumes normally for
+  the REMAINING tabs (this is the fix for the cascade: tabs after the trip point, once the
+  device is actually back, capture successfully instead of failing one by one). If this
+  budget is exhausted without confirmation, the archive does not resume at the cadence that
+  just overwhelmed the device -- it doubles its own effective `cdp_pace_s` (capped at 8x) for
+  the rest of the run, an adaptive slowdown applied only once real trouble is observed.
+- **`cdp_burst_size`/`cdp_burst_cooldown_s`** (default 25 / 5s): a PROACTIVE bound,
+  independent of any failure signal -- a mandatory cooldown pause every `cdp_burst_size`
+  consecutive CDP dispatches, so a large archive cannot throw unlimited burst load at the
+  device in the first place. `cdp_burst_size<=0` disables this entirely.
+
+All three default such that a small archive's behavior and timing are unaffected -- both
+count-based knobs only ever engage past their respective count, and both can be set to `0`
+to disable, mirroring `cdp_pace_s`/`cdp_backpressure_max_wait_s`'s own "0 disables"
+convention. `manifest["pacing"]` reports each knob's configured value alongside cumulative
+counts (`device_health_signals`, `device_health_trips`, `device_health_recoveries`,
+`cdp_slowdown_multiplier`, `cdp_burst_cooldowns`); `on_progress` also receives live
+`device_health_signal`/`device_health_trip`/`device_recovered`/`device_recovery_gave_up`/
+`burst_cooldown` events. See `archive.py`'s module docstring ("Device health: recovering
+from a real disconnect, not just a slow one") for the full design.
+
 ## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
 
 Like the archive capability itself, converting a captured page's MHTML into markdown --
