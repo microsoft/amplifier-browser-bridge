@@ -37,6 +37,8 @@ from mcp.server.fastmcp import FastMCP, Image
 from .addressing import Target
 from .archive import DEFAULT_DEPTH, ArchiveError
 from .archive import run_archive as _run_archive
+from .archive_catalog import DEFAULT_CONCURRENCY, DEFAULT_TOP_N, CatalogError
+from .archive_catalog import run_archive_catalog as _run_archive_catalog
 from .archive_convert import ConversionError
 from .archive_convert import run_archive_convert as _run_archive_convert
 from .auth import resolve_default_token
@@ -1170,6 +1172,77 @@ async def browser_archive_convert(
     try:
         return _run_archive_convert(archive_dir, tab_ids=tab_ids)
     except ConversionError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+async def browser_archive_catalog(
+    archive_dir: str,
+    catalog: bool = False,
+    lens: str | None = None,
+    tab_ids: list[int] | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    top_n: int = DEFAULT_TOP_N,
+) -> dict[str, Any]:
+    """Catalog an existing browser_archive output's tabs, AFTER THE FACT, from
+    what is already on disk -- see `archive_catalog.py`'s module docstring.
+    `archive_dir` is the same directory `browser_archive`'s own manifest
+    reported (`manifest["archive_dir"]`), not an individual tab directory.
+    Does no browser interaction at all.
+
+    Two layers. Layer 1 (structural inventory: duplicate URLs and how many
+    could be closed, per-window/per-domain breakdowns, awake/asleep/discarded/
+    pinned counts) ALWAYS runs -- pure, local, no model, no network, the cheap
+    always-useful floor. Layer 2 (a per-tab LLM judgment -- what/who/why kept/
+    topics/value) is OPT-IN via `catalog=true`: this is a distinct, later step
+    that never runs automatically as part of `browser_archive`/
+    `browser_archive_convert`, mirroring the mechanism/policy split
+    `browser_vision_read` already establishes for calling an external vision
+    model. `catalog=false` (the default) returns ONLY the Layer 1 inventory --
+    free, instant, no API key required.
+
+    `lens`, if given (only used when `catalog=true`), is optional freeform
+    reader context -- who you are, whose voices/authors you weight highly,
+    what you're working on, what makes a page worth keeping FOR YOU -- threaded
+    into every tab's judgment as trusted context the page's own content can
+    never override.
+
+    Like `browser_archive`/`browser_archive_convert`, this returns only a
+    MANIFEST -- paths, per-tab STATUS, counts, a per-value tally, and a
+    best-effort token-usage summary -- NEVER the catalog judgment text itself
+    (`what`/`who`/`why_kept`); across hundreds of tabs that text can be many KB,
+    and returning it as this tool's return value would recreate the exact
+    context-truncation failure this whole project exists to avoid. The full
+    judgments are written to a `catalog.json` sidecar in `archive_dir` --
+    read it directly, or use `archive_catalog.render_catalog_markdown` (a pure
+    library function, not exposed as a tool) to turn it into a readable report.
+
+    `tab_ids`, if given, restricts Layer 2 cataloging to that subset -- Layer 1
+    always covers every tab in `tabs.json`. A requested id absent from
+    `tabs.json` gets a `{"status": "not_found", ...}` entry in the sidecar,
+    mirroring `browser_archive`'s own `"not_found"` per-tab state, rather than
+    silently ignored.
+
+    A tab with NEITHER a screenshot NOR extracted markdown on disk is recorded
+    `{"status": "no_content", ...}` -- a real, visible non-result, never a
+    fabricated summary. A model response missing required fields is rejected
+    and retried exactly once before being recorded `"failed"` with the real
+    reason.
+
+    `concurrency` bounds how many per-tab model calls run at once (default 4).
+    `top_n` bounds how many entries land in Layer 1's `duplicates`/`by_domain`
+    lists (default 20) -- it never affects the aggregate counts.
+    """
+    try:
+        return await _run_archive_catalog(
+            archive_dir,
+            lens=lens,
+            catalog=catalog,
+            tab_ids=tab_ids,
+            concurrency=concurrency,
+            top_n=top_n,
+        )
+    except CatalogError as e:
         return {"ok": False, "error": str(e)}
 
 

@@ -5,24 +5,27 @@ Phase 1. This doc covers the two Phase 2 surfaces -- both are thin adapters over
 the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
-**Hand-verified 2026-08-15 (counted directly against the code, not assumed):**
-the native Amplifier tool module registers **30** tools; the MCP server
-registers **28**. They are not byte-identical sets -- the native module has
-three the MCP server does not (`browser_reload`, `browser_setup`,
-`browser_setup_status`), and the MCP server has one the native module does
-not (`browser_confirm`). Every other name below is shared by both, named
-`browser_<command>` (mirroring Playwright MCP's vocabulary, design doc
-section 9), including `browser_archive` (D2, browser-state archive),
-`browser_archive_convert` (the new MHTML-to-markdown conversion step -- see
-"Browser-state archive: MHTML -> markdown conversion" below), and
+**Hand-verified 2026-08-16 (counted directly against the code, not assumed --
+`grep -c '^@mcp.tool()' src/amplifier_browser_bridge/mcp_server.py` and
+`len(_build_tools())` from a real Python session against this branch, not
+carried forward from any prior claim):** the native Amplifier tool module
+registers **31** tools; the MCP server registers **29**. They are not
+byte-identical sets -- the native module has three the MCP server does not
+(`browser_reload`, `browser_setup`, `browser_setup_status`), and the MCP
+server has one the native module does not (`browser_confirm`). Every other
+name below is shared by both, named `browser_<command>` (mirroring
+Playwright MCP's vocabulary, design doc section 9), including
+`browser_archive` (D2, browser-state archive), `browser_archive_convert`
+(MHTML-to-markdown conversion -- see "Browser-state archive: MHTML ->
+markdown conversion" below), `browser_archive_catalog` (the new tab-cataloging
+step -- see "Browser-state archive: tab cataloging" below), and
 `browser_update_extension` (the version-skew story -- see "Extension
-update (Tier 0/1/2)" below). A prior revision of this doc claimed "29 and
-27" -- that count was already stale before this update (it predated
-`browser_archive_convert` being added to both surfaces); both numbers here
-were re-counted directly from
-`amplifier_module_tool_browser_bridge/__init__.py`'s `_build_tools()` and
-`mcp_server.py`'s `@mcp.tool()` decorators, the authoritative, current lists,
-not carried forward from the prior claim.
+update (Tier 0/1/2)" below). A prior revision of this doc claimed "30 and
+28" -- that count was already stale before this update (it predated
+`browser_archive_catalog` being added to both surfaces); this is exactly the
+kind of drift this note exists to catch -- **do not carry either number
+forward again without re-counting**; re-run the two commands above against
+whatever HEAD you're documenting.
 
 | Tool | Command | Notes | Surface |
 |---|---|---|---|
@@ -54,6 +57,7 @@ not carried forward from the prior claim.
 | `browser_confirm` | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
 | `browser_archive` | (composed: `windows`/`tabs`/`page_state`/`mhtml`/`nav_history`/profile-data commands) | D2, browser-state archive -- capture browser state at a chosen depth (L0-L5), write payloads to disk, return a MANIFEST (never the payload) -- see "Browser-state archive" below | both |
 | `browser_archive_convert` | (no wire command -- pure local conversion over an existing archive on disk) | Convert a `browser_archive` output's captured MHTML pages into markdown, AFTER THE FACT -- see "Browser-state archive: MHTML -> markdown conversion" below | both |
+| `browser_archive_catalog` | (no wire command -- pure local Layer 1 inventory + opt-in Layer 2 LLM judgment over an existing archive on disk) | Catalog a `browser_archive` output's tabs, AFTER THE FACT: a free structural inventory (duplicates, per-window/domain breakdowns, awake/asleep/discarded/pinned counts) always, plus an opt-in per-tab what/who/why_kept/value judgment through vision.py -- see "Browser-state archive: tab cataloging" below | both |
 | `browser_update_extension` | (composed: restage + `reload` + polled `list_devices`) | verify-or-guide extension update -- see "Extension update (Tier 0/1/2)" below | both |
 | `browser_setup` | (native, in-process `init` equivalent) | first-run/re-run setup, no CLI on PATH required | **native module only** |
 | `browser_setup_status` | (native, in-process `doctor` equivalent) | diagnose the setup chain | **native module only** |
@@ -375,6 +379,63 @@ paths, byte counts, per-tab status, and warnings -- never the markdown text
 itself. A converted page can be many KB of markdown; returning it as this
 tool's return value would recreate the exact context-truncation failure
 `browser_archive` itself exists to avoid.
+
+## Browser-state archive: tab cataloging
+
+`browser_archive_catalog` is the ONE agent-facing tool for cataloging an existing
+`browser_archive` output's tabs, AFTER THE FACT (`archive_catalog.py`'s
+`run_archive_catalog`). It does no browser interaction at all -- pure local work
+over files a prior `browser_archive` (and, optionally, `browser_archive_convert`)
+call already wrote to disk.
+
+**Two layers.** Layer 1 (structural inventory: duplicate URLs and how many could
+be closed keeping one each, per-window/per-domain breakdowns, awake/asleep/
+discarded/pinned counts) is read straight from `tabs.json`/`windows.json` and
+ALWAYS runs -- pure, no model, no network, the cheap always-useful floor that
+works even with zero vision provider configured. Layer 2 (a per-tab LLM judgment
+-- `what`/`who`/`why_kept`/`topics`/`value`, judged through an optional freeform
+reader `lens`) is OPT-IN via `catalog=true`: this never runs automatically as
+part of `browser_archive`/`browser_archive_convert`, mirroring the mechanism/
+policy split `browser_vision_read` already establishes for calling an external
+vision model. `catalog=false` (the default) returns ONLY the Layer 1 inventory.
+
+**Reuses `vision.py`, adds no dependency.** The default summarizer routes every
+per-tab call through `vision.py`'s existing provider resolution/dispatch -- no
+new SDK, no new provider-configuration surface. A tab with a screenshot on disk
+(`tabs/<id>/screenshot.<ext>`) becomes an ordinary `vision.extract_text` call
+with the screenshot as the image; a tab with only extracted markdown
+(`tabs/<id>/markdown/page.extracted.md`, written by `browser_archive_convert`)
+becomes the same call with no image and the markdown folded into the prompt
+instead. A tab with NEITHER on disk is recorded `{"status": "no_content", ...}`
+-- a real, visible non-result, never a fabricated summary.
+
+**Reader lens, prompt-injection hygiene**: `lens`, if given, is threaded into
+every tab's prompt inside its own explicit BEGIN/END block, BEFORE the tab's own
+(untrusted) page content -- nothing in the page's extracted markdown (or
+whatever a screenshot renders) can be mistaken for, or override, the reader's
+own lens.
+
+**Fail-loud, one bounded retry**: a model response missing a non-empty `what` or
+a valid `value` (`high`/`medium`/`low`) is rejected and retried exactly once; a
+second failure is recorded as that tab's real `{"status": "failed", "error":
+...}`, never silently dropped and never fabricated.
+
+**Manifest, never the payload -- again**: like `browser_archive`/
+`browser_archive_convert`, this returns only paths, per-tab STATUS (not the
+judgment text), counts, a per-value tally, and a best-effort token-usage summary
+-- NEVER the catalog judgment text itself (`what`/`who`/`why_kept`). The full
+per-tab judgments are written to ONE sidecar JSON file, `archive_dir/catalog.json`,
+incrementally as each tab completes so a crash mid-run never loses already-
+cataloged tabs. `archive_catalog.render_catalog_markdown` is a pure LIBRARY
+function that turns that sidecar into a readable report grouped by value tier --
+it is never called by the tool surface itself.
+
+`tab_ids`, if given, restricts Layer 2 cataloging to that subset -- a requested
+id absent from `tabs.json` gets a `{"status": "not_found", ...}` entry in the
+sidecar rather than being silently ignored, mirroring `browser_archive`'s own
+`"not_found"` per-tab state. `concurrency` (default 4) bounds how many per-tab
+model calls run at once; `top_n` (default 20) bounds how many entries land in
+Layer 1's `duplicates`/`by_domain` lists without affecting the aggregate counts.
 
 ## Extension update (Tier 0/1/2)
 

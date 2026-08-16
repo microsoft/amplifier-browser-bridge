@@ -141,19 +141,26 @@ def _check_total_size(images: list[bytes]) -> None:
 async def extract_text(
     images: list[bytes], prompt: str, *, config: VisionConfig | None = None, media_type: str = "image/jpeg"
 ) -> dict[str, Any]:
-    """Call a vision-capable LLM over one or more images and return extracted text.
+    """Call a vision-capable LLM over zero or more images and return extracted text.
 
     `images` is a list of raw image bytes (JPEG by default) -- multiple images are
     sent as a single multi-image message (e.g. one call per page of a multi-page
     capture), so the model can reason across all of them together (page ordering,
     continuation, etc.) rather than requiring the caller to stitch per-page answers.
 
+    `images` may be an EMPTY list for a TEXT-ONLY call -- e.g. `archive_catalog.py`'s
+    markdown-fallback path, for a tab with extracted page text but no screenshot on
+    disk. An empty list sends `prompt` alone to whichever provider/model is resolved,
+    through the exact same call path (`_call_anthropic`/`_call_openai`/`_call_gemini`
+    each already build their image blocks by iterating `images`, so zero images just
+    means zero image blocks -- no per-provider branching needed for this). This is the
+    one deliberately minimal extension to this module for that caller; `images` must
+    still be a real list -- pass `[]` explicitly for a text-only call.
+
     Returns `{"text": ..., "provider": ..., "model": ..., "image_count": ...}` on
     success. Raises `VisionConfigError` if no provider is configured, or
     `VisionError` if the configured provider's API call itself fails.
     """
-    if not images:
-        raise VisionError("extract_text requires at least one image")
     _check_total_size(images)
     cfg = config or resolve_provider()
 

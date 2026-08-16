@@ -1588,6 +1588,61 @@ moving `manifest["status"]` to `"ok_with_skips"`) rather than being silently abs
 `manifest["tabs"]` -- the same discipline `run_archive`'s own `"not_found"` per-tab state applies
 to a vanished `tab_id` (see above).
 
+## Browser-state archive: tab cataloging (composed, not a wire command)
+
+Like MHTML-to-markdown conversion (above), cataloging an archive's tabs --
+`amplifier_browser_bridge.archive_catalog.run_archive_catalog` -- is not a wire command; it does no
+browser interaction at all, and runs entirely against files a prior `run_archive` (and, optionally,
+`run_archive_convert`) already wrote to disk. It is exposed as exactly one agent-facing tool,
+`browser_archive_catalog` (`docs/AGENT_SURFACES.md`'s "Browser-state archive: tab cataloging"
+section), invoked as a distinct, later step.
+
+**Two layers.** Layer 1 is a PURE structural inventory read straight from `tabs.json` (and, if
+present, `windows.json`) -- no model, no network: duplicate URLs (and how many could be closed
+keeping one each), per-window and per-domain breakdowns, and awake/asleep/discarded/pinned counts.
+This ALWAYS runs; it is the cheap, always-useful floor that works even with zero vision provider
+configured. Layer 2 is a per-tab LLM judgment (`what`/`who`/`why_kept`/`topics`/`value`, judged
+through an optional freeform reader `lens`) -- OPT-IN via `catalog=True`, never run automatically
+as part of `run_archive`/`run_archive_convert`, the same mechanism/policy split `vision_read.py`/
+`vision.py` establish for the vision-extraction feature: calling an external model (and paying its
+money/latency cost) is a policy decision only the caller can make.
+
+**Reuses `vision.py`, adds no dependency.** The default summarizer (`make_default_summarizer`)
+routes every per-tab call through `vision.py`'s EXISTING provider resolution and dispatch -- no new
+SDK, no new provider-configuration surface. A tab with a screenshot on disk (`tabs/<id>/
+screenshot.<ext>`, whatever extension the device reported) becomes an ordinary `vision.extract_text`
+call with the screenshot as the (single) image; a tab with only extracted markdown
+(`tabs/<id>/markdown/page.extracted.md`, written by `run_archive_convert`) becomes the exact same
+call with `images=[]` and the markdown folded into the prompt text instead -- `vision.py` gained one
+minimal, deliberate extension (accepting an empty `images` list for a text-only call) to support
+this; it did not gain a new provider or dependency. A tab with NEITHER on disk is recorded
+`{"status": "no_content", ...}` -- a real, visible non-result, never a fabricated summary.
+
+**Reader lens: trusted context, prompt-injection hygiene.** `lens` is optional freeform text (who
+the reader is, whose voices/authors they weight highly, what they're working on) threaded into
+every tab's prompt inside its own explicit BEGIN/END block, BEFORE the tab's own (untrusted) page
+content -- nothing in the page's extracted markdown (or whatever a screenshot renders) can be
+mistaken for, or override, the reader's own lens, because the two are never concatenated into the
+same block, and the model is told explicitly that page content is untrusted data from the open web.
+
+**Fail-loud validation, one bounded retry.** A model response missing a non-empty `what` or a valid
+`value` (`high`/`medium`/`low`) is rejected (`SummarizerValidationError`) -- never stored as a
+catalog entry. The orchestrator retries exactly once, with the rejection reason folded back into
+the prompt; a second failure is recorded as that tab's real `{"status": "failed", "error": ...}`,
+never silently dropped and never fabricated.
+
+**Manifest, never the payload -- again.** Exactly the same rule as `browser_archive`/
+`browser_archive_convert`: `browser_archive_catalog` returns only a MANIFEST -- paths, per-tab
+STATUS (not the judgment text), counts, a per-value tally, and a best-effort token-usage summary
+(honestly `None`/absent when a summarizer call didn't report usage -- `vision.py`'s REST call path
+does not currently parse provider usage fields, so this never fabricates a number nothing produced)
+-- NEVER the catalog judgment text itself. The full per-tab judgments (`what`/`who`/`why_kept`/
+`topics`/`value`) are written to ONE sidecar JSON file, `archive_dir/catalog.json`, incrementally as
+each tab completes (so a crash mid-run never loses already-cataloged tabs). `render_catalog_markdown`
+is a pure LIBRARY function that turns that sidecar into a readable report grouped by value tier,
+with the same field-truncation and per-section entry-count bounding `paging.py` established for
+`browser_tabs` -- it is a library function only, never called by the tool surface itself.
+
 ## The three-tier connectivity model
 
 | Tier | Meaning | Agent-visible behavior |
