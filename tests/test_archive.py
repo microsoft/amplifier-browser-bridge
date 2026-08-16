@@ -22,7 +22,20 @@ from typing import Any
 import pytest
 
 from amplifier_browser_bridge.addressing import Target
-from amplifier_browser_bridge.archive import _CDP_PACED_COMMANDS, ArchiveError, run_archive
+from amplifier_browser_bridge.archive import (
+    _CDP_PACED_COMMANDS,
+    DEFAULT_CDP_BURST_COOLDOWN_S,
+    DEFAULT_CDP_BURST_SIZE,
+    DEFAULT_CDP_CHUNK_COOLDOWN_S,
+    DEFAULT_CDP_CHUNK_SIZE,
+    DEFAULT_DEVICE_HEALTH_TRIP_THRESHOLD,
+    DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S,
+    ArchiveError,
+    _chunk_tabs,
+    _is_device_disconnect_error,
+    _is_per_tab_cdp_session_error,
+    run_archive,
+)
 from amplifier_browser_bridge.client import HubError
 
 # ---------------------------------------------------------------------------
@@ -1576,3 +1589,978 @@ async def test_relative_dest_dir_with_tilde_is_expanded(
     archive_dir = Path(result["result"]["archive_dir"])
     assert archive_dir.is_relative_to(tmp_path / "archives")
     assert "~" not in str(archive_dir)
+
+
+# ---------------------------------------------------------------------------
+# Device health: recovering from a real disconnect, not just a slow one.
+#
+# Real-world finding: a live 62-tab L4 archive (captures=["mhtml",
+# "screenshot", "nav_history"], wake=true) measured tabs_captured=36,
+# tabs_failed=24, tabs_partial=2, duration_s=742.9 -- the failures were a
+# cascade of "device ... disconnected mid-command", ~20 back-to-back
+# "Detached while handling command"/CDP -32603 "Internal error" failures, and
+# one "could not reach hub ... timed out waiting for a response". The
+# pre-existing `_CdpPacer` backpressure (`cdp_backpressure_max_wait_s`, 20s
+# default) assumes the device is merely SLOW, not genuinely disconnected, so
+# every one of the ~24 remaining dispatches paid that wait, gave up, and
+# fired straight into the same dead connection again.
+#
+# These tests simulate that exact failure signature -- a device that goes
+# non-live mid-run and later recovers -- rather than only ever exercising the
+# happy path (a test where the device never drops cannot catch this
+# regression; see the task's own instruction).
+#
+# CORRECTION (see archive.py's module docstring "Per-tab CDP isolation"
+# section): a LATER 28-tab eval proved "Detached while handling command"/CDP
+# `-32603` are PER-TAB session symptoms, not device-wide ones -- only
+# "disconnected mid-command"/"could not reach hub" are genuine device-level
+# events. The classifier is now split (`_is_device_disconnect_error`,
+# `_is_per_tab_cdp_session_error`); tests below that simulate a genuine
+# device-wide trip now script the disconnect-only signatures, not the
+# per-tab ones -- scripting the per-tab pair no longer trips anything (see
+# the dedicated per-tab-isolation tests further down).
+# ---------------------------------------------------------------------------
+
+
+def test_is_device_disconnect_error_matches_only_the_genuine_device_signatures() -> None:
+    """Unit-level proof that the DEVICE-level classifier recognizes only the
+    two genuine connection/websocket signatures, case-insensitively, and does
+    NOT flag either an ordinary per-page content error OR a per-tab CDP
+    session fault as device-wide trouble -- that distinction is the whole
+    point of this fix (archive.py's "Per-tab CDP isolation" section)."""
+    assert _is_device_disconnect_error("device 16909b75-... disconnected mid-command") is True
+    assert (
+        _is_device_disconnect_error(
+            "could not reach hub at ws://100.124.126.19:8900/agent: timed out waiting for a response"
+        )
+        is True
+    )
+    # Per-tab CDP session faults must NOT be misclassified as device-wide trouble
+    # -- this is the direct fix for the pre-correction over-broad classifier.
+    assert _is_device_disconnect_error("Detached while handling command.") is False
+    assert _is_device_disconnect_error('{"code":-32603,"message":"Internal error"}') is False
+    # Ordinary page-content failures must never be misclassified as device trouble.
+    assert _is_device_disconnect_error("Frame with ID 0 is showing error page") is False
+    assert _is_device_disconnect_error("boom") is False
+    assert _is_device_disconnect_error(None) is False
+    assert _is_device_disconnect_error("") is False
+
+
+def test_is_per_tab_cdp_session_error_matches_only_the_per_tab_signatures() -> None:
+    """Unit-level proof that the PER-TAB classifier recognizes exactly the two
+    per-tab session-fault signatures, case-insensitively, and does NOT flag a
+    genuine device-level disconnect or an ordinary per-page content error."""
+    assert _is_per_tab_cdp_session_error("Detached while handling command.") is True
+    assert _is_per_tab_cdp_session_error("DETACHED WHILE HANDLING COMMAND.") is True
+    assert _is_per_tab_cdp_session_error('{"code":-32603,"message":"Internal error"}') is True
+    # Genuine device-level disconnects must NOT be misclassified as a per-tab fault.
+    assert _is_per_tab_cdp_session_error("device 16909b75-... disconnected mid-command") is False
+    assert (
+        _is_per_tab_cdp_session_error(
+            "could not reach hub at ws://100.124.126.19:8900/agent: timed out waiting for a response"
+        )
+        is False
+    )
+    # Ordinary page-content failures must never be misclassified as a CDP fault.
+    assert _is_per_tab_cdp_session_error("Frame with ID 0 is showing error page") is False
+    assert _is_per_tab_cdp_session_error("boom") is False
+    assert _is_per_tab_cdp_session_error(None) is False
+    assert _is_per_tab_cdp_session_error("") is False
+
+
+@pytest.mark.asyncio
+async def test_device_disconnect_cascade_recovers_and_captures_later_tabs(tmp_path: Path) -> None:
+    """THE load-bearing regression test for a GENUINE device-wide disconnect: a
+    fake device whose CDP (`mhtml`) commands start failing with genuine
+    device-disconnect signatures (`disconnected mid-command` -- NOT the
+    per-tab `-32603`/`Detached while handling command` pair, which no longer
+    trips anything -- see the per-tab-isolation tests further down) after 2
+    successful dispatches, tier reporting non-`live` for a stretch, then
+    recovering -- the run must RECOVER (once tier confirms `live` again) and
+    capture the LATER tabs, rather than cascading the failure through every
+    remaining tab. A client that never drops cannot exercise this path at
+    all."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    tabs = [_tab(101), _tab(102), _tab(103), _tab(104)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=_devices,
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
+                {"ok": True, "result": {"tab_id": 104, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
+            ]
+        },
+    )
+    events: list[dict[str, Any]] = []
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+        on_progress=events.append,
+    )
+    manifest = result["result"]
+
+    # The two tabs during the trip window keep their honest per-tab failure --
+    # never silently retried or hidden.
+    assert manifest["tabs"]["101"]["status"] == "failed"
+    assert manifest["tabs"]["102"]["status"] == "failed"
+
+    # The load-bearing assertion: the LATER tabs, captured once the device is
+    # confirmed back on `live`, succeed -- the failure did not cascade through
+    # the rest of the batch.
+    assert manifest["tabs"]["103"]["status"] == "ok"
+    assert manifest["tabs"]["104"]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["device_health_signals"] == 2
+    assert pacing["device_health_trips"] == 1
+    assert pacing["device_health_recoveries"] == 1
+    assert pacing["cdp_slowdown_multiplier"] == 1.0  # fully recovered -- no lasting slowdown
+
+    event_names = [e["event"] for e in events]
+    assert "device_health_signal" in event_names
+    assert "device_health_trip" in event_names
+    assert "device_recovered" in event_names
+
+
+@pytest.mark.asyncio
+async def test_device_recovery_gives_up_after_budget_and_applies_slowdown(tmp_path: Path) -> None:
+    """If the device never reports `live` again within `device_recovery_max_wait_s`,
+    the pacer must not hang forever, and must not silently resume at the exact
+    cadence that just overwhelmed the device -- it degrades gracefully
+    (doubles its own effective `cdp_pace_s`, capped) instead. Dispatch still
+    proceeds afterward -- this is pacing, not a correctness gate."""
+    client = _basic_client(
+        tabs=[_tab(101), _tab(102), _tab(103)],
+        capabilities={"debugger": True},
+        devices=lambda: [{**_device_record(debugger=True), "tier": "dormant"}],
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
+            ]
+        },
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.01,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=0.2,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 10.0  # gave up -- did not hang waiting for a device that never recovers
+    manifest = result["result"]
+
+    pacing = manifest["pacing"]
+    assert pacing["device_health_trips"] == 1
+    assert pacing["device_health_recoveries"] == 0  # never confirmed live again
+    assert pacing["cdp_slowdown_multiplier"] > 1.0  # degraded gracefully, not silently unchanged
+
+    # Dispatch still proceeded for the tab after the trip -- this is advisory
+    # pacing, never a correctness gate; the run reaches every tab regardless.
+    assert manifest["tabs"]["103"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_a_single_isolated_device_health_signal_does_not_trip(tmp_path: Path) -> None:
+    """One genuine device-disconnect-signature failure, surrounded by ordinary
+    successes/failures, must be recorded as a device-health SIGNAL (diagnostic)
+    but must NOT trip the escalated recovery wait -- only a genuine RUN of
+    `device_health_trip_threshold` CONSECUTIVE signals does that. This is the
+    "distinct from a single per-tab content failure" requirement."""
+    client = _basic_client(
+        tabs=[_tab(101), _tab(102), _tab(103)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": "some ordinary page rendering problem"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": "another ordinary page rendering problem"},
+            ]
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+    )
+    pacing = result["result"]["pacing"]
+    assert pacing["device_health_signals"] == 1  # only the one real signature counted
+    assert pacing["device_health_trips"] == 0  # never reached 2 CONSECUTIVE signals
+    assert pacing["cdp_slowdown_multiplier"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_device_health_escalation_can_be_disabled(tmp_path: Path) -> None:
+    """`device_health_trip_threshold=0` must disable the escalation entirely --
+    every CDP-paced capture is still attempted and recorded normally, exactly
+    the "0 disables" convention `cdp_backpressure_max_wait_s`/`cdp_pace_s`
+    already established."""
+    client = _basic_client(
+        tabs=[_tab(101), _tab(102), _tab(103)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+            ]
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=0,
+    )
+    pacing = result["result"]["pacing"]
+    assert pacing["device_health_signals"] == 3  # still tracked as a diagnostic
+    assert pacing["device_health_trips"] == 0  # but escalation never engaged
+    # Every tab's own failure is still recorded normally -- disabling
+    # escalation never means disabling per-tab failure recording.
+    for tab_id in ("101", "102", "103"):
+        assert result["result"]["tabs"][tab_id]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Per-tab CDP isolation -- see archive.py's module docstring ("Per-tab CDP
+# isolation: a screenshot detach must not doom mhtml on the same tab") for the
+# two 28-tab eval runs (identical WITH and WITHOUT chunking engaged) this
+# responds to. Per-tab manifest analysis of both runs named the mechanism:
+# `screenshot` throws CDP `-32603` on a tab with no paintable surface, that
+# detaches the tab's OWN CDP session, and the SUBSEQUENT `mhtml` dispatch for
+# the SAME tab then fails with `Detached while handling command` -- a per-tab
+# cascade, not a device-wide one. These tests exercise the two-part fix:
+# reordering (mhtml/nav_history dispatch before screenshot) and re-scoping the
+# device-health classifier so an isolated per-tab fault never consumes the
+# device-recovery budget.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_screenshot_32603_does_not_cascade_into_mhtml_on_the_same_tab(tmp_path: Path) -> None:
+    """THE load-bearing regression test for this fix: a tab whose `screenshot`
+    capture raises CDP `-32603` must still get its `mhtml` capture -- the
+    exact eval finding (9/9 tabs: screenshot `-32603` first, then `mhtml`
+    `Detached while handling command` on the SAME tab). Before this fix,
+    `_capture_tab` dispatched `screenshot` (L3) before `mhtml` (L4), so a
+    `-32603` detach on `screenshot` left `mhtml`'s dispatch inheriting a
+    broken CDP session and failing too -- both captures failed, and the tab
+    was reported wholly `"failed"`. After the fix, `mhtml` dispatches FIRST
+    (while the session is still fresh) and succeeds regardless of what
+    happens to `screenshot` afterward -- the tab is honestly `"partial"`
+    (screenshot failed, mhtml ok), never `"failed"`, and never silently
+    retried. THIS TEST MUST FAIL AGAINST THE PRE-FIX DISPATCH ORDER."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "screenshot": {"ok": False, "error": '{"code":-32603,"message":"Internal error"}'},
+            "mhtml": {
+                "ok": True,
+                "result": {"tab_id": 101, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"},
+            },
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["screenshot", "mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+    )
+    manifest = result["result"]
+
+    # The load-bearing assertions: mhtml survived the screenshot's own
+    # detach, and the tab is reported partial -- not both-failed.
+    assert manifest["tabs"]["101"]["captures"]["mhtml"]["status"] == "ok"
+    assert manifest["tabs"]["101"]["captures"]["screenshot"]["status"] == "failed"
+    assert manifest["tabs"]["101"]["status"] == "partial"
+
+    # The actual mhtml bytes made it to disk -- not just an in-memory "ok".
+    mhtml_path = Path(manifest["tabs"]["101"]["captures"]["mhtml"]["path"])
+    assert mhtml_path.exists()
+    assert mhtml_path.read_text(encoding="utf-8") == "MHTML-DATA"
+
+    # An honest, non-cascading capture failure still shows up in `failures` --
+    # this fix is about isolation, never about hiding the real screenshot fault.
+    screenshot_failures = [f for f in manifest["failures"] if f.get("capture") == "screenshot"]
+    assert len(screenshot_failures) == 1
+    assert "-32603" in screenshot_failures[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_mhtml_dispatches_before_screenshot_at_l4(tmp_path: Path) -> None:
+    """Mechanism-level proof of the reorder itself: at L4 (`mhtml`+`screenshot`),
+    `mhtml` must be the FIRST CDP dispatch this tab makes, `screenshot` the
+    LAST -- the direct fix for the eval's observed ordering (screenshot fails
+    first, dooming the mhtml dispatched right after it, pre-fix)."""
+    client = _basic_client(tabs=[_tab(101)], capabilities={"debugger": True})
+    await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+    )
+    cdp_commands = [command for (_, command, _) in client.calls if command in ("mhtml", "screenshot")]
+    assert cdp_commands == ["mhtml", "screenshot"]
+
+
+@pytest.mark.asyncio
+async def test_isolated_per_tab_32603_does_not_trip_device_health_or_wait(tmp_path: Path) -> None:
+    """An isolated per-tab `-32603`/`Detached while handling command` fault --
+    even repeated across MANY tabs -- must NEVER increment
+    `device_health_trips`, NEVER consume the 120s `device_recovery_max_wait_s`
+    budget, and must NEVER even count as a `device_health_signal` (that
+    counter, like the trip counter, is reserved for genuine device-level
+    disconnects post-fix). This is the direct fix for the eval finding: 5
+    health-trips per 28-tab run were this misclassification, not real device
+    trouble, and were responsible for most of the run's 295s duration."""
+    tabs = [_tab(100 + i) for i in range(6)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        extra_commands={
+            "screenshot": {"ok": False, "error": '{"code":-32603,"message":"Internal error"}'},
+        },
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["screenshot", "mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+    )
+    elapsed = time.monotonic() - started
+
+    pacing = result["result"]["pacing"]
+    # The decisive proof: pre-fix, these six -32603 failures would have
+    # counted as device-health signals (old classifier matched "-32603"),
+    # tripped the escalation at threshold=2, and consumed a
+    # `device_recovery_max_wait_s`-bounded wait -- exactly the eval's "5
+    # health-trips per run, ~295s of mostly-wasted waiting" finding. Post-fix,
+    # none of that ever engages for a per-tab-only fault.
+    assert pacing["device_health_signals"] == 0
+    assert pacing["device_health_trips"] == 0
+    assert pacing["device_health_recoveries"] == 0
+    # This fake device's tier never leaves "live", so even a wrongly-tripped
+    # recovery wait would resolve near-instantly here -- this is a sanity
+    # bound, not the primary proof (the pacing counts above are).
+    assert elapsed < 5.0
+
+    # Every tab's mhtml still succeeded despite its own screenshot failing --
+    # per-tab isolation held for all six tabs, not just one.
+    for tab in tabs:
+        tab_id = str(tab["tab_id"])
+        assert result["result"]["tabs"][tab_id]["captures"]["mhtml"]["status"] == "ok"
+        assert result["result"]["tabs"][tab_id]["status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_genuine_device_disconnect_still_trips_recovery_after_rescoping(tmp_path: Path) -> None:
+    """Regression guard: re-scoping the classifier to exclude per-tab
+    `-32603`/`Detached` must NOT regress the genuine case the recovery
+    machinery was built for. A run of GENUINE device-disconnect signatures
+    (`disconnected mid-command`) must still trip `device_health_trips` and
+    still recover once the device reports `live` again -- the real 62-tab
+    incident's mechanism, unaffected by this fix."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    tabs = [_tab(101), _tab(102), _tab(103)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=_devices,
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
+            ]
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+    )
+    pacing = result["result"]["pacing"]
+    assert pacing["device_health_signals"] == 2
+    assert pacing["device_health_trips"] == 1
+    assert pacing["device_health_recoveries"] == 1
+    assert result["result"]["tabs"]["103"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_per_tab_detach_triggers_an_explicit_reattach_before_the_next_cdp_capture(
+    tmp_path: Path,
+) -> None:
+    """Mechanism-level proof of the reattach isolation: once `mhtml`'s own
+    result matches a per-tab CDP session fault, `_capture_tab` must issue an
+    explicit `attach` for THIS tab before the NEXT CDP-based capture
+    (`nav_history`) -- rather than assuming a fresh attach happens on its
+    own. The `attach` call must never be recorded as its own entry in the
+    tab's `captures` dict (it is orchestrator bookkeeping, not a capture)."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "mhtml": {"ok": False, "error": "Detached while handling command."},
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L5",
+        captures=["mhtml", "nav_history"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+    )
+    commands = [command for (_, command, _) in client.calls]
+    assert "attach" in commands
+    # The reattach happens AFTER mhtml's own failed dispatch and BEFORE
+    # nav_history's -- not before mhtml (nothing preceded it) and not
+    # redundantly repeated.
+    assert commands.index("mhtml") < commands.index("attach") < commands.index("nav_history")
+    assert commands.count("attach") == 1
+
+    # `attach` is orchestrator bookkeeping only -- never surfaced as its own
+    # capture entry, and nav_history still gets its normal outcome recorded.
+    assert "attach" not in result["result"]["tabs"]["101"]["captures"]
+    assert result["result"]["tabs"]["101"]["captures"]["nav_history"]["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Proactive burst bound -- independent of any failure signal (priority 2:
+# bound the concurrent/burst load on the device before it has any chance to
+# tip CDP over in the first place).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cdp_burst_size_forces_a_proactive_cooldown(tmp_path: Path) -> None:
+    """After `cdp_burst_size` consecutive CDP dispatches, a cooldown pause must
+    be inserted regardless of tier or device health -- proactively bounding
+    burst load rather than only reacting once a failure has already
+    occurred."""
+    tabs = [_tab(100 + i) for i in range(5)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=3,
+        cdp_burst_cooldown_s=0.01,
+    )
+    assert result["result"]["pacing"]["cdp_burst_cooldowns"] == 1
+    # Every tab still captured -- the cooldown is a pause, never a drop.
+    assert result["result"]["summary"]["tabs_captured"] == 5
+
+
+# ---------------------------------------------------------------------------
+# No regression: a small, healthy run's behavior and manifest shape must be
+# unaffected by any of the new device-health/burst knobs at their defaults.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_small_healthy_run_is_unaffected_by_device_health_defaults(tmp_path: Path) -> None:
+    """A small archive with no failures, using every new knob's DEFAULT value,
+    must behave exactly as before this fix: plain `"ok"` status, zero
+    device-health signals/trips, zero burst cooldowns, and no lasting
+    slowdown."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L4", captures=["mhtml"])
+    manifest = result["result"]
+
+    assert manifest["status"] == "ok"
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["device_health_trip_threshold"] == DEFAULT_DEVICE_HEALTH_TRIP_THRESHOLD
+    assert pacing["device_recovery_max_wait_s"] == DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S
+    assert pacing["cdp_burst_size"] == DEFAULT_CDP_BURST_SIZE
+    assert pacing["cdp_burst_cooldown_s"] == DEFAULT_CDP_BURST_COOLDOWN_S
+    assert pacing["device_health_signals"] == 0
+    assert pacing["device_health_trips"] == 0
+    assert pacing["device_health_recoveries"] == 0
+    assert pacing["cdp_burst_cooldowns"] == 0
+    assert pacing["cdp_slowdown_multiplier"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Chunking -- see module docstring's "Chunking: keeping the device under its
+# drop threshold in the first place" section. Two measured eval data points
+# (same device/tabs, CDP-only L4, current cdp_burst_size/cooldown defaults):
+#
+#   12 tabs:  rate 0.75,  0 health_trips,  48s   -- device not stressed
+#   28 tabs:  rate 0.571, 5 health_trips, 295s   -- device overwhelmed
+#
+# The failure is LOAD-DEPENDENT: dispatching ~28 CDP captures back-to-back
+# drives the device past its drop threshold. `cdp_chunk_size` proactively
+# keeps every burst well below that threshold by splitting a large tab_ids
+# list into sequential sub-batches with a real settle (cooldown + tier
+# confirmation) between them -- never within one.
+#
+# No live browser is exercised in any of these tests -- only the same
+# duck-typed `FakeArchiveClient` used throughout this file.
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_tabs_splits_into_expected_number_of_chunks() -> None:
+    """Unit-level proof of `_chunk_tabs`'s own splitting arithmetic, isolated
+    from the async run_archive machinery: 28 tabs at chunk_size 8 must split
+    into exactly 4 chunks (8, 8, 8, 4), matching the task's own 28-tab eval
+    scenario."""
+    tabs = [_tab(100 + i) for i in range(28)]
+    chunks = _chunk_tabs(tabs, 8)
+    assert len(chunks) == 4
+    assert [len(c) for c in chunks] == [8, 8, 8, 4]
+    # Every original tab appears in exactly one chunk, in order -- chunking
+    # must never drop, duplicate, or reorder a tab.
+    assert [t["tab_id"] for chunk in chunks for t in chunk] == [t["tab_id"] for t in tabs]
+
+
+def test_chunk_tabs_disabled_by_zero_or_none_is_a_single_chunk() -> None:
+    """`chunk_size<=0` or `None` must disable chunking entirely -- the whole
+    list becomes ONE chunk, matching this module's established "0/None
+    disables" convention."""
+    tabs = [_tab(100 + i) for i in range(28)]
+    assert _chunk_tabs(tabs, 0) == [tabs]
+    assert _chunk_tabs(tabs, -1) == [tabs]
+    assert _chunk_tabs(tabs, None) == [tabs]
+
+
+def test_chunk_tabs_empty_list_is_zero_chunks() -> None:
+    """An empty tab list produces zero chunks regardless of chunk_size, so
+    callers can iterate the result unconditionally."""
+    assert _chunk_tabs([], 8) == []
+    assert _chunk_tabs([], None) == []
+
+
+@pytest.mark.asyncio
+async def test_large_run_splits_into_chunks_with_settle_between_not_within(tmp_path: Path) -> None:
+    """THE load-bearing mechanism test: a 12-tab run (matching the task's own
+    "did fine at 12" data point) with cdp_chunk_size=4 must split into exactly
+    3 chunks, and a settle (cooldown + tier confirmation) must occur BETWEEN
+    chunks (2 settles for 3 chunks) and NEVER within one -- proven by counting
+    `list_devices()` calls attributable to the settle (a healthy device with
+    `cdp_backpressure_max_wait_s=0` makes no OTHER tier-check calls once pacing
+    itself is otherwise disabled)."""
+    tabs = [_tab(100 + i) for i in range(12)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    events: list[dict[str, Any]] = []
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=4,
+        cdp_chunk_cooldown_s=0.0,
+        device_recovery_max_wait_s=1.0,
+        on_progress=events.append,
+    )
+    manifest = result["result"]
+
+    assert manifest["status"] == "ok"
+    for i in range(12):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 3
+    assert pacing["chunks_completed"] == 3
+    assert pacing["chunk_settle_waits"] == 2  # between 3 chunks -- never after the last
+    assert pacing["chunk_settle_gave_up"] is False
+
+    # Every chunk boundary emitted a "chunk_completed" event followed by a
+    # settle-recovered event -- never a "chunk_completed" for the last chunk
+    # (there is nothing to settle before -- there is no next chunk).
+    chunk_completed_events = [e for e in events if e["event"] == "chunk_completed"]
+    settle_recovered_events = [e for e in events if e["event"] == "chunk_settle_recovered"]
+    assert len(chunk_completed_events) == 2
+    assert len(settle_recovered_events) == 2
+    assert [e["chunk_index"] for e in chunk_completed_events] == [0, 1]
+
+    # The settle's tier-confirmation reuses `_CdpPacer`'s own tier-check path
+    # (`pacing["cdp_tier_checks"]`, incremented only by the pacer itself --
+    # NOT by run_archive's own one-time initial device lookup). A healthy
+    # device confirms live on the FIRST check every time (no backoff looping
+    # needed), so exactly one tier check per settle: 2 settles -> 2 checks --
+    # never within a chunk (backpressure/burst are both disabled here, so
+    # these two are attributable to chunking alone).
+    assert pacing["cdp_tier_checks"] == 2
+    # The one-time device lookup at the top of run_archive is a plain
+    # `list_devices()` call outside the pacer entirely -- so the raw call
+    # count is the pacer's tier checks PLUS that one.
+    assert client.list_devices_calls == pacing["cdp_tier_checks"] + 1
+
+
+@pytest.mark.asyncio
+async def test_non_live_tier_at_chunk_boundary_waits_then_proceeds_once_live(tmp_path: Path) -> None:
+    """If the fake device reports a non-live tier right at a chunk boundary,
+    the run must WAIT (bounded) rather than proceed immediately, and only
+    dispatch the next chunk once tier reads live again -- the settle is a
+    real gate, not a no-op. Only ONE list_devices() call happens outside the
+    settle (run_archive's own one-time initial device lookup) -- everything
+    after that is either per-tab dispatch (unpaced here: backpressure/burst
+    are both disabled) or the settle's own tier-check loop, so the tier
+    sequence below is consumed 1 (initial) + N (settle checks)."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    tabs = [_tab(100 + i) for i in range(6)]  # 2 chunks of 3
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True}, devices=_devices)
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=3,
+        cdp_chunk_cooldown_s=0.0,
+        device_recovery_max_wait_s=5.0,
+    )
+    manifest = result["result"]
+
+    # Every tab in both chunks still captured successfully -- the settle
+    # waited for recovery rather than giving up or proceeding blindly.
+    for i in range(6):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 2
+    assert pacing["chunks_completed"] == 2
+    assert pacing["chunk_settle_gave_up"] is False
+    # The settle had to poll more than once (tier was "intermittent" for a
+    # stretch: the 2nd and 3rd scripted tier values) before confirming live
+    # (the 4th) -- proof this was a real bounded wait, not an instant
+    # pass-through. `cdp_tier_checks` is the pacer's OWN counter (excludes
+    # run_archive's one-time initial device lookup, which is a plain
+    # `list_devices()` call outside the pacer).
+    assert pacing["cdp_tier_checks"] >= 2
+    assert client.list_devices_calls == pacing["cdp_tier_checks"] + 1
+
+
+@pytest.mark.asyncio
+async def test_chunk_settle_gives_up_and_records_remaining_tabs_as_honest_failures(
+    tmp_path: Path,
+) -> None:
+    """If the device NEVER recovers within device_recovery_max_wait_s, the run
+    must not hang, must not silently drop the remaining tabs, and must not
+    cascade one-by-one failures through them either: every tab in every
+    not-yet-started chunk gets ONE honest 'failed' entry, and the run stops
+    dispatching further chunks entirely."""
+    tabs = [_tab(100 + i) for i in range(9)]  # 3 chunks of 3
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=lambda: [{**_device_record(debugger=True), "tier": "dormant"}],
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=3,
+        cdp_chunk_cooldown_s=0.01,
+        device_recovery_max_wait_s=0.3,
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < 10.0  # bounded -- never hangs waiting for a device that never recovers
+    manifest = result["result"]
+
+    # First chunk (tabs 100-102) captured normally -- the device was live for it.
+    for i in range(3):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+
+    # Every tab in every LATER chunk (103-108) is an honest, distinct failure --
+    # never silently dropped, never absent from the manifest.
+    for i in range(3, 9):
+        tab_id = str(100 + i)
+        assert manifest["tabs"][tab_id]["status"] == "failed"
+        assert "did not confirm" in manifest["tabs"][tab_id]["reason"]
+
+    # Real per-tab failure entries, one per aborted tab -- never a silent drop.
+    tab_failure_ids = {f["tab_id"] for f in manifest["failures"] if f["scope"] == "tab"}
+    assert tab_failure_ids == {103, 104, 105, 106, 107, 108}
+
+    assert manifest["status"] == "ok_with_failures"
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 3
+    assert pacing["chunks_completed"] == 1  # only the first chunk ever finished
+    assert pacing["chunk_settle_gave_up"] is True
+    assert pacing["chunk_settle_waits"] == 1  # stopped after the FIRST failed settle
+
+    # Summary accounting must stay honest: 3 captured, 6 failed, 9 attempted total.
+    assert manifest["summary"]["tabs_captured"] == 3
+    assert manifest["summary"]["tabs_failed"] == 6
+    assert manifest["summary"]["tabs_capture_attempted"] == 9
+
+
+@pytest.mark.asyncio
+async def test_chunking_composes_with_mid_chunk_device_recovery(tmp_path: Path) -> None:
+    """Chunking must COMPOSE with the existing reactive mid-chunk recovery,
+    not fight it: a device-health-signature drop INSIDE a chunk still
+    recovers via the pre-existing `_CdpPacer` escalation, and the run still
+    proceeds through the chunk boundary settle to the next chunk normally."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live", "live", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    # 6 tabs, chunk_size=4 -> chunks = [[101,102,103,104], [105,106]]. The
+    # device-health drop/recovery happens INSIDE chunk 1 (tabs 101/102 fail,
+    # 103/104 succeed once recovered) -- proving chunking doesn't interfere
+    # with the reactive escalation. Chunk 2 (105/106) then succeeds normally
+    # after an ordinary (already-live) settle.
+    tabs = [_tab(101), _tab(102), _tab(103), _tab(104), _tab(105), _tab(106)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=_devices,
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "D"}},
+                {"ok": True, "result": {"tab_id": 104, "format": "mhtml", "bytes": 5, "data": "D"}},
+                {"ok": True, "result": {"tab_id": 105, "format": "mhtml", "bytes": 5, "data": "D"}},
+                {"ok": True, "result": {"tab_id": 106, "format": "mhtml", "bytes": 5, "data": "D"}},
+            ]
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+        cdp_chunk_size=4,
+        cdp_chunk_cooldown_s=0.0,
+    )
+    manifest = result["result"]
+
+    # Mid-chunk reactive recovery is unaffected: the two tabs during the trip
+    # window keep their honest failure, the two after recovery succeed --
+    # exactly the pre-existing device-health-recovery behavior.
+    assert manifest["tabs"]["101"]["status"] == "failed"
+    assert manifest["tabs"]["102"]["status"] == "failed"
+    assert manifest["tabs"]["103"]["status"] == "ok"
+    assert manifest["tabs"]["104"]["status"] == "ok"
+
+    # The chunk boundary settle (between chunk 1 and chunk 2) then succeeds
+    # normally (device already live by then), and chunk 2 captures fine.
+    assert manifest["tabs"]["105"]["status"] == "ok"
+    assert manifest["tabs"]["106"]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 2
+    assert pacing["chunks_completed"] == 2
+    assert pacing["chunk_settle_gave_up"] is False
+    assert pacing["device_health_trips"] == 1
+    assert pacing["device_health_recoveries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cdp_chunk_size_zero_disables_chunking(tmp_path: Path) -> None:
+    """`cdp_chunk_size=0` must disable chunking entirely: the whole tab_ids
+    list is processed as a single continuous loop, exactly the pre-chunking
+    behavior -- one chunk, zero settles, regardless of how large the run is."""
+    tabs = [_tab(100 + i) for i in range(20)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=0,
+    )
+    manifest = result["result"]
+    assert manifest["summary"]["tabs_captured"] == 20
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 1
+    assert pacing["chunks_completed"] == 1
+    assert pacing["chunk_settle_waits"] == 0
+    assert pacing["chunk_settle_gave_up"] is False
+
+
+@pytest.mark.asyncio
+async def test_cdp_chunk_size_none_disables_chunking(tmp_path: Path) -> None:
+    """`cdp_chunk_size=None` must behave identically to `0` -- both are the
+    documented "disable chunking" spellings."""
+    tabs = [_tab(100 + i) for i in range(20)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+        cdp_chunk_size=None,
+    )
+    manifest = result["result"]
+    assert manifest["summary"]["tabs_captured"] == 20
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 1
+    assert pacing["chunks_completed"] == 1
+    assert pacing["chunk_settle_waits"] == 0
+
+
+@pytest.mark.asyncio
+async def test_small_run_at_or_under_chunk_size_is_a_single_chunk(tmp_path: Path) -> None:
+    """A run with tabs <= cdp_chunk_size must be exactly ONE chunk with NO
+    inter-chunk settle -- behaving exactly as it did before chunking existed,
+    even with chunking enabled at its default size."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_chunk_size=8,
+    )
+    manifest = result["result"]
+    assert manifest["status"] == "ok"
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["status"] == "ok"
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 1
+    assert pacing["chunks_completed"] == 1
+    assert pacing["chunk_settle_waits"] == 0
+    assert pacing["chunk_settle_gave_up"] is False
+
+
+@pytest.mark.asyncio
+async def test_chunking_defaults_used_when_unspecified(tmp_path: Path) -> None:
+    """A run that doesn't pass cdp_chunk_size/cdp_chunk_cooldown_s at all
+    must report the module's real DEFAULT values in the manifest -- proving
+    the defaults are actually wired into run_archive's signature, not just
+    documented."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)], capabilities={"debugger": True})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L4", captures=["mhtml"])
+    pacing = result["result"]["pacing"]
+    assert pacing["cdp_chunk_size"] == DEFAULT_CDP_CHUNK_SIZE
+    assert pacing["cdp_chunk_cooldown_s"] == DEFAULT_CDP_CHUNK_COOLDOWN_S
+
+
+@pytest.mark.asyncio
+async def test_chunking_manifest_accounts_for_every_requested_tab_id(tmp_path: Path) -> None:
+    """Manifest honesty must hold under chunking exactly as it does without
+    it: every id in tab_ids gets an entry (ok or not_found), even when some
+    ids are split across chunk boundaries and others don't exist at all."""
+    tabs = [_tab(100 + i) for i in range(10)]
+    client = _basic_client(tabs=tabs, capabilities={"debugger": True})
+    requested = [100 + i for i in range(10)] + [999]  # 999 does not exist
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        tab_ids=requested,
+        cdp_chunk_size=4,
+        cdp_chunk_cooldown_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        cdp_burst_size=0,
+    )
+    manifest = result["result"]
+    for i in range(10):
+        assert manifest["tabs"][str(100 + i)]["status"] == "ok"
+    assert manifest["tabs"]["999"]["status"] == "not_found"
+    assert manifest["requested_tab_ids_not_found"] == [999]
+
+    pacing = manifest["pacing"]
+    assert pacing["chunks_total"] == 3  # 10 tabs at chunk_size 4 -> 4,4,2
+    assert pacing["chunks_completed"] == 3
+    assert "chunk_settle_waits" in pacing
+    assert "chunk_settle_wait_total_s" in pacing

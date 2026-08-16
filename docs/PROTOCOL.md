@@ -1535,6 +1535,195 @@ anything, so a live signal during a large run is worth more than a happy-path nu
 a handful of tabs. See `archive.py`'s module docstring ("Queued means wait, not fail" and
 "Pacing") for the full design and the measured incident both respond to.
 
+#### Device health: recovering from a real disconnect, not just a slow one
+
+Real-world finding: a live 62-tab L4 archive (`captures=["mhtml", "screenshot",
+"nav_history"]`, `wake=true`, macOS Edge over Tailscale) reported `tabs_captured: 36`,
+`tabs_failed: 24`, `tabs_partial: 2`, `duration_s: 742.9` -- the failures clustered into a
+cascade of `device ... disconnected mid-command`, ~20 back-to-back `Detached while handling
+command` / CDP `{"code":-32603,"message":"Internal error"}` failures, and one `could not
+reach hub ... timed out waiting for a response`. The device's CDP layer genuinely fell over
+mid-run; `cdp_backpressure_max_wait_s`'s 20s budget (designed for a device that is merely
+SLOW to answer) is nowhere near enough for a real websocket + `hello` reconnect, so every
+remaining dispatch paid that wait, gave up, and fired straight into the same dead connection
+again -- one disconnect cascaded into a batch-wide failure instead of a contained one.
+
+Three additional, independent knobs close this without touching how a genuine per-tab
+failure is recorded (a tab that still can't be captured after recovery is still an honest
+failure -- see "No silent partial success" above):
+
+- **`device_health_trip_threshold`** (default 3): consecutive CDP-paced capture failures
+  matching a GENUINE DEVICE-LEVEL disconnect signature -- `disconnected mid-command`,
+  `could not reach hub` -- these are properties of the CONNECTION itself, distinct from an
+  ordinary per-page content failure, and are never confused with one. Reaching this
+  threshold escalates the NEXT CDP dispatch's wait from the ordinary
+  `cdp_backpressure_max_wait_s` to `device_recovery_max_wait_s` below. `0` disables this
+  escalation entirely.
+
+  **Correction (see "Per-tab CDP isolation" below): `Detached while handling command` and
+  CDP `-32603` are DELIBERATELY EXCLUDED from this list.** They were originally bucketed
+  in with the two signatures above; a later 28-tab eval proved they are PER-TAB `chrome.
+  debugger`-session symptoms, not device-wide ones, and must never consume this budget --
+  see the dedicated section below for the corrected mechanism.
+- **`device_recovery_max_wait_s`** (default 120s): the escalated wait -- deliberately much
+  larger than `cdp_backpressure_max_wait_s`, sized for a genuine reconnect rather than a
+  stale tier reading. Once the device confirms `live` again, dispatch resumes normally for
+  the REMAINING tabs (this is the fix for the cascade: tabs after the trip point, once the
+  device is actually back, capture successfully instead of failing one by one). If this
+  budget is exhausted without confirmation, the archive does not resume at the cadence that
+  just overwhelmed the device -- it doubles its own effective `cdp_pace_s` (capped at 8x) for
+  the rest of the run, an adaptive slowdown applied only once real trouble is observed.
+- **`cdp_burst_size`/`cdp_burst_cooldown_s`** (default 25 / 5s): a PROACTIVE bound,
+  independent of any failure signal -- a mandatory cooldown pause every `cdp_burst_size`
+  consecutive CDP dispatches, so a large archive cannot throw unlimited burst load at the
+  device in the first place. `cdp_burst_size<=0` disables this entirely.
+
+All three default such that a small archive's behavior and timing are unaffected -- both
+count-based knobs only ever engage past their respective count, and both can be set to `0`
+to disable, mirroring `cdp_pace_s`/`cdp_backpressure_max_wait_s`'s own "0 disables"
+convention. `manifest["pacing"]` reports each knob's configured value alongside cumulative
+counts (`device_health_signals`, `device_health_trips`, `device_health_recoveries`,
+`cdp_slowdown_multiplier`, `cdp_burst_cooldowns`); `on_progress` also receives live
+`device_health_signal`/`device_health_trip`/`device_recovered`/`device_recovery_gave_up`/
+`burst_cooldown` events. See `archive.py`'s module docstring ("Device health: recovering
+from a real disconnect, not just a slow one") for the full design.
+
+#### Per-tab CDP isolation: a screenshot detach must not doom mhtml on the same tab
+
+Real-world finding, TWO clean 28-tab eval runs (same physical device/tabs, CDP-only L4,
+one WITH chunking engaged and one WITHOUT): both produced the IDENTICAL result -- rate
+0.571, 9 failed, 5 health_trips. Chunking, added on the theory that burst load was
+overwhelming the device, changed nothing -- proving the failure is NOT load-dependent.
+Per-tab manifest analysis of both runs named the real mechanism:
+
+```
+9 tabs: [screenshot] {"code":-32603,"message":"Internal error"}   <- fails FIRST
+9 tabs: [mhtml]      Detached while handling command.             <- SAME 9 tabs, after
+3 tabs: [mhtml]      device ... disconnected mid-command          <- genuine disconnects
+```
+
+The 9 screenshot-failures and 9 mhtml-failures are THE SAME 9 TABS, always in the same
+order (screenshot fails, then mhtml on the same tab fails): `Page.captureScreenshot`
+throws `-32603` on a tab woken from discard/asleep whose renderer never produced a
+paintable surface; that detaches the tab's OWN `chrome.debugger` session, and the
+mhtml dispatch that (pre-fix) ran right after it for the SAME tab inherited the broken
+session and failed too -- a per-TAB cascade, not a device-wide one. The (pre-correction)
+device-health classifier compounded this by treating `-32603`/`Detached while handling
+command` as device-level signals, so a single tab's screenshot fault was tripping the
+120s `device_recovery_max_wait_s` escalation meant for a genuinely disconnected device --
+the 5 "health trips" per run were this misclassification, not real device failures, and
+were responsible for most of the run's 295s duration.
+
+**The fix, entirely at the orchestration layer (`archive.py`; hub.py/cdp.py's own
+attach/detach machinery is unmodified):**
+
+- **Reorder per-tab CDP dispatch.** `mhtml` (L4) and `nav_history` (L5) -- structural
+  document/session snapshots that need no painted frame -- now dispatch BEFORE
+  `screenshot` (L3), the one observed to throw `-32603` on a tab with no paintable
+  surface. Depth-ladder gating is unchanged; only dispatch ORDER moved.
+- **Isolate remaining per-tab CDP captures from an observed per-tab detach.** If a
+  CDP-based capture's own result matches the per-tab signature (`-32603`/`Detached while
+  handling command` -- NEVER the genuine-disconnect pair), `_capture_tab` issues one
+  best-effort, explicit `attach` for THIS tab before its NEXT CDP-based capture, rather
+  than assuming a fresh attach happens on its own. Dispatched with no CDP pacing/health
+  accounting (this is orchestrator bookkeeping, not a paced/recorded capture) and never
+  appears in the tab's own `captures` dict; a failed re-attach simply means the next
+  capture proceeds and, if the tab truly cannot be reached, fails and is recorded as an
+  honest per-tab failure like any other.
+- **Re-scope the device-health classifier.** `device_health_trip_threshold`'s escalation
+  now counts ONLY genuine device-level disconnects (`disconnected mid-command`/`could not
+  reach hub` -- see the correction note above) -- an isolated per-tab `-32603`/`Detached`,
+  however many tabs it touches, can never consume the 120s recovery-wait budget. The
+  trip/recovery MACHINERY itself (`device_health_trip_threshold`, `device_recovery_max_wait_s`)
+  is unchanged and still handles a genuine full-device disconnect exactly as before (the
+  62-tab incident above).
+
+**What this does NOT prove**: the tests this fix ships with (fake-client, no live
+browser) prove the mechanism is correct -- a tab whose screenshot throws `-32603` still
+gets its mhtml captured, and an isolated per-tab signal no longer trips the recovery
+wait. They do not, by themselves, prove a specific improved capture rate, health-trip
+count, or duration on the real 28-tab device this finding was measured against -- that
+requires a live eval run of the same scenario with this fix engaged, measured the same
+way the two identical baseline numbers above were.
+
+#### Chunking: keeping the device under its drop threshold, proactively
+
+Two clean eval data points (same physical device/tabs, CDP-only L4 --
+`mhtml`+`screenshot`+`nav_history` -- current `cdp_burst_size`/`cdp_burst_cooldown_s`
+defaults) made the failure above LOAD-DEPENDENT, not merely time-dependent or random:
+
+```
+12 tabs:  rate 0.75,  0 health_trips,  48s   -- device not stressed at small N
+28 tabs:  rate 0.571, 5 health_trips, 295s   -- device overwhelmed: 6x duration,
+                                                rate collapsed recovering drops
+                                                that should never have happened
+```
+
+`cdp_burst_size`/`cdp_burst_cooldown_s` is real but WEAKER than this finding calls for: it
+pauses every `cdp_burst_size` (default 25) dispatches WITHIN one continuous loop, and never
+confirms the device is actually healthy before resuming -- a breather, not a checkpoint. 25
+is also far above the drop threshold these two data points bracket (fine at 12, overwhelmed
+at 28): a burst cooldown at the default size never engages at all before a run of this size
+is already in the failure zone.
+
+`cdp_chunk_size` is the PROACTIVE fix: `run_archive`'s per-tab capture loop (L1+) splits the
+selected tab list into sequential sub-batches of at most `cdp_chunk_size` tabs, processing
+one chunk to completion before the next starts. Between chunks (never within one), the
+archive inserts a settle:
+
+- **`cdp_chunk_cooldown_s`** (default 5s): an unconditional pause -- the same "give the
+  device a fixed breather" rationale as `cdp_burst_cooldown_s`, but a coarser,
+  between-WHOLE-CHUNKS unit rather than a within-loop one.
+- A bounded tier-confirmation wait that the device reads `live` again, reusing the exact
+  same `client.list_devices()` tier-check path the reactive recovery above already uses (no
+  new device-health mechanism, just a new checkpoint). The wait budget is
+  `device_recovery_max_wait_s` itself -- the SAME budget the reactive mid-chunk recovery
+  uses -- so there is no separate knob to tune for this.
+
+Unlike every other wait in this protocol's pacing model, this ONE is not merely advisory: if
+the device never confirms `live` again within that budget, the archive does not dispatch the
+remaining chunks at all. Every tab in every not-yet-started chunk gets an honest `"failed"`
+entry in `manifest["tabs"]` (added to `manifest["failures"]` like any other real failure) --
+never a silent drop, never a hang, and never a one-by-one cascade through tabs that were
+never going to succeed anyway. A device-health trip and recovery INSIDE a single chunk is
+unaffected by chunking and handled exactly as described above -- chunking composes with that
+reactive machinery rather than replacing it.
+
+`cdp_chunk_size<=0` (or `None`, default `8`) disables chunking entirely -- the whole tab list
+becomes a single chunk, so the capture loop is byte-for-byte the pre-chunking single
+continuous loop (no settle ever runs). The same holds, with zero code path difference,
+whenever the run's own tab count is already `<= cdp_chunk_size`: a small run is exactly one
+chunk and behaves exactly as it did before this feature existed.
+
+**Chosen defaults**: the two eval data points bracket the drop threshold between 12 (safe)
+and 28 (overwhelmed) tabs of continuous CDP dispatch. `cdp_chunk_size=8` keeps every chunk
+comfortably below even the safe end of that bracket -- a real margin, not just barely under
+the line -- while still splitting a 28-tab run into a modest ~4 chunks, so the fix does not
+itself dominate wall-clock time on a large run. `cdp_chunk_cooldown_s=5.0` reuses
+`cdp_burst_cooldown_s`'s own default for the same rationale, as an independently tunable
+knob. `manifest["pacing"]` reports both configured values alongside cumulative counts
+(`chunks_total`, `chunks_completed`, `chunk_settle_waits`, `chunk_settle_wait_total_s`,
+`chunk_settle_gave_up`); `on_progress` also receives live `chunk_completed`/
+`chunk_settle_recovered`/`chunk_settle_gave_up` events. See `archive.py`'s module docstring
+("Chunking: keeping the device under its drop threshold in the first place") for the full
+design.
+
+These two data points make the failure load-dependent and this fix mechanically sound; they
+do not, by themselves, prove a specific improved capture rate on a real device -- that
+requires a live eval run of the same 28-tab scenario with chunking engaged, measured the
+same way the two baseline numbers above were.
+
+**Correction, from a THIRD eval run (see "Per-tab CDP isolation" above): the
+load-dependent theory here is DISPROVEN.** The identical 28-tab scenario WITH chunking
+engaged produced the IDENTICAL result to running it WITHOUT chunking (rate 0.571, 9
+failed, 5 health_trips, both runs) -- a device genuinely being overwhelmed by burst
+volume would behave differently once that volume is bounded into smaller, settled-between
+chunks, and it didn't. The real failure is per-tab, not load-dependent, and chunking was
+never addressing it. `cdp_chunk_size`/`cdp_chunk_cooldown_s` remain available as an
+OPT-IN knob (default unchanged, `<=0` still disables it) rather than removed outright, but
+do not reach for chunking as the fix for a low capture rate -- reach for the per-tab
+isolation and re-scoped health classification above first.
+
 ## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
 
 Like the archive capability itself, converting a captured page's MHTML into markdown --
