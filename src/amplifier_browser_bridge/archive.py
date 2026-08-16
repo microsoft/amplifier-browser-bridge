@@ -249,11 +249,26 @@ failure is recorded (module docstring's "No silent partial success" section is
 unaffected -- this is a PACING fix, not a correctness one):
 
 1. **Classify device-health failures, distinct from page-content failures**
-   (`_is_device_health_error`, matched against `_DEVICE_HEALTH_SIGNATURES`). `Detached
-   while handling command`, CDP `-32603` (`Internal error`), `disconnected mid-command`,
-   and `could not reach hub` are properties of the CONNECTION/DEBUGGER SESSION, never of
-   the page being captured -- an ordinary "this page failed to render" error never
-   matches any of these.
+   (originally `_is_device_health_error`, matched against `_DEVICE_HEALTH_SIGNATURES`).
+   `Detached while handling command`, CDP `-32603` (`Internal error`), `disconnected
+   mid-command`, and `could not reach hub` are properties of the CONNECTION/DEBUGGER
+   SESSION, never of the page being captured -- an ordinary "this page failed to
+   render" error never matches any of these.
+
+   **Correction (see "Per-tab CDP isolation" below):** this four-signature bucket was
+   itself over-broad. `Detached while handling command` and CDP `-32603` turned out to
+   be PER-TAB symptoms (a single tab's `chrome.debugger` session came loose -- e.g. a
+   tab woken from discard whose renderer never produced a paintable surface for
+   `Page.captureScreenshot`), not device-wide ones; only `disconnected mid-command`
+   (a websocket teardown, `registry.py`'s `DeviceRecord.unbind`) and `could not reach
+   hub` (a transport-level failure, `client.py`) are genuine DEVICE-level events. The
+   classifier is now split in two: `_is_device_disconnect_error` (the narrower,
+   genuinely device-level pair -- this is what feeds `record_result`'s trip counting
+   below) and `_is_per_tab_cdp_session_error` (the per-tab pair -- used only for the
+   isolation/reattach logic in `_capture_tab`, never for trip counting). The 62-tab
+   incident narrated here was a genuine full disconnect (confirmed by the
+   `disconnected mid-command` root signal), so it is unaffected by this correction --
+   see "Per-tab CDP isolation" for the DIFFERENT incident that motivated it.
 2. **Recover from a genuine disconnect instead of cascading through the rest of the
    batch** (`_CdpPacer.record_result` + `_wait_for_device_recovery`). Once
    `device_health_trip_threshold` (default 3) CONSECUTIVE CDP-paced captures fail with a
@@ -287,6 +302,93 @@ alongside cumulative counts (`device_health_signals`, `device_health_trips`,
 caller that only reads the manifest after the fact; `on_progress` also receives live
 `device_health_signal`/`device_health_trip`/`device_recovered`/`device_recovery_gave_up`/
 `burst_cooldown` events as they happen.
+
+## Per-tab CDP isolation: a screenshot detach must not doom mhtml on the same tab
+
+Real-world finding, TWO clean 28-tab eval runs (same physical device, same tabs, CDP-only
+L4 -- `mhtml`+`screenshot`+`nav_history`, current `cdp_burst_size`/`cdp_chunk_size`
+defaults, one run WITH chunking engaged and one WITHOUT): both produced the IDENTICAL
+result -- rate 0.571, 9 failed, 5 health_trips. Proactive chunking, added on the theory
+that burst load was overwhelming the device's CDP layer, changed NOTHING. That theory is
+wrong: a device genuinely being overwhelmed by burst volume would behave differently once
+the burst is bounded into smaller chunks with real settles between them. It didn't --
+which means the failure is not load-dependent at all. It is PER-TAB.
+
+Per-tab manifest analysis (identical across both runs) named the real mechanism:
+
+    9 tabs: [screenshot] {"code":-32603,"message":"Internal error"}   <- fails FIRST
+    9 tabs: [mhtml]      Detached while handling command.             <- SAME 9 tabs, after
+    3 tabs: [mhtml]      device ... disconnected mid-command          <- genuine disconnects
+
+The 9 screenshot-failures and 9 mhtml-failures are THE SAME 9 TABS (9/9 overlap), and the
+ordering is always screenshot-then-mhtml, never the reverse: zero tabs failed screenshot
+while mhtml still succeeded. `Page.captureScreenshot` throws `-32603` on a tab woken from
+discard/asleep whose renderer never produced a paintable surface (nothing to screenshot).
+That failure detaches the tab's OWN `chrome.debugger` session; the SUBSEQUENT `mhtml`
+dispatch for the SAME tab (module docstring order, before this fix: `screenshot` at L3
+runs before `mhtml` at L4) inherits that broken session and fails with `Detached while
+handling command` -- a per-page-content-independent, per-TAB cascade, not a device-wide
+one. One un-screenshottable tab was losing BOTH its screenshot AND its mhtml.
+
+Compounding this: the (pre-correction) device-health classifier treated `-32603` and
+`Detached while handling command` as DEVICE-level signals (see "Device health" above's
+correction note), so a PER-TAB screenshot fault was tripping the 120s
+`device_recovery_max_wait_s` escalation meant for a genuinely disconnected device -- the
+5 "health trips" per run were this misclassification, not real device failures, and were
+responsible for most of the run's 295s duration.
+
+**The fix has two independent parts, both in this module, neither touching hub.py/cdp.py
+(the extension-side attach/detach machinery itself is unmodified and untested here --
+this fix is entirely at the ORCHESTRATION layer, choosing what order to dispatch in and
+what to do with a result already received):**
+
+1. **Reorder per-tab CDP dispatch so the higher-value, structurally-safer captures run
+   BEFORE the one identified as the trigger** (`_capture_tab`). `mhtml` (L4) and
+   `nav_history` (L5) -- both structural document/session snapshots via
+   `Page.captureSnapshot`/`Page.getNavigationHistory`, neither requiring a painted frame
+   -- now dispatch BEFORE `screenshot` (L3), which is the one observed to throw `-32603`
+   on a tab with no paintable surface. `text`/`dom` (JS-injection, never CDP-paced) are
+   unaffected and still run first. Depth-ladder gating (`depth_idx >= _DEPTH_INDEX[...]`)
+   is unchanged for every capture -- only the DISPATCH ORDER within one `_capture_tab`
+   call moved; `CAPTURE_NAMES`'s tuple order (used for depth-reachability bookkeeping,
+   never for dispatch sequencing) is unaffected.
+2. **Isolate remaining per-tab CDP captures from an observed per-tab detach**
+   (`_is_per_tab_cdp_session_error`, matched against `_PER_TAB_CDP_SIGNATURES` --
+   `Detached while handling command` and CDP `-32603` ONLY, deliberately excluding the
+   genuine-disconnect pair). If a CDP-based capture's own result matches this per-tab
+   signature, `_capture_tab` issues one best-effort, explicit `attach` command (the same
+   wire command `cdp.py`'s docstring already describes an agent's own explicit `attach`
+   producing) for THIS tab before the NEXT CDP-based capture on it -- rather than
+   assuming a fresh attach will happen on its own. This is orchestrator-level recovery
+   bookkeeping, not itself a paced/recorded capture: it is dispatched with `is_cdp=False`
+   (never counted in `support.pacer`'s device-health accounting) and never appears in the
+   tab's own `captures` dict; a failed re-attach simply means the next capture proceeds
+   and, if the tab truly cannot be reached, fails and is recorded as an honest per-tab
+   failure like any other (module docstring's "No silent partial success" section is
+   unaffected). Combined with (1), this protects EVERY per-tab CDP capture from EVERY
+   other one on the same tab, not just the one specific screenshot-then-mhtml ordering
+   the eval evidence named.
+
+**Re-scoping the device-health classifier** (the other half of this fix, described in
+"Device health" above's correction note): `_CdpPacer.record_result` now calls
+`_is_device_disconnect_error` (matching only `disconnected mid-command`/`could not reach
+hub`) instead of the old four-signature classifier, so an isolated per-tab `-32603`/
+`Detached while handling command` can NEVER consume `device_health_trip_threshold`'s
+budget or trigger `device_recovery_max_wait_s`'s 120s wait -- only a genuine run of
+device-level disconnects does. `device_health_trip_threshold`/`device_recovery_max_wait_s`
+themselves, and the trip/recovery MACHINERY in `_CdpPacer`, are unchanged: this is a
+re-scoping of WHAT counts as a trip signal, never a removal of the recovery path itself,
+which remains exactly what handles a genuine full-device disconnect (like the 62-tab
+incident above).
+
+**What this does NOT prove**: the tests this fix ships with (fake-client, no live
+browser -- see "Impossible depth"'s sibling constraint on how this module is tested)
+prove the MECHANISM is correct: a tab whose screenshot throws `-32603` still gets its
+mhtml captured, and an isolated per-tab signal no longer trips the recovery wait. They do
+not, by themselves, prove a specific improved capture rate, health-trip count, or
+duration on the real 28-tab device this finding was measured against -- that requires a
+live eval run of the same scenario with this fix engaged, measured the same way the two
+identical baseline numbers above were.
 
 ## Chunking: keeping the device under its drop threshold in the first place
 
@@ -370,6 +472,21 @@ confirm it before continuing -- but they do not, by themselves, prove a specific
 improved capture rate on a real device. That requires a live eval run of the same
 28-tab scenario with chunking engaged, measured the same way the two baseline numbers
 above were.
+
+**Correction, from a THIRD eval run (see "Per-tab CDP isolation" above): the
+load-dependent theory this section is built on is DISPROVEN.** Running the identical
+28-tab scenario WITH chunking engaged produced the IDENTICAL result to running it
+WITHOUT chunking (rate 0.571, 9 failed, 5 health_trips, both runs) -- if the device were
+genuinely being overwhelmed by burst volume, bounding that volume into smaller,
+settled-between chunks should have changed the outcome, and it changed nothing. The real
+failure is per-tab (a screenshot detach cascading into mhtml on the SAME tab), not
+load-dependent, and chunking was never addressing it. `cdp_chunk_size`/
+`cdp_chunk_cooldown_s` are left in place as an OPT-IN knob (default unchanged, `<= 0`
+still disables it) rather than removed outright -- a large archive genuinely can still
+generate more total dispatches than a small one, and a proactive settle-between-batches
+mechanism is not inherently wrong, even though it does not address the specific failure
+mode this module's evidence points to. Do not reach for it as the fix for a low capture
+rate; reach for the per-tab isolation and re-scoped health classification above first.
 """
 
 from __future__ import annotations
@@ -462,9 +579,13 @@ DEFAULT_CDP_BACKPRESSURE_MAX_WAIT_S: float = 20.0
 # same dead connection again.
 # ---------------------------------------------------------------------------
 
-# Consecutive CDP-paced capture failures matching a device-health signature
-# (see `_is_device_health_error`) before `_CdpPacer` stops treating the device
-# as merely slow and starts treating it as genuinely IN TROUBLE -- escalating
+# Consecutive CDP-paced capture failures matching a GENUINE device-level
+# disconnect signature (see `_is_device_disconnect_error` -- deliberately NOT the
+# narrower per-tab `-32603`/`Detached while handling command` faults, which
+# `_is_per_tab_cdp_session_error` handles separately and never counts here; see
+# module docstring's "Per-tab CDP isolation" section) before `_CdpPacer` stops
+# treating the device as merely slow and starts treating it as genuinely IN
+# TROUBLE -- escalating
 # to `_wait_for_device_recovery`'s much larger budget instead of the ordinary
 # tier-backpressure wait. `<= 0` disables device-health escalation entirely
 # (mirroring the existing "0 disables" convention `cdp_backpressure_max_wait_s`
@@ -678,36 +799,73 @@ def _capture_failed(error: str) -> dict[str, Any]:
 # text (never against `text`/`dom`/profile-data errors -- those are not paced
 # and are not implicated by the incident this responds to).
 #
-# Deliberately narrow and literal, not a broad heuristic: each one is a
-# property of the CONNECTION/DEBUGGER SESSION, not of the PAGE being
-# captured, and each was observed VERBATIM in the live incident this closes
-# (a 62-tab L4 archive: 36 captured, 24 failed, 2 partial, 742.9s).
+# Deliberately narrow and literal, not a broad heuristic: each one was observed
+# VERBATIM in a real incident this module closes. Originally bucketed together as
+# a single `_DEVICE_HEALTH_SIGNATURES` tuple (a 62-tab L4 archive: 36 captured, 24
+# failed, 2 partial, 742.9s) -- see module docstring's "Device health" section --
+# but a LATER incident (two 28-tab eval runs, "Per-tab CDP isolation" section)
+# proved that bucket was itself over-broad: `-32603`/`Detached while handling
+# command` are properties of a single TAB's `chrome.debugger` session, not the
+# device/connection as a whole, and must never consume the device-recovery budget
+# a genuine full disconnect needs. The signatures are now split into two disjoint
+# sets by what they actually indicate, not merged into one:
+#
+#   - `_DEVICE_DISCONNECT_SIGNATURES`: the CONNECTION itself is in trouble
+#     (websocket teardown / hub unreachable) -- these, and ONLY these, count
+#     toward `_CdpPacer`'s device-health trip threshold (`_is_device_disconnect_error`).
+#   - `_PER_TAB_CDP_SIGNATURES`: ONE tab's CDP session came loose -- used only to
+#     decide whether `_capture_tab` should force a fresh `attach` before this
+#     tab's NEXT CDP capture (`_is_per_tab_cdp_session_error`), never fed into the
+#     device-health trip counter.
+#
 # `"-32603"` matches CDP's own JSON-RPC "Internal error" code
 # (`{"code":-32603,"message":"Internal error"}`) rather than the bare phrase
-# "internal error", which is common enough in unrelated page/server error
-# text to risk false-positively treating an ordinary page failure as a
-# device-health signal.
-_DEVICE_HEALTH_SIGNATURES: tuple[str, ...] = (
-    "detached while handling command",
-    "disconnected mid-command",
-    "-32603",
-    "could not reach hub",
+# "internal error", which is common enough in unrelated page/server error text to
+# risk false-positively treating an ordinary page failure as a CDP-session signal.
+_DEVICE_DISCONNECT_SIGNATURES: tuple[str, ...] = (
+    "disconnected mid-command",  # registry.py's `DeviceRecord.unbind` -- websocket gone
+    "could not reach hub",  # client.py -- transport-level failure to reach the hub at all
+)
+
+_PER_TAB_CDP_SIGNATURES: tuple[str, ...] = (
+    "detached while handling command",  # this ONE tab's chrome.debugger session came loose
+    "-32603",  # CDP JSON-RPC "Internal error" -- e.g. no paintable surface to screenshot
 )
 
 
-def _is_device_health_error(error: Any) -> bool:
-    """True if `error` names a DEVICE-HEALTH failure (the CDP layer/connection
-    itself is in trouble) rather than an ordinary per-page content failure --
-    see `_DEVICE_HEALTH_SIGNATURES` above. Used by `_CdpPacer.record_result`
-    to decide whether a CDP-paced capture's failure should count toward the
-    device-health trip threshold; never changes how the failure itself is
-    recorded in the per-tab manifest (module docstring's "No silent partial
-    success" section still applies unchanged -- this is purely a PACING
-    signal, not a correctness one)."""
+def _is_device_disconnect_error(error: Any) -> bool:
+    """True if `error` names a genuine DEVICE-LEVEL disconnect (the websocket/hub
+    connection itself is in trouble) -- see `_DEVICE_DISCONNECT_SIGNATURES` above.
+    Used by `_CdpPacer.record_result` to decide whether a CDP-paced capture's
+    failure should count toward the device-health trip threshold; never changes
+    how the failure itself is recorded in the per-tab manifest (module docstring's
+    "No silent partial success" section still applies unchanged -- this is purely
+    a PACING signal, not a correctness one).
+
+    Deliberately narrower than the tab-level `_is_per_tab_cdp_session_error`
+    below -- a single tab's `chrome.debugger` session coming loose (`-32603`,
+    `Detached while handling command`) is NOT evidence the device itself is in
+    trouble (module docstring's "Per-tab CDP isolation" section), and must never
+    consume this budget."""
     if not isinstance(error, str) or not error:
         return False
     lowered = error.lower()
-    return any(signature in lowered for signature in _DEVICE_HEALTH_SIGNATURES)
+    return any(signature in lowered for signature in _DEVICE_DISCONNECT_SIGNATURES)
+
+
+def _is_per_tab_cdp_session_error(error: Any) -> bool:
+    """True if `error` names a PER-TAB CDP session fault (this one tab's
+    `chrome.debugger` session came loose) -- see `_PER_TAB_CDP_SIGNATURES` above.
+    Used only by `_capture_tab` to decide whether to force a fresh `attach` for
+    THIS tab before its next CDP-based capture (module docstring's "Per-tab CDP
+    isolation" section) -- deliberately never fed into `_CdpPacer.record_result`
+    or the device-health trip counter; a per-tab fault must never be mistaken for
+    device-wide trouble, which is exactly the misclassification this split
+    corrects."""
+    if not isinstance(error, str) or not error:
+        return False
+    lowered = error.lower()
+    return any(signature in lowered for signature in _PER_TAB_CDP_SIGNATURES)
 
 
 @dataclass
@@ -915,8 +1073,11 @@ class _CdpPacer:
     ) -> None:
         """Escalated recovery wait, triggered once `record_result` has counted
         `device_health_trip_threshold` consecutive CDP-paced failures matching
-        a device-health signature (`_is_device_health_error`) -- i.e. the
-        device itself appears to be in trouble, not merely one page. Uses
+        a GENUINE device-level disconnect signature (`_is_device_disconnect_error`
+        -- deliberately excludes the narrower per-tab `-32603`/`Detached while
+        handling command` faults `_is_per_tab_cdp_session_error` handles; see
+        module docstring's "Per-tab CDP isolation" section) -- i.e. the
+        device itself appears to be in trouble, not merely one tab. Uses
         `device_recovery_max_wait_s` (deliberately much larger than
         `max_wait_s`/`_wait_for_recovery` above) because a genuine reconnect
         needs real time for the extension to re-establish its websocket and
@@ -987,16 +1148,22 @@ class _CdpPacer:
     def record_result(self, result: Any, *, on_event: Callable[[dict[str, Any]], None]) -> None:
         """Feeds a just-completed CDP-paced capture's OWN outcome back into this
         pacer -- called by `_safe_command` only for `is_cdp=True` dispatches,
-        after `_resolve_queued` has produced a terminal result. A device-health
-        failure (`_is_device_health_error`) increments the consecutive-failure
-        counter `before_dispatch` checks on the NEXT CDP dispatch; anything
-        else (success, or an ordinary per-page content failure) resets it --
-        only a genuine RUN of device-health signals trips the escalation, not
-        one isolated page failure mixed in among otherwise-healthy captures.
+        after `_resolve_queued` has produced a terminal result. A genuine
+        DEVICE-level disconnect (`_is_device_disconnect_error` --
+        `disconnected mid-command`/`could not reach hub` ONLY, see module
+        docstring's "Per-tab CDP isolation" correction) increments the
+        consecutive-failure counter `before_dispatch` checks on the NEXT CDP
+        dispatch; anything else -- success, an ordinary per-page content
+        failure, OR a per-TAB CDP session fault (`-32603`/`Detached while
+        handling command`; see `_is_per_tab_cdp_session_error`, checked
+        separately by `_capture_tab` for tab-local isolation, never here) --
+        resets it. Only a genuine RUN of device-level disconnect signals trips
+        the escalation; a per-tab fault, however many tabs it touches, never
+        does.
         """
         ok = isinstance(result, dict) and result.get("ok") is True
         error = result.get("error") if isinstance(result, dict) else None
-        if not ok and _is_device_health_error(error):
+        if not ok and _is_device_disconnect_error(error):
             self._consecutive_health_failures += 1
             self.device_health_signals += 1
             on_event(
@@ -1593,6 +1760,44 @@ async def _capture_tab(
                 {"scope": "tab", "tab_id": tab_id, "capture": name, "error": capture_entry.get("error")}
             )
 
+    # Per-tab CDP isolation -- see module docstring's "Per-tab CDP isolation" section.
+    # Set to True whenever a just-completed CDP-based capture's OWN result matched a
+    # per-tab session fault (`_is_per_tab_cdp_session_error` -- `-32603`/`Detached
+    # while handling command`, NEVER a genuine device disconnect, which is a
+    # separate, device-scoped signal `_CdpPacer` handles). Consumed (and cleared) by
+    # `_reattach_if_needed` immediately before the NEXT CDP-based capture for THIS
+    # tab, so one tab's broken session cannot cascade into another capture on the
+    # same tab. `nonlocal` rather than a class: this state is scoped to one
+    # `_capture_tab` call (one tab), never shared across tabs.
+    needs_reattach = False
+
+    def note_cdp_result(result: Any) -> None:
+        nonlocal needs_reattach
+        if (
+            isinstance(result, dict)
+            and result.get("ok") is not True
+            and _is_per_tab_cdp_session_error(result.get("error"))
+        ):
+            needs_reattach = True
+
+    async def reattach_if_needed() -> None:
+        """Best-effort, explicit `attach` for THIS tab -- issued only when a PRIOR
+        CDP-based capture on it observed a per-tab session fault, immediately before
+        the next one dispatches. This is orchestrator-level recovery bookkeeping, not
+        itself a paced/recorded capture: `is_cdp=False` (never counted toward
+        `support.pacer`'s device-health trip accounting -- that budget is reserved
+        for genuine device-level disconnects, not a single tab's re-attach) and its
+        result is never written into `entry["captures"]`. A failed re-attach is not
+        raised or treated specially here -- the next capture attempt simply proceeds
+        and, if the tab truly cannot be reached, fails and is recorded as an honest
+        per-tab failure like any other (module docstring's "No silent partial
+        success" section)."""
+        nonlocal needs_reattach
+        if not needs_reattach:
+            return
+        await _safe_command(client, target, "attach", {}, support)
+        needs_reattach = False
+
     if depth_idx >= _DEPTH_INDEX["L1"]:
         if allowed("text"):
             read_args = {**injection_args}
@@ -1610,33 +1815,49 @@ async def _capture_tab(
         else:
             record("dom", _capture_skipped_by_config("dom"))
 
-    if depth_idx >= _DEPTH_INDEX["L3"]:
-        if allowed("screenshot"):
-            screenshot_args = {**base_args}
-            if use_capture_hidden:
-                screenshot_args["capture_hidden"] = True
-            # `screenshot` is CDP-based only when it carries `capture_hidden` --
-            # see module docstring's "Pacing" section and `_CdpPacer`.
-            result = await _safe_command(
-                client, target, "screenshot", screenshot_args, support, is_cdp=use_capture_hidden
-            )
-            record("screenshot", _record_screenshot_capture(tab_dir, result))
-        else:
-            record("screenshot", _capture_skipped_by_config("screenshot"))
-
+    # `mhtml` (L4) and `nav_history` (L5) dispatch BEFORE `screenshot` (L3) here --
+    # deliberately NOT the depth ladder's own introduction order (see module
+    # docstring's "Per-tab CDP isolation" section). `Page.captureScreenshot` is the
+    # capture observed to throw CDP `-32603` on a tab with no paintable surface
+    # (e.g. woken from discard); `Page.captureSnapshot`/`Page.getNavigationHistory`
+    # need no painted frame and are not implicated. Capturing the structurally safer,
+    # higher-value snapshots FIRST means a screenshot-induced detach can no longer
+    # cascade into them -- only `screenshot` itself, last, is ever at risk of being
+    # doomed by an earlier failure on this tab (there is nothing scheduled after it).
+    # Depth-ladder gating is unchanged; only DISPATCH ORDER moved.
     if depth_idx >= _DEPTH_INDEX["L4"]:
         if allowed("mhtml"):
             result = await _safe_command(client, target, "mhtml", dict(base_args), support, is_cdp=True)
+            note_cdp_result(result)
             record("mhtml", _record_mhtml_capture(tab_dir, result))
         else:
             record("mhtml", _capture_skipped_by_config("mhtml"))
 
     if depth_idx >= _DEPTH_INDEX["L5"]:
         if allowed("nav_history"):
+            await reattach_if_needed()
             result = await _safe_command(client, target, "nav_history", dict(base_args), support, is_cdp=True)
+            note_cdp_result(result)
             record("nav_history", _record_json_capture(tab_dir, "nav_history.json", result))
         else:
             record("nav_history", _capture_skipped_by_config("nav_history"))
+
+    if depth_idx >= _DEPTH_INDEX["L3"]:
+        if allowed("screenshot"):
+            await reattach_if_needed()
+            screenshot_args = {**base_args}
+            if use_capture_hidden:
+                screenshot_args["capture_hidden"] = True
+            # `screenshot` is CDP-based only when it carries `capture_hidden` --
+            # see module docstring's "Pacing" section and `_CdpPacer`. Dispatched
+            # LAST among this tab's CDP captures (see above) -- nothing else this
+            # run schedules for this tab can be doomed by ITS failure.
+            result = await _safe_command(
+                client, target, "screenshot", screenshot_args, support, is_cdp=use_capture_hidden
+            )
+            record("screenshot", _record_screenshot_capture(tab_dir, result))
+        else:
+            record("screenshot", _capture_skipped_by_config("screenshot"))
 
     entry["status"] = _tab_status(entry["captures"])
     return entry

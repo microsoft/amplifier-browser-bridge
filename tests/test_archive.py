@@ -32,7 +32,8 @@ from amplifier_browser_bridge.archive import (
     DEFAULT_DEVICE_RECOVERY_MAX_WAIT_S,
     ArchiveError,
     _chunk_tabs,
-    _is_device_health_error,
+    _is_device_disconnect_error,
+    _is_per_tab_cdp_session_error,
     run_archive,
 )
 from amplifier_browser_bridge.client import HubError
@@ -1608,38 +1609,77 @@ async def test_relative_dest_dir_with_tilde_is_expanded(
 # non-live mid-run and later recovers -- rather than only ever exercising the
 # happy path (a test where the device never drops cannot catch this
 # regression; see the task's own instruction).
+#
+# CORRECTION (see archive.py's module docstring "Per-tab CDP isolation"
+# section): a LATER 28-tab eval proved "Detached while handling command"/CDP
+# `-32603` are PER-TAB session symptoms, not device-wide ones -- only
+# "disconnected mid-command"/"could not reach hub" are genuine device-level
+# events. The classifier is now split (`_is_device_disconnect_error`,
+# `_is_per_tab_cdp_session_error`); tests below that simulate a genuine
+# device-wide trip now script the disconnect-only signatures, not the
+# per-tab ones -- scripting the per-tab pair no longer trips anything (see
+# the dedicated per-tab-isolation tests further down).
 # ---------------------------------------------------------------------------
 
 
-def test_is_device_health_error_matches_the_four_measured_signatures() -> None:
-    """Unit-level proof that the classifier recognizes exactly the four
-    signatures observed in the live incident, case-insensitively, and does
-    NOT flag an ordinary per-page content error as device trouble."""
-    assert _is_device_health_error("Detached while handling command.") is True
-    assert _is_device_health_error("DETACHED WHILE HANDLING COMMAND.") is True
-    assert _is_device_health_error('{"code":-32603,"message":"Internal error"}') is True
-    assert _is_device_health_error("device 16909b75-... disconnected mid-command") is True
+def test_is_device_disconnect_error_matches_only_the_genuine_device_signatures() -> None:
+    """Unit-level proof that the DEVICE-level classifier recognizes only the
+    two genuine connection/websocket signatures, case-insensitively, and does
+    NOT flag either an ordinary per-page content error OR a per-tab CDP
+    session fault as device-wide trouble -- that distinction is the whole
+    point of this fix (archive.py's "Per-tab CDP isolation" section)."""
+    assert _is_device_disconnect_error("device 16909b75-... disconnected mid-command") is True
     assert (
-        _is_device_health_error(
+        _is_device_disconnect_error(
             "could not reach hub at ws://100.124.126.19:8900/agent: timed out waiting for a response"
         )
         is True
     )
+    # Per-tab CDP session faults must NOT be misclassified as device-wide trouble
+    # -- this is the direct fix for the pre-correction over-broad classifier.
+    assert _is_device_disconnect_error("Detached while handling command.") is False
+    assert _is_device_disconnect_error('{"code":-32603,"message":"Internal error"}') is False
     # Ordinary page-content failures must never be misclassified as device trouble.
-    assert _is_device_health_error("Frame with ID 0 is showing error page") is False
-    assert _is_device_health_error("boom") is False
-    assert _is_device_health_error(None) is False
-    assert _is_device_health_error("") is False
+    assert _is_device_disconnect_error("Frame with ID 0 is showing error page") is False
+    assert _is_device_disconnect_error("boom") is False
+    assert _is_device_disconnect_error(None) is False
+    assert _is_device_disconnect_error("") is False
+
+
+def test_is_per_tab_cdp_session_error_matches_only_the_per_tab_signatures() -> None:
+    """Unit-level proof that the PER-TAB classifier recognizes exactly the two
+    per-tab session-fault signatures, case-insensitively, and does NOT flag a
+    genuine device-level disconnect or an ordinary per-page content error."""
+    assert _is_per_tab_cdp_session_error("Detached while handling command.") is True
+    assert _is_per_tab_cdp_session_error("DETACHED WHILE HANDLING COMMAND.") is True
+    assert _is_per_tab_cdp_session_error('{"code":-32603,"message":"Internal error"}') is True
+    # Genuine device-level disconnects must NOT be misclassified as a per-tab fault.
+    assert _is_per_tab_cdp_session_error("device 16909b75-... disconnected mid-command") is False
+    assert (
+        _is_per_tab_cdp_session_error(
+            "could not reach hub at ws://100.124.126.19:8900/agent: timed out waiting for a response"
+        )
+        is False
+    )
+    # Ordinary page-content failures must never be misclassified as a CDP fault.
+    assert _is_per_tab_cdp_session_error("Frame with ID 0 is showing error page") is False
+    assert _is_per_tab_cdp_session_error("boom") is False
+    assert _is_per_tab_cdp_session_error(None) is False
+    assert _is_per_tab_cdp_session_error("") is False
 
 
 @pytest.mark.asyncio
 async def test_device_disconnect_cascade_recovers_and_captures_later_tabs(tmp_path: Path) -> None:
-    """THE load-bearing regression test: a fake device whose CDP (`mhtml`)
-    commands start failing with device-health signatures after 2 successful
-    dispatches, tier reporting non-`live` for a stretch, then recovering --
-    the run must RECOVER (once tier confirms `live` again) and capture the
-    LATER tabs, rather than cascading the failure through every remaining
-    tab. A client that never drops cannot exercise this path at all."""
+    """THE load-bearing regression test for a GENUINE device-wide disconnect: a
+    fake device whose CDP (`mhtml`) commands start failing with genuine
+    device-disconnect signatures (`disconnected mid-command` -- NOT the
+    per-tab `-32603`/`Detached while handling command` pair, which no longer
+    trips anything -- see the per-tab-isolation tests further down) after 2
+    successful dispatches, tier reporting non-`live` for a stretch, then
+    recovering -- the run must RECOVER (once tier confirms `live` again) and
+    capture the LATER tabs, rather than cascading the failure through every
+    remaining tab. A client that never drops cannot exercise this path at
+    all."""
     tier_sequence = iter(["live", "intermittent", "intermittent", "live"])
 
     def _devices() -> list[dict[str, Any]]:
@@ -1654,8 +1694,8 @@ async def test_device_disconnect_cascade_recovers_and_captures_later_tabs(tmp_pa
         devices=_devices,
         extra_commands={
             "mhtml": [
-                {"ok": False, "error": "Detached while handling command."},
-                {"ok": False, "error": "Detached while handling command."},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
                 {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
                 {"ok": True, "result": {"tab_id": 104, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
             ]
@@ -1712,8 +1752,8 @@ async def test_device_recovery_gives_up_after_budget_and_applies_slowdown(tmp_pa
         devices=lambda: [{**_device_record(debugger=True), "tier": "dormant"}],
         extra_commands={
             "mhtml": [
-                {"ok": False, "error": "Detached while handling command."},
-                {"ok": False, "error": "Detached while handling command."},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
                 {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
             ]
         },
@@ -1746,9 +1786,9 @@ async def test_device_recovery_gives_up_after_budget_and_applies_slowdown(tmp_pa
 
 @pytest.mark.asyncio
 async def test_a_single_isolated_device_health_signal_does_not_trip(tmp_path: Path) -> None:
-    """One device-health-signature failure, surrounded by ordinary successes/
-    failures, must be recorded as a device-health SIGNAL (diagnostic) but must
-    NOT trip the escalated recovery wait -- only a genuine RUN of
+    """One genuine device-disconnect-signature failure, surrounded by ordinary
+    successes/failures, must be recorded as a device-health SIGNAL (diagnostic)
+    but must NOT trip the escalated recovery wait -- only a genuine RUN of
     `device_health_trip_threshold` CONSECUTIVE signals does that. This is the
     "distinct from a single per-tab content failure" requirement."""
     client = _basic_client(
@@ -1757,7 +1797,7 @@ async def test_a_single_isolated_device_health_signal_does_not_trip(tmp_path: Pa
         extra_commands={
             "mhtml": [
                 {"ok": False, "error": "some ordinary page rendering problem"},
-                {"ok": False, "error": "Detached while handling command."},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
                 {"ok": False, "error": "another ordinary page rendering problem"},
             ]
         },
@@ -1789,9 +1829,9 @@ async def test_device_health_escalation_can_be_disabled(tmp_path: Path) -> None:
         capabilities={"debugger": True},
         extra_commands={
             "mhtml": [
-                {"ok": False, "error": "Detached while handling command."},
-                {"ok": False, "error": "Detached while handling command."},
-                {"ok": False, "error": "Detached while handling command."},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
             ]
         },
     )
@@ -1812,6 +1852,235 @@ async def test_device_health_escalation_can_be_disabled(tmp_path: Path) -> None:
     # escalation never means disabling per-tab failure recording.
     for tab_id in ("101", "102", "103"):
         assert result["result"]["tabs"][tab_id]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Per-tab CDP isolation -- see archive.py's module docstring ("Per-tab CDP
+# isolation: a screenshot detach must not doom mhtml on the same tab") for the
+# two 28-tab eval runs (identical WITH and WITHOUT chunking engaged) this
+# responds to. Per-tab manifest analysis of both runs named the mechanism:
+# `screenshot` throws CDP `-32603` on a tab with no paintable surface, that
+# detaches the tab's OWN CDP session, and the SUBSEQUENT `mhtml` dispatch for
+# the SAME tab then fails with `Detached while handling command` -- a per-tab
+# cascade, not a device-wide one. These tests exercise the two-part fix:
+# reordering (mhtml/nav_history dispatch before screenshot) and re-scoping the
+# device-health classifier so an isolated per-tab fault never consumes the
+# device-recovery budget.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_screenshot_32603_does_not_cascade_into_mhtml_on_the_same_tab(tmp_path: Path) -> None:
+    """THE load-bearing regression test for this fix: a tab whose `screenshot`
+    capture raises CDP `-32603` must still get its `mhtml` capture -- the
+    exact eval finding (9/9 tabs: screenshot `-32603` first, then `mhtml`
+    `Detached while handling command` on the SAME tab). Before this fix,
+    `_capture_tab` dispatched `screenshot` (L3) before `mhtml` (L4), so a
+    `-32603` detach on `screenshot` left `mhtml`'s dispatch inheriting a
+    broken CDP session and failing too -- both captures failed, and the tab
+    was reported wholly `"failed"`. After the fix, `mhtml` dispatches FIRST
+    (while the session is still fresh) and succeeds regardless of what
+    happens to `screenshot` afterward -- the tab is honestly `"partial"`
+    (screenshot failed, mhtml ok), never `"failed"`, and never silently
+    retried. THIS TEST MUST FAIL AGAINST THE PRE-FIX DISPATCH ORDER."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "screenshot": {"ok": False, "error": '{"code":-32603,"message":"Internal error"}'},
+            "mhtml": {
+                "ok": True,
+                "result": {"tab_id": 101, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"},
+            },
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["screenshot", "mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+    )
+    manifest = result["result"]
+
+    # The load-bearing assertions: mhtml survived the screenshot's own
+    # detach, and the tab is reported partial -- not both-failed.
+    assert manifest["tabs"]["101"]["captures"]["mhtml"]["status"] == "ok"
+    assert manifest["tabs"]["101"]["captures"]["screenshot"]["status"] == "failed"
+    assert manifest["tabs"]["101"]["status"] == "partial"
+
+    # The actual mhtml bytes made it to disk -- not just an in-memory "ok".
+    mhtml_path = Path(manifest["tabs"]["101"]["captures"]["mhtml"]["path"])
+    assert mhtml_path.exists()
+    assert mhtml_path.read_text(encoding="utf-8") == "MHTML-DATA"
+
+    # An honest, non-cascading capture failure still shows up in `failures` --
+    # this fix is about isolation, never about hiding the real screenshot fault.
+    screenshot_failures = [f for f in manifest["failures"] if f.get("capture") == "screenshot"]
+    assert len(screenshot_failures) == 1
+    assert "-32603" in screenshot_failures[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_mhtml_dispatches_before_screenshot_at_l4(tmp_path: Path) -> None:
+    """Mechanism-level proof of the reorder itself: at L4 (`mhtml`+`screenshot`),
+    `mhtml` must be the FIRST CDP dispatch this tab makes, `screenshot` the
+    LAST -- the direct fix for the eval's observed ordering (screenshot fails
+    first, dooming the mhtml dispatched right after it, pre-fix)."""
+    client = _basic_client(tabs=[_tab(101)], capabilities={"debugger": True})
+    await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+    )
+    cdp_commands = [command for (_, command, _) in client.calls if command in ("mhtml", "screenshot")]
+    assert cdp_commands == ["mhtml", "screenshot"]
+
+
+@pytest.mark.asyncio
+async def test_isolated_per_tab_32603_does_not_trip_device_health_or_wait(tmp_path: Path) -> None:
+    """An isolated per-tab `-32603`/`Detached while handling command` fault --
+    even repeated across MANY tabs -- must NEVER increment
+    `device_health_trips`, NEVER consume the 120s `device_recovery_max_wait_s`
+    budget, and must NEVER even count as a `device_health_signal` (that
+    counter, like the trip counter, is reserved for genuine device-level
+    disconnects post-fix). This is the direct fix for the eval finding: 5
+    health-trips per 28-tab run were this misclassification, not real device
+    trouble, and were responsible for most of the run's 295s duration."""
+    tabs = [_tab(100 + i) for i in range(6)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        extra_commands={
+            "screenshot": {"ok": False, "error": '{"code":-32603,"message":"Internal error"}'},
+        },
+    )
+    started = time.monotonic()
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["screenshot", "mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+    )
+    elapsed = time.monotonic() - started
+
+    pacing = result["result"]["pacing"]
+    # The decisive proof: pre-fix, these six -32603 failures would have
+    # counted as device-health signals (old classifier matched "-32603"),
+    # tripped the escalation at threshold=2, and consumed a
+    # `device_recovery_max_wait_s`-bounded wait -- exactly the eval's "5
+    # health-trips per run, ~295s of mostly-wasted waiting" finding. Post-fix,
+    # none of that ever engages for a per-tab-only fault.
+    assert pacing["device_health_signals"] == 0
+    assert pacing["device_health_trips"] == 0
+    assert pacing["device_health_recoveries"] == 0
+    # This fake device's tier never leaves "live", so even a wrongly-tripped
+    # recovery wait would resolve near-instantly here -- this is a sanity
+    # bound, not the primary proof (the pacing counts above are).
+    assert elapsed < 5.0
+
+    # Every tab's mhtml still succeeded despite its own screenshot failing --
+    # per-tab isolation held for all six tabs, not just one.
+    for tab in tabs:
+        tab_id = str(tab["tab_id"])
+        assert result["result"]["tabs"][tab_id]["captures"]["mhtml"]["status"] == "ok"
+        assert result["result"]["tabs"][tab_id]["status"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_genuine_device_disconnect_still_trips_recovery_after_rescoping(tmp_path: Path) -> None:
+    """Regression guard: re-scoping the classifier to exclude per-tab
+    `-32603`/`Detached` must NOT regress the genuine case the recovery
+    machinery was built for. A run of GENUINE device-disconnect signatures
+    (`disconnected mid-command`) must still trip `device_health_trips` and
+    still recover once the device reports `live` again -- the real 62-tab
+    incident's mechanism, unaffected by this fix."""
+    tier_sequence = iter(["live", "intermittent", "intermittent", "live"])
+
+    def _devices() -> list[dict[str, Any]]:
+        record = _device_record(debugger=True)
+        record["tier"] = next(tier_sequence, "live")
+        return [record]
+
+    tabs = [_tab(101), _tab(102), _tab(103)]
+    client = _basic_client(
+        tabs=tabs,
+        capabilities={"debugger": True},
+        devices=_devices,
+        extra_commands={
+            "mhtml": [
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
+            ]
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L4",
+        captures=["mhtml"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+        device_health_trip_threshold=2,
+        device_recovery_max_wait_s=5.0,
+    )
+    pacing = result["result"]["pacing"]
+    assert pacing["device_health_signals"] == 2
+    assert pacing["device_health_trips"] == 1
+    assert pacing["device_health_recoveries"] == 1
+    assert result["result"]["tabs"]["103"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_per_tab_detach_triggers_an_explicit_reattach_before_the_next_cdp_capture(
+    tmp_path: Path,
+) -> None:
+    """Mechanism-level proof of the reattach isolation: once `mhtml`'s own
+    result matches a per-tab CDP session fault, `_capture_tab` must issue an
+    explicit `attach` for THIS tab before the NEXT CDP-based capture
+    (`nav_history`) -- rather than assuming a fresh attach happens on its
+    own. The `attach` call must never be recorded as its own entry in the
+    tab's `captures` dict (it is orchestrator bookkeeping, not a capture)."""
+    client = _basic_client(
+        tabs=[_tab(101)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "mhtml": {"ok": False, "error": "Detached while handling command."},
+        },
+    )
+    result = await run_archive(
+        client,
+        _DEVICE_ID,
+        tmp_path,
+        depth="L5",
+        captures=["mhtml", "nav_history"],
+        cdp_pace_s=0.0,
+        cdp_backpressure_max_wait_s=0.0,
+    )
+    commands = [command for (_, command, _) in client.calls]
+    assert "attach" in commands
+    # The reattach happens AFTER mhtml's own failed dispatch and BEFORE
+    # nav_history's -- not before mhtml (nothing preceded it) and not
+    # redundantly repeated.
+    assert commands.index("mhtml") < commands.index("attach") < commands.index("nav_history")
+    assert commands.count("attach") == 1
+
+    # `attach` is orchestrator bookkeeping only -- never surfaced as its own
+    # capture entry, and nav_history still gets its normal outcome recorded.
+    assert "attach" not in result["result"]["tabs"]["101"]["captures"]
+    assert result["result"]["tabs"]["101"]["captures"]["nav_history"]["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -2127,8 +2396,8 @@ async def test_chunking_composes_with_mid_chunk_device_recovery(tmp_path: Path) 
         devices=_devices,
         extra_commands={
             "mhtml": [
-                {"ok": False, "error": "Detached while handling command."},
-                {"ok": False, "error": "Detached while handling command."},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
+                {"ok": False, "error": f"device {_DEVICE_ID} disconnected mid-command"},
                 {"ok": True, "result": {"tab_id": 103, "format": "mhtml", "bytes": 5, "data": "D"}},
                 {"ok": True, "result": {"tab_id": 104, "format": "mhtml", "bytes": 5, "data": "D"}},
                 {"ok": True, "result": {"tab_id": 105, "format": "mhtml", "bytes": 5, "data": "D"}},
