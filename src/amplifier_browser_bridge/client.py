@@ -17,7 +17,7 @@ from typing import Any
 import websockets
 
 from .addressing import Target
-from .protocol import PROTOCOL_VERSION, new_id
+from .protocol import MAX_WS_MESSAGE_BYTES, PROTOCOL_VERSION, new_id
 
 
 class HubError(RuntimeError):
@@ -95,7 +95,20 @@ class HubClient:
         # gave up first. `open_timeout` (connection establishment) is unaffected
         # and stays enforced.
         try:
-            async with websockets.connect(self.url, open_timeout=10, ping_interval=None) as ws:
+            # max_size=MAX_WS_MESSAGE_BYTES (protocol.py): without an explicit
+            # value here, this library defaults to 2**20 (1MB) -- see
+            # protocol.py's "WebSocket message-size ceiling" section for the
+            # real-world failure (archiving four real pages at MHTML depth)
+            # this closes, and why the bound is explicit rather than removed
+            # entirely. A capture that still exceeds even this raised bound
+            # surfaces as an ordinary `websockets.exceptions.WebSocketException`
+            # below, translated into a `HubError` like any other connection
+            # failure -- callers that issue captures per-tab (archive.py's
+            # `_safe_command`) treat that as one failed capture, not a reason
+            # to abandon the rest of a run.
+            async with websockets.connect(
+                self.url, open_timeout=10, ping_interval=None, max_size=MAX_WS_MESSAGE_BYTES
+            ) as ws:
                 await ws.send(json.dumps(req))
                 raw = await asyncio.wait_for(ws.recv(), timeout=effective_timeout)
         except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as e:

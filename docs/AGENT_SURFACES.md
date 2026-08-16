@@ -254,6 +254,19 @@ An L0 archive of 735 real tabs reports `tabs_inventoried: 735` alongside
 `tabs_captured: 0` -- never `tabs_inventoried: 0`, which would misread as "nothing
 was archived" when 735 tabs are sitting on disk.
 
+**Transport failures fail one capture, never the whole run**: a real page's
+`mhtml` capture can be large enough to exceed a WebSocket's message-size limit
+(`docs/PROTOCOL.md`'s "WebSocket message-size ceiling" section) -- or hit any
+other connection-level failure mid-archive. Every per-capture/per-profile-item
+wire call this tool composes goes through one choke point (`archive.py`'s
+`_safe_command`) that turns that failure into an ordinary recorded capture
+failure, exactly like an explicit `{"ok": false, ...}` result -- the run
+continues to the next tab, and every tab already captured (and already written
+to disk) survives in the final manifest. Before this fix, an uncaught transport
+failure partway through a run aborted `run_archive` entirely -- discarding
+every already-captured tab's manifest entry, since `manifest.json` is written
+only once, at the very end.
+
 Per-tab status is likewise not binary: `"ok"` (every attempted capture succeeded),
 `"partial"` (some succeeded, some failed -- e.g. a browser error page where
 CDP-based captures like `mhtml`/`screenshot`/`nav_history` succeed even though
@@ -281,6 +294,28 @@ it (a vanished tab was never actually attempted), and `manifest["status"]` becom
 `"ok_with_skips"` -- the same bucket `"skipped"` tabs use, since both are benign,
 non-failure gaps. The top-level `manifest["requested_tab_ids_not_found"]` list is a
 convenience summary of the same ids.
+
+**Injection budget and explicit capture selection**: because the depth ladder is a
+strict superset, requesting L4 also runs L1/L2 (`text`/`dom`, JS-injection-based)
+first. Real-world finding: on heavy hydrated SPAs, injection captures timed out at
+both 90s and 120s budgets while CDP-based captures (`mhtml`/`screenshot`/
+`nav_history`) succeeded on the same tabs in seconds -- for an archive spanning many
+tabs, every tab pays up to two full injection timeouts before reaching the capture
+actually wanted. Two optional args address this without abandoning the
+strict-superset default: `injection_timeout_s` overrides `timeout_s` for JUST
+`text`/`dom`, bounding the wall-clock cost of a hung SPA's injection captures
+without ever reducing what gets attempted (they still run, they just fail fast
+instead of consuming the full budget); `captures` is an explicit allow-list
+(`"text"`/`"dom"`/`"screenshot"`/`"mhtml"`/`"nav_history"`) that narrows -- never
+widens -- which per-tab captures run at all, e.g. a "CDP-only" archive that skips
+`text`/`dom` entirely (zero cost, not attempted-then-bounded). A capture `captures`
+excludes is recorded as `{"status": "skipped", "reason": ...}` -- the same status a
+no-wake skip or opt-out cookies skip already uses -- and excluded from a tab's own
+ok/failed rollup, so a tab where every attempted capture succeeded still reports
+plain `"ok"` even with some captures configured out. Both default to `None` (no
+change from prior behavior); an invalid `captures` (empty, unrecognized name, or
+nothing reachable at the requested `depth`) raises before anything is captured,
+the same fail-loud posture as an impossible depth.
 
 ## Browser-state archive: MHTML -> markdown conversion
 

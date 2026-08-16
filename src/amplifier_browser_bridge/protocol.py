@@ -202,6 +202,43 @@ CDP_INTENT_ARGS: frozenset[str] = frozenset({"trusted", "capture_hidden"})
 HUB_ONLY_ARGS: frozenset[str] = frozenset({"timeout_s"})
 
 # ---------------------------------------------------------------------------
+# WebSocket message-size ceiling
+# ---------------------------------------------------------------------------
+# Neither WebSocket library this codebase depends on was ever asked, on this
+# protocol's behalf, how big a single message is allowed to be -- each was
+# left on its own generic default:
+#
+#   - `websockets` (the CLIENT's library -- client.py's `websockets.connect`)
+#     defaults `max_size` to 2**20 (1,048,576) bytes.
+#   - `aiohttp` (the HUB's library -- hub.py's two `web.WebSocketResponse()`
+#     routes, `/device` and `/agent`) defaults `max_msg_size` to
+#     4 * 1024 * 1024 (4MB).
+#
+# Real-world finding: archiving four real web pages at MHTML depth (L4 --
+# `Page.captureSnapshot`, archive.py) died with `websockets`' own "sent 1009
+# (message too big) frame exceeds limit of 1048576 bytes" -- the CLIENT
+# tripping its unset (so default) 1MB cap while receiving the hub's relayed
+# `mhtml` result. A real page's MHTML inlines every stylesheet, font, and
+# image it references and routinely lands well past 1MB -- sometimes past
+# 4MB too -- for a genuinely heavy page (github.com, huggingface.co); the
+# earlier MHTML testing that never hit this only used 30-62KB local test
+# decks, nowhere near either default.
+#
+# One shared, EXPLICIT, BOUNDED ceiling, applied identically to all three
+# legs of a round trip (device -> hub, hub -> agent, and the agent/CLI
+# client's own receive) -- so no leg silently enforces a smaller limit than
+# another, and a payload that clears one hop only to be rejected by the next
+# is not a failure mode this protocol has to reason about. Deliberately NOT
+# `None`/unbounded: an unbounded per-message size is an unbounded per-command
+# memory allocation on both the hub and the client, for a payload size the
+# caller cannot predict or cap themselves. 64MiB is comfortably past any real
+# MHTML capture observed in practice while still being a real ceiling -- a
+# capture that manages to exceed even this fails that ONE capture (see
+# archive.py's `_safe_command`), never the whole archive run, and never
+# silently (docs/PROTOCOL.md's "WebSocket message-size ceiling" section).
+MAX_WS_MESSAGE_BYTES: int = 64 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
 # Message type vocabularies
 # ---------------------------------------------------------------------------
 

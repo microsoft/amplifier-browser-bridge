@@ -40,6 +40,41 @@ The extension always dials **out** to the hub -- it never listens on an inbound 
 what lets it work behind NAT, survive network roaming, and require zero port-forwarding setup
 on the browser's device (design doc §3.1).
 
+## WebSocket message-size ceiling
+
+Every leg of a round trip -- the extension's `/device` connection, the hub's `/agent` route, and
+the agent/CLI client's own connection -- enforces the SAME explicit ceiling on a single message:
+`MAX_WS_MESSAGE_BYTES` (`protocol.py`), **64MiB**.
+
+Neither WebSocket library this codebase depends on was ever asked, on this protocol's behalf, how
+big a single message may be -- each defaulted to its own generic value: `websockets` (the client's
+library, `client.py`) defaults `max_size` to 2**20 (1MB); `aiohttp` (the hub's library, both
+`web.WebSocketResponse()` routes in `hub.py`) defaults `max_msg_size` to 4MB. This protocol
+legitimately carries payloads that exceed both -- a real page's MHTML capture (`mhtml`,
+`Page.captureSnapshot`) inlines every stylesheet, font, and image the page references, and
+routinely lands well past 1MB, sometimes past 4MB, for a genuinely heavy real-world page
+(github.com, huggingface.co). Real-world finding: archiving four such pages at MHTML depth (see
+"Browser-state archive" below) died with `websockets`' own `sent 1009 (message too big) frame
+exceeds limit of 1048576 bytes` -- the CLIENT tripping its unset (so default) 1MB cap while
+receiving the hub's relayed `mhtml` result.
+
+The fix is one explicit, shared, BOUNDED constant applied to all three legs -- `websockets.connect
+(..., max_size=MAX_WS_MESSAGE_BYTES)` in `client.py`, and `web.WebSocketResponse(...,
+max_msg_size=MAX_WS_MESSAGE_BYTES)` on both hub routes -- so no leg silently enforces a smaller
+limit than another, and a payload that clears one hop only to be rejected by the next is not a
+failure mode this protocol has to reason about. Deliberately NOT unbounded: an unlimited
+per-message size is an unlimited per-command memory allocation on both the hub and the client, for
+a payload size the caller cannot predict or cap themselves.
+
+A capture that still manages to exceed even this raised ceiling -- or hits any other
+transport-level failure -- surfaces as an ordinary `HubError` to a direct `HubClient` caller. The
+browser-state archive orchestrator (`archive.py`) goes one step further: every per-capture/
+per-profile-item wire call goes through a single choke point (`_safe_command`) that turns a
+`HubError` into an ordinary `{"ok": false, ...}` capture failure recorded in the archive manifest,
+so ONE oversized or otherwise unreachable page fails only that capture -- never the whole archive
+run. See "Browser-state archive" below and `archive.py`'s module docstring ("No silent partial
+success").
+
 ---
 
 ## Device protocol (extension <-> hub)
@@ -1425,6 +1460,80 @@ counts it explicitly, `summary["tabs_capture_attempted"]` excludes it (a vanishe
 actually attempted), and `manifest["status"]` becomes `"ok_with_skips"`, the same bucket
 `"skipped"` tabs use since both are benign, non-failure gaps. The top-level
 `manifest["requested_tab_ids_not_found"]` list remains a convenience summary of the same ids.
+
+#### Injection budget and explicit capture selection
+
+Because the depth ladder is a strict superset, requesting L4 (MHTML) also runs L1 (`text`) and L2
+(`dom`) first -- both JS-injection-based (`read`/`page_state`). Real-world finding: on heavy
+hydrated SPAs (github.com, huggingface.co), the injection captures timed out at BOTH 90s and 120s
+budgets, while the CDP-based captures (`mhtml`/`screenshot`/`nav_history`) succeeded on the SAME
+tabs in seconds. For an archive spanning many tabs, every tab pays up to two full injection
+timeouts before reaching the capture the caller actually wanted.
+
+Two independent, optional knobs address this WITHOUT abandoning the strict-superset property as
+the default:
+
+- **`injection_timeout_s`** (`run_archive`/`browser_archive`): overrides `timeout_s` for JUST the
+  injection-based captures (`text`/`dom`) -- CDP-based captures keep using `timeout_s` (or the hub
+  default) unchanged. Bounds the wall-clock cost of a hung/heavy SPA's injection captures without
+  ever reducing what the depth ladder attempts: `text`/`dom` are still attempted, they just fail
+  fast (an ordinary `"failed"` capture) instead of consuming the full budget. `None` (the default)
+  means no override -- behavior is byte-for-byte unchanged from before this argument existed.
+- **`captures`** (`run_archive`/`browser_archive`): an explicit allow-list, from `CAPTURE_NAMES`
+  (`"text"`, `"dom"`, `"screenshot"`, `"mhtml"`, `"nav_history"`), that narrows -- never widens --
+  which per-tab captures actually run at this depth. `captures=["mhtml", "screenshot",
+  "nav_history"]` with `depth="L4"` is a "CDP-only" archive: `text`/`dom` are never attempted at
+  all for any tab, zero wall-clock cost, instead of attempted-then-bounded. A capture the depth
+  ladder would otherwise have included, but that `captures` excludes, is recorded as
+  `{"status": "skipped", "reason": ...}` -- the SAME status a no-wake tab skip or an opt-out
+  `cookies_list` skip already uses -- never silently omitted, and excluded from the ok/failed
+  accounting a tab's own rollup status computes (`archive.py`'s `_tab_status`), so a tab where
+  every ATTEMPTED capture succeeded still reports plain `"ok"` even though some captures were
+  configured out. `None` (the default) means no narrowing -- the pre-existing strict-superset
+  behavior. `manifest["captures_requested"]` records exactly what was passed (or `None`), so a
+  caller reading the manifest later can tell what was actually asked for.
+
+  Validated PRE-FLIGHT (`archive.py`'s `_validate_captures`), before anything is captured: an
+  empty list, an unrecognized name, or a `captures` set naming nothing reachable at the requested
+  `depth` (e.g. `captures=["mhtml"]` with `depth="L1"`, which would silently capture nothing for
+  every tab in the run) all raise `ArchiveError` immediately -- the same fail-loud posture as the
+  "Impossible depth" check above, one level down.
+
+A caller must never be able to silently get less than they asked for: a capture skipped by
+`captures` is always distinct from one attempted-and-failed, exactly as `"skipped"`/`"not_found"`
+already are at the tab level.
+
+#### Queued commands and pacing (large archives)
+
+`run_archive` is one caller among several that issues ordinary `command()` requests over the
+`/agent` route -- so it is fully subject to the queued-command contract above ("This is the
+load-bearing non-blocking guarantee"): a per-tab/profile-data command dispatched to a non-live
+device returns `{"status": "queued", ...}` immediately. `run_archive` follows a queued response
+with `poll` until it resolves to a real result -- or gives up after `poll_max_wait_s` (default
+90s, checked every `poll_interval_s`, default 2s) and records an honest failure rather than
+hanging the archive indefinitely. This closes a real-world gap: a prior version treated the
+queued response ITSELF as the final, failed outcome and never called `poll` at all, so when a
+126-tab archive's own command volume pushed the device off `live` partway through, ~200
+commands the device went on to actually execute were all recorded as failures -- the work was
+done; the answers were discarded. `manifest["pacing"]["queued_waits"]`/`["queued_wait_total_s"]`/
+`["queued_timeouts"]` summarize how much of this happened during a given run.
+
+The same real-world archive is also why `run_archive` paces its own CDP-requiring per-tab
+dispatches (`mhtml`, `nav_history`, and `screenshot` when using `capture_hidden` -- see
+"Unconditionally CDP-requiring commands" above): nothing previously limited how fast these were
+fired, and doing so back-to-back with zero gap is what overwhelmed the device's extension in the
+first place. `cdp_pace_s` (default 0.2s) enforces a floor on the interval between successive CDP
+dispatches; independently, before each one, a cheap hub-local `list_devices()` tier check waits
+(bounded exponential backoff, cap `cdp_backpressure_max_wait_s`, default 20s) for a
+non-`live` device to recover before proceeding, rather than adding more commands to a device that
+has already shown it cannot keep up. Both are advisory pacing, not a correctness gate -- the
+queued/poll handling above is what guarantees a correct eventual outcome regardless of whether
+pacing was enough. `run_archive`'s optional `on_progress` callback receives structured events
+(`tab_done`, `queued_wait_started`/`_resolved`/`_gave_up`, `backpressure_waiting`/`_resumed`,
+`archive_finished`) live as the run progresses -- a small sample (e.g. 5 tabs) never saturates
+anything, so a live signal during a large run is worth more than a happy-path number measured on
+a handful of tabs. See `archive.py`'s module docstring ("Queued means wait, not fail" and
+"Pacing") for the full design and the measured incident both respond to.
 
 ## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
 

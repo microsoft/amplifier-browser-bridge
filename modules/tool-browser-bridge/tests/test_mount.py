@@ -359,6 +359,55 @@ async def test_browser_archive_routes_through_run_archive(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_browser_archive_forwards_injection_timeout_s_and_captures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """Proves this adapter actually forwards `injection_timeout_s`/`captures`
+    through to `run_archive` -- not just accepts and drops them."""
+
+    class _ScriptedClient:
+        def __init__(self) -> None:
+            self.command_calls: list[tuple[Any, str, dict[str, Any]]] = []
+
+        async def list_devices(self):
+            return [{"device_id": "d1", "capabilities": {"debugger": True, "scripting": True}}]
+
+        async def command(self, target, command, args):
+            self.command_calls.append((target, command, args))
+            if command == "windows":
+                return {"ok": True, "result": {"windows": [], "tab_groups": []}}
+            if command == "tabs":
+                return {"ok": True, "result": [{"tab_id": 101, "window_id": 1, "url": "https://x.com"}]}
+            if command == "mhtml":
+                return {"ok": True, "result": {"tab_id": 101, "format": "mhtml", "bytes": 1, "data": "M"}}
+            return {"ok": True, "result": {}}
+
+    fake = _ScriptedClient()
+    monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
+
+    tool = _tool_by_name("browser_archive")
+    result = await tool.execute(
+        {
+            "device_id": "d1",
+            "dest_dir": str(tmp_path),
+            "depth": "L4",
+            "captures": ["mhtml"],
+            "injection_timeout_s": 5.0,
+        }
+    )
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    assert output["result"]["captures_requested"] == ["mhtml"]
+    called_commands = {c for (_t, c, _a) in fake.command_calls}
+    assert "read" not in called_commands
+    assert "page_state" not in called_commands
+    assert output["result"]["tabs"]["101"]["captures"]["text"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
 async def test_browser_archive_impossible_depth_returns_ok_false_not_adapter_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):

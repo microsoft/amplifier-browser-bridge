@@ -513,6 +513,43 @@ async def test_browser_archive_routes_through_run_archive(tmp_path, monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_browser_archive_forwards_injection_timeout_s_and_captures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    """Proves the MCP adapter actually forwards the two new args through to
+    `run_archive` -- not just accepts them and drops them."""
+    fake = _ScriptedHubClient(
+        [_archive_device(debugger=True)],
+        {
+            "windows": {"ok": True, "result": {"windows": [], "tab_groups": []}},
+            "tabs": {"ok": True, "result": [{"tab_id": 101, "window_id": 1, "url": "https://example.com"}]},
+            "mhtml": {"ok": True, "result": {"tab_id": 101, "format": "mhtml", "bytes": 1, "data": "M"}},
+            "screenshot": {
+                "ok": True,
+                "result": {"tab_id": 101, "format": "jpg", "base64": "aGVsbG8=", "via": "captureVisibleTab"},
+            },
+        },
+    )
+    monkeypatch.setattr(srv, "_client", lambda: fake)
+
+    result = await srv.browser_archive(
+        device_id="d1",
+        dest_dir=str(tmp_path),
+        depth="L4",
+        captures=["mhtml", "screenshot"],
+        injection_timeout_s=7.0,
+    )
+
+    assert result["ok"] is True
+    manifest = result["result"]
+    assert manifest["captures_requested"] == ["mhtml", "screenshot"]
+    called_commands = {c for (_t, c, _a) in fake.command_calls}
+    assert "read" not in called_commands
+    assert "page_state" not in called_commands
+    assert manifest["tabs"]["101"]["captures"]["text"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
 async def test_browser_archive_impossible_depth_surfaces_as_ok_false(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
