@@ -254,6 +254,19 @@ An L0 archive of 735 real tabs reports `tabs_inventoried: 735` alongside
 `tabs_captured: 0` -- never `tabs_inventoried: 0`, which would misread as "nothing
 was archived" when 735 tabs are sitting on disk.
 
+**Transport failures fail one capture, never the whole run**: a real page's
+`mhtml` capture can be large enough to exceed a WebSocket's message-size limit
+(`docs/PROTOCOL.md`'s "WebSocket message-size ceiling" section) -- or hit any
+other connection-level failure mid-archive. Every per-capture/per-profile-item
+wire call this tool composes goes through one choke point (`archive.py`'s
+`_safe_command`) that turns that failure into an ordinary recorded capture
+failure, exactly like an explicit `{"ok": false, ...}` result -- the run
+continues to the next tab, and every tab already captured (and already written
+to disk) survives in the final manifest. Before this fix, an uncaught transport
+failure partway through a run aborted `run_archive` entirely -- discarding
+every already-captured tab's manifest entry, since `manifest.json` is written
+only once, at the very end.
+
 Per-tab status is likewise not binary: `"ok"` (every attempted capture succeeded),
 `"partial"` (some succeeded, some failed -- e.g. a browser error page where
 CDP-based captures like `mhtml`/`screenshot`/`nav_history` succeed even though

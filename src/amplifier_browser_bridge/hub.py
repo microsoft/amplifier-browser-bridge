@@ -78,7 +78,7 @@ from .hub_location import DEFAULT_PORT
 from .onboarding import detect_platform, render_android_setup_page, render_setup_page
 from .pairing import DEFAULT_TICKET_TTL_SECONDS, PairingError, PairingStore, format_ticket
 from .policy import STATE_CHANGING_COMMANDS, PolicyEngine, PolicyError
-from .protocol import COMMANDS, HUB_ONLY_ARGS, PROTOCOL_VERSION, new_id
+from .protocol import COMMANDS, HUB_ONLY_ARGS, MAX_WS_MESSAGE_BYTES, PROTOCOL_VERSION, new_id
 from .queue import QueuedCommand
 from .registry import DeviceConnection, DeviceRecord, DeviceRegistry
 from .scope import SCOPE_FIELDS, ScopeError, SessionScope
@@ -599,7 +599,17 @@ class Hub:
     # ------------------------------------------------------------------
 
     async def _handle_device_ws(self, request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=None)  # app-level heartbeat, not transport-level
+        # max_msg_size=MAX_WS_MESSAGE_BYTES (protocol.py): without an explicit
+        # value here, aiohttp defaults to 4MB -- see protocol.py's "WebSocket
+        # message-size ceiling" section. This route is a device's ONLY
+        # connection to the hub (long-lived, one per device); an oversized
+        # `result` (a real page's MHTML capture) tripping the default here
+        # would tear down that entire connection -- every command in flight
+        # for the device, not just the one that overflowed -- rather than
+        # failing just the one oversized capture.
+        ws = web.WebSocketResponse(
+            heartbeat=None, max_msg_size=MAX_WS_MESSAGE_BYTES
+        )  # app-level heartbeat, not transport-level
         await ws.prepare(request)
         device_id: str | None = None
 
@@ -915,7 +925,14 @@ class Hub:
     # ------------------------------------------------------------------
 
     async def _handle_agent_ws(self, request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse()
+        # max_msg_size=MAX_WS_MESSAGE_BYTES (protocol.py): matches the same
+        # explicit ceiling applied to the client's own `websockets.connect`
+        # (client.py) and the `/device` route above -- see protocol.py's
+        # "WebSocket message-size ceiling" section. Without this, the hub
+        # would reject a large `result` it is relaying to the agent (e.g. an
+        # `mhtml` capture) before the agent's own -- now more generous --
+        # cap ever comes into play.
+        ws = web.WebSocketResponse(max_msg_size=MAX_WS_MESSAGE_BYTES)
         await ws.prepare(request)
 
         async for msg in ws:

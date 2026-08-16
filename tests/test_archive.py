@@ -21,6 +21,7 @@ import pytest
 
 from amplifier_browser_bridge.addressing import Target
 from amplifier_browser_bridge.archive import ArchiveError, run_archive
+from amplifier_browser_bridge.client import HubError
 
 # ---------------------------------------------------------------------------
 # Fixtures: a fake device + a scriptable fake HubClient
@@ -134,7 +135,17 @@ class FakeArchiveClient:
         if isinstance(scripted, list):
             idx = self._call_index.get(command, 0)
             self._call_index[command] = idx + 1
-            return scripted[idx] if idx < len(scripted) else scripted[-1]
+            scripted = scripted[idx] if idx < len(scripted) else scripted[-1]
+        # A scripted exception instance (rather than a dict) simulates a
+        # TRANSPORT-level failure -- e.g. HubError, the real HubClient's own
+        # exception type for a connection-level failure (oversized payload,
+        # timeout, refused connection, ...) -- as opposed to the hub-level
+        # `{"ok": False, ...}` shape simulated above. Exercises `archive.py`'s
+        # `_safe_command` choke point (see test_oversized_capture_failure_*
+        # below), which is what turns an exception like this into an
+        # ordinary per-capture failure instead of aborting the whole run.
+        if isinstance(scripted, BaseException):
+            raise scripted
         return scripted
 
 
@@ -385,6 +396,72 @@ async def test_failures_are_recorded_at_the_top_level_and_never_buried(tmp_path:
     assert manifest["failures"][0]["tab_id"] == 101
     assert manifest["failures"][0]["capture"] == "text"
     assert manifest["failures"][0]["error"] == "boom"
+
+
+# ---------------------------------------------------------------------------
+# A TRANSPORT-level failure (HubError -- e.g. an oversized MHTML payload
+# tripping the client's websocket size cap, or any other connection-level
+# failure) on one tab's capture must fail only that capture, never abort the
+# whole archive run. Real-world finding: archiving four real web pages at
+# MHTML depth (L4) raised HubError straight out of `client.command()`,
+# uncaught, killing the entire run partway through -- every tab after the
+# pathological one was silently lost, and `manifest.json` (written only once,
+# at the very end of `run_archive`) was never written at all. See client.py's
+# module docstring and protocol.py's "WebSocket message-size ceiling" section
+# for the transport-level half of this fix; this is the orchestrator-level
+# half (`archive.py`'s `_safe_command`).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_huberror_on_one_tabs_mhtml_capture_does_not_abort_the_run(tmp_path: Path) -> None:
+    """Tab 101's `mhtml` capture raises `HubError` (simulating an oversized
+    payload tripping the client's own websocket size cap, mid-archive) --
+    this must be recorded as a failed capture for THAT tab, and the run must
+    still reach tab 102 and complete, writing a real manifest.json to disk
+    (never reached at all, prior to this fix, once the exception escaped
+    uncaught)."""
+    client = _basic_client(
+        tabs=[_tab(101), _tab(102)],
+        capabilities={"debugger": True},
+        extra_commands={
+            "mhtml": [
+                HubError(
+                    "could not reach hub at ws://100.124.126.19:8900/agent: sent 1009 (message too "
+                    "big) frame exceeds limit of 1048576 bytes; no close frame received"
+                ),
+                {"ok": True, "result": {"tab_id": 102, "format": "mhtml", "bytes": 5, "data": "MHTML-DATA"}},
+            ]
+        },
+    )
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L4")
+    manifest = result["result"]
+
+    # The pathological tab: capture failed, not an uncaught exception.
+    assert manifest["tabs"]["101"]["captures"]["mhtml"]["status"] == "failed"
+    assert "message too big" in manifest["tabs"]["101"]["captures"]["mhtml"]["error"]
+
+    # The run continued: tab 102 was reached and fully captured.
+    assert manifest["tabs"]["102"]["status"] == "ok"
+    assert manifest["tabs"]["102"]["captures"]["mhtml"]["status"] == "ok"
+
+    # The run reached completion at all -- manifest.json actually exists.
+    manifest_path = Path(manifest["archive_dir"]) / "manifest.json"
+    assert manifest_path.exists()
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["status"] == "ok_with_failures"
+
+
+@pytest.mark.asyncio
+async def test_huberror_on_top_level_windows_or_tabs_inventory_does_not_raise(tmp_path: Path) -> None:
+    """The same transport-level resilience applies to the top-level
+    `windows`/`tabs` inventory calls, not just per-tab captures -- a HubError
+    there must not raise out of `run_archive` either."""
+    client = _basic_client(extra_commands={"windows": HubError("could not reach hub: connection refused")})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0")
+    manifest = result["result"]
+    assert manifest["windows"]["status"] == "failed"
+    assert "connection refused" in manifest["windows"]["error"]
+    assert manifest["status"] == "ok_with_failures"
 
 
 @pytest.mark.asyncio

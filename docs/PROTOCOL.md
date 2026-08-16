@@ -40,6 +40,41 @@ The extension always dials **out** to the hub -- it never listens on an inbound 
 what lets it work behind NAT, survive network roaming, and require zero port-forwarding setup
 on the browser's device (design doc §3.1).
 
+## WebSocket message-size ceiling
+
+Every leg of a round trip -- the extension's `/device` connection, the hub's `/agent` route, and
+the agent/CLI client's own connection -- enforces the SAME explicit ceiling on a single message:
+`MAX_WS_MESSAGE_BYTES` (`protocol.py`), **64MiB**.
+
+Neither WebSocket library this codebase depends on was ever asked, on this protocol's behalf, how
+big a single message may be -- each defaulted to its own generic value: `websockets` (the client's
+library, `client.py`) defaults `max_size` to 2**20 (1MB); `aiohttp` (the hub's library, both
+`web.WebSocketResponse()` routes in `hub.py`) defaults `max_msg_size` to 4MB. This protocol
+legitimately carries payloads that exceed both -- a real page's MHTML capture (`mhtml`,
+`Page.captureSnapshot`) inlines every stylesheet, font, and image the page references, and
+routinely lands well past 1MB, sometimes past 4MB, for a genuinely heavy real-world page
+(github.com, huggingface.co). Real-world finding: archiving four such pages at MHTML depth (see
+"Browser-state archive" below) died with `websockets`' own `sent 1009 (message too big) frame
+exceeds limit of 1048576 bytes` -- the CLIENT tripping its unset (so default) 1MB cap while
+receiving the hub's relayed `mhtml` result.
+
+The fix is one explicit, shared, BOUNDED constant applied to all three legs -- `websockets.connect
+(..., max_size=MAX_WS_MESSAGE_BYTES)` in `client.py`, and `web.WebSocketResponse(...,
+max_msg_size=MAX_WS_MESSAGE_BYTES)` on both hub routes -- so no leg silently enforces a smaller
+limit than another, and a payload that clears one hop only to be rejected by the next is not a
+failure mode this protocol has to reason about. Deliberately NOT unbounded: an unlimited
+per-message size is an unlimited per-command memory allocation on both the hub and the client, for
+a payload size the caller cannot predict or cap themselves.
+
+A capture that still manages to exceed even this raised ceiling -- or hits any other
+transport-level failure -- surfaces as an ordinary `HubError` to a direct `HubClient` caller. The
+browser-state archive orchestrator (`archive.py`) goes one step further: every per-capture/
+per-profile-item wire call goes through a single choke point (`_safe_command`) that turns a
+`HubError` into an ordinary `{"ok": false, ...}` capture failure recorded in the archive manifest,
+so ONE oversized or otherwise unreachable page fails only that capture -- never the whole archive
+run. See "Browser-state archive" below and `archive.py`'s module docstring ("No silent partial
+success").
+
 ---
 
 ## Device protocol (extension <-> hub)

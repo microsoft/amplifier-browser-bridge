@@ -165,6 +165,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .addressing import Target
+from .client import HubError
 
 # Depth ladder, cheapest to deepest -- see module docstring. Each level's index is
 # used purely for ">=" comparisons ("does this run need to do at least as much as
@@ -257,6 +258,39 @@ def _command_outcome(result: Any) -> tuple[bool, Any, str | None]:
 
 def _capture_failed(error: str) -> dict[str, Any]:
     return {"status": "failed", "error": error}
+
+
+async def _safe_command(
+    client: _ArchiveClient, target: Target, command: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    """The single choke point every per-capture/per-profile-item `client.command()`
+    call in this module goes through, so a TRANSPORT-level failure (`HubError` --
+    e.g. a connection refused, a timeout, or a device/hub/client rejecting an
+    oversized message -- see client.py's/hub.py's/protocol.py's "WebSocket
+    message-size ceiling" section) becomes an ordinary `{"ok": False, "error":
+    ...}` result instead of an exception.
+
+    Real-world finding: `client.command()` previously raised `HubError` straight
+    out of `_capture_tab`/`_capture_profile`/`run_archive`'s own top-level
+    `windows`/`tabs` calls, uncaught -- one pathological tab (a real page whose
+    MHTML capture tripped the client's websocket size cap) aborted the ENTIRE
+    archive run partway through, discarding every already-captured tab's
+    manifest entry (`manifest.json` is only ever written once, at the very end
+    of `run_archive`) even though the files themselves were already safely on
+    disk. `_command_outcome` already normalizes a dict-shaped
+    `{"ok": false, ...}` result into a per-capture failure that lets the run
+    continue (module docstring's "No silent partial success" section); this
+    function is what makes a raised `HubError` reach `_command_outcome` in that
+    same shape, rather than skipping it entirely. Deliberately narrow: only
+    `HubError` (the one exception type this codebase's own transport layer is
+    documented to raise for a connection-level failure) is caught here -- any
+    other exception is a genuine bug and must keep propagating loudly, per this
+    project's fail-loud convention (CONTRIBUTING.md).
+    """
+    try:
+        return await client.command(target, command, args)
+    except HubError as e:
+        return {"ok": False, "error": str(e)}
 
 
 def _inventoried_count(entry: dict[str, Any]) -> int | None:
@@ -493,26 +527,26 @@ async def _capture_tab(
         read_args = {**base_args}
         if all_frames:
             read_args["all_frames"] = True
-        result = await client.command(target, "read", read_args)
+        result = await _safe_command(client, target, "read", read_args)
         record("text", _record_read_capture(tab_dir, result))
 
     if depth_idx >= _DEPTH_INDEX["L2"]:
-        result = await client.command(target, "page_state", dict(base_args))
+        result = await _safe_command(client, target, "page_state", dict(base_args))
         record("dom", _record_page_state_capture(tab_dir, result))
 
     if depth_idx >= _DEPTH_INDEX["L3"]:
         screenshot_args = {**base_args}
         if use_capture_hidden:
             screenshot_args["capture_hidden"] = True
-        result = await client.command(target, "screenshot", screenshot_args)
+        result = await _safe_command(client, target, "screenshot", screenshot_args)
         record("screenshot", _record_screenshot_capture(tab_dir, result))
 
     if depth_idx >= _DEPTH_INDEX["L4"]:
-        result = await client.command(target, "mhtml", dict(base_args))
+        result = await _safe_command(client, target, "mhtml", dict(base_args))
         record("mhtml", _record_mhtml_capture(tab_dir, result))
 
     if depth_idx >= _DEPTH_INDEX["L5"]:
-        result = await client.command(target, "nav_history", dict(base_args))
+        result = await _safe_command(client, target, "nav_history", dict(base_args))
         record("nav_history", _record_json_capture(tab_dir, "nav_history.json", result))
 
     entry["status"] = _tab_status(entry["captures"])
@@ -544,14 +578,14 @@ async def _capture_profile(
     profile: dict[str, Any] = {}
 
     for key, command, filename, count_of in _PROFILE_SPECS:
-        result = await client.command(target, command, {})
+        result = await _safe_command(client, target, command, {})
         capture_entry = _record_json_capture(profile_dir, filename, result, count_of=count_of)
         profile[key] = capture_entry
         if capture_entry.get("status") != "ok":
             failures.append({"scope": "profile", "item": key, "error": capture_entry.get("error")})
 
     if include_cookies:
-        result = await client.command(target, "cookies_list", {})
+        result = await _safe_command(client, target, "cookies_list", {})
         capture_entry = _record_json_capture(profile_dir, "cookies.json", result, count_of="entries")
         profile["cookies"] = capture_entry
         if capture_entry.get("status") != "ok":
@@ -645,7 +679,7 @@ async def run_archive(
 
     device_target = Target(device_id=device_id)
 
-    windows_result = await client.command(device_target, "windows", {})
+    windows_result = await _safe_command(client, device_target, "windows", {})
     ok, windows_data, error = _command_outcome(windows_result)
     if ok and isinstance(windows_data, dict):
         windows_path = archive_dir / "windows.json"
@@ -667,7 +701,7 @@ async def run_archive(
         manifest["tab_groups"] = _capture_failed(windows_error or "unknown error")
         failures.append({"scope": "windows", "error": windows_error})
 
-    tabs_result = await client.command(device_target, "tabs", {})
+    tabs_result = await _safe_command(client, device_target, "tabs", {})
     ok, tab_list, error = _command_outcome(tabs_result)
     if ok and isinstance(tab_list, list):
         tabs_path = archive_dir / "tabs.json"
