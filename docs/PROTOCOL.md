@@ -1461,6 +1461,48 @@ actually attempted), and `manifest["status"]` becomes `"ok_with_skips"`, the sam
 `"skipped"` tabs use since both are benign, non-failure gaps. The top-level
 `manifest["requested_tab_ids_not_found"]` list remains a convenience summary of the same ids.
 
+#### Injection budget and explicit capture selection
+
+Because the depth ladder is a strict superset, requesting L4 (MHTML) also runs L1 (`text`) and L2
+(`dom`) first -- both JS-injection-based (`read`/`page_state`). Real-world finding: on heavy
+hydrated SPAs (github.com, huggingface.co), the injection captures timed out at BOTH 90s and 120s
+budgets, while the CDP-based captures (`mhtml`/`screenshot`/`nav_history`) succeeded on the SAME
+tabs in seconds. For an archive spanning many tabs, every tab pays up to two full injection
+timeouts before reaching the capture the caller actually wanted.
+
+Two independent, optional knobs address this WITHOUT abandoning the strict-superset property as
+the default:
+
+- **`injection_timeout_s`** (`run_archive`/`browser_archive`): overrides `timeout_s` for JUST the
+  injection-based captures (`text`/`dom`) -- CDP-based captures keep using `timeout_s` (or the hub
+  default) unchanged. Bounds the wall-clock cost of a hung/heavy SPA's injection captures without
+  ever reducing what the depth ladder attempts: `text`/`dom` are still attempted, they just fail
+  fast (an ordinary `"failed"` capture) instead of consuming the full budget. `None` (the default)
+  means no override -- behavior is byte-for-byte unchanged from before this argument existed.
+- **`captures`** (`run_archive`/`browser_archive`): an explicit allow-list, from `CAPTURE_NAMES`
+  (`"text"`, `"dom"`, `"screenshot"`, `"mhtml"`, `"nav_history"`), that narrows -- never widens --
+  which per-tab captures actually run at this depth. `captures=["mhtml", "screenshot",
+  "nav_history"]` with `depth="L4"` is a "CDP-only" archive: `text`/`dom` are never attempted at
+  all for any tab, zero wall-clock cost, instead of attempted-then-bounded. A capture the depth
+  ladder would otherwise have included, but that `captures` excludes, is recorded as
+  `{"status": "skipped", "reason": ...}` -- the SAME status a no-wake tab skip or an opt-out
+  `cookies_list` skip already uses -- never silently omitted, and excluded from the ok/failed
+  accounting a tab's own rollup status computes (`archive.py`'s `_tab_status`), so a tab where
+  every ATTEMPTED capture succeeded still reports plain `"ok"` even though some captures were
+  configured out. `None` (the default) means no narrowing -- the pre-existing strict-superset
+  behavior. `manifest["captures_requested"]` records exactly what was passed (or `None`), so a
+  caller reading the manifest later can tell what was actually asked for.
+
+  Validated PRE-FLIGHT (`archive.py`'s `_validate_captures`), before anything is captured: an
+  empty list, an unrecognized name, or a `captures` set naming nothing reachable at the requested
+  `depth` (e.g. `captures=["mhtml"]` with `depth="L1"`, which would silently capture nothing for
+  every tab in the run) all raise `ArchiveError` immediately -- the same fail-loud posture as the
+  "Impossible depth" check above, one level down.
+
+A caller must never be able to silently get less than they asked for: a capture skipped by
+`captures` is always distinct from one attempted-and-failed, exactly as `"skipped"`/`"not_found"`
+already are at the tab level.
+
 ## Browser-state archive: MHTML -> markdown conversion (composed, not a wire command)
 
 Like the archive capability itself, converting a captured page's MHTML into markdown --

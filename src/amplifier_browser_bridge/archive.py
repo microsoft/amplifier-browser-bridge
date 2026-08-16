@@ -179,6 +179,30 @@ DEFAULT_DEPTH = "L0"
 _CDP_CAPABILITY = "debugger"
 _CDP_REQUIRED_FROM_DEPTH = "L4"
 
+# Per-tab capture names, in the SAME order the depth ladder introduces them --
+# see module docstring's "Injection budget and explicit capture selection"
+# section. These are the keys that show up in `manifest["tabs"][tab_id]
+# ["captures"]`, not the wire command names (`read`/`page_state` map to
+# `text`/`dom` respectively; `screenshot`/`mhtml`/`nav_history` are unchanged).
+CAPTURE_NAMES: tuple[str, ...] = ("text", "dom", "screenshot", "mhtml", "nav_history")
+# Which depth level FIRST includes each capture -- used by `_validate_captures`
+# to reject (pre-flight) a `captures` argument that names nothing reachable at
+# the requested `depth`, which would otherwise silently capture nothing for
+# every tab in the run.
+_CAPTURE_OWNING_DEPTH: dict[str, str] = {
+    "text": "L1",
+    "dom": "L2",
+    "screenshot": "L3",
+    "mhtml": "L4",
+    "nav_history": "L5",
+}
+# JS-injection-based capture routes (chrome.scripting + injected.js) -- as
+# opposed to the CDP-based routes (screenshot/mhtml/nav_history). See module
+# docstring's "Injection budget" section: these two are the ones observed to
+# time out on heavy hydrated SPAs at both 90s and 120s budgets, while the
+# CDP-based routes succeeded on the same tabs.
+_INJECTION_CAPTURE_NAMES: frozenset[str] = frozenset({"text", "dom"})
+
 
 class ArchiveError(ValueError):
     """Raised for a PRE-FLIGHT failure that stops the whole run before anything is
@@ -209,6 +233,52 @@ def _depth_index(depth: str) -> int:
         return _DEPTH_INDEX[depth]
     except KeyError:
         raise ArchiveError(f"unknown archive depth {depth!r} -- valid depths: {', '.join(DEPTHS)}") from None
+
+
+def _validate_captures(captures: list[str] | None, *, depth: str, depth_idx: int) -> frozenset[str] | None:
+    """Validates and normalizes the caller's explicit `captures` argument (see
+    module docstring's "Injection budget and explicit capture selection"
+    section and `run_archive`'s docstring). Returns `None` -- meaning "no
+    narrowing at all: every capture the depth ladder would attempt runs",
+    the pre-existing strict-superset default -- when the caller omitted
+    `captures` entirely.
+
+    Raises `ArchiveError`, a PRE-FLIGHT failure before anything is captured
+    (same posture as `_depth_index`/the "Impossible depth" check below), for:
+
+        - an empty list (ambiguous -- omit the argument for the real default)
+        - an unrecognized name (a typo silently capturing nothing for that
+          name is worse than refusing up front)
+        - a `captures` set with NO name reachable at the requested `depth` --
+          e.g. `captures=["mhtml"]` with `depth="L1"` -- which would silently
+          capture NOTHING for every tab in the run. Because the reachability
+          check depends only on `depth` (never on any tab's own data), this
+          one pre-flight check is sufficient: if it passes, every tab that
+          actually reaches per-tab capture is guaranteed a non-empty
+          attempted set (see `_tab_status`'s defensive fallback for the
+          belt-and-suspenders case this is meant to make unreachable).
+    """
+    if captures is None:
+        return None
+    if not captures:
+        raise ArchiveError(
+            "captures, if given, must name at least one capture -- omit the argument entirely for "
+            "the default (every capture the depth ladder attempts, the pre-existing behavior)."
+        )
+    unknown = sorted(set(captures) - set(CAPTURE_NAMES))
+    if unknown:
+        raise ArchiveError(
+            f"captures names unrecognized capture(s) {unknown} -- valid names: {', '.join(CAPTURE_NAMES)}."
+        )
+    reachable = {name for name in captures if _DEPTH_INDEX[_CAPTURE_OWNING_DEPTH[name]] <= depth_idx}
+    if not reachable:
+        needed = ", ".join(f"{n} (needs depth {_CAPTURE_OWNING_DEPTH[n]}+)" for n in sorted(captures))
+        raise ArchiveError(
+            f"captures={sorted(captures)!r} names no capture reachable at depth {depth!r} -- the "
+            f"depth ladder would never attempt any of them at this depth ({needed}). Use a deeper "
+            "depth, or a different captures set."
+        )
+    return frozenset(captures)
 
 
 def _sanitize_component(value: str) -> str:
@@ -433,7 +503,7 @@ def _record_mhtml_capture(tab_dir: Path, result: Any) -> dict[str, Any]:
 def _tab_status(captures: dict[str, Any]) -> str:
     """Rolls up a tab's per-capture statuses (`text`/`dom`/`screenshot`/`mhtml`/
     `nav_history`, whichever ran at this depth) into ONE tab-level status --
-    never binary. `"ok"` only when every attempted capture succeeded, `"failed"`
+    never binary. `"ok"` only when every ATTEMPTED capture succeeded, `"failed"`
     only when every attempted capture failed, and `"partial"` -- the middle
     state neither of the other two can honestly claim -- when some succeeded and
     some failed (module docstring's "No silent partial success" section). This
@@ -444,9 +514,25 @@ def _tab_status(captures: dict[str, Any]) -> str:
     behavior) discarded the ~147KB of real artifacts already on disk for it.
     Assumes at least one capture was attempted; `_capture_tab` never calls this
     for a `"skipped"` tab, which returns before any capture runs.
+
+    A capture entry with `status == "skipped"` (the caller's explicit
+    `captures` argument excluded it -- see `_capture_skipped_by_config`) is
+    excluded from the ok/failed accounting entirely, the same way a whole
+    `"skipped"` (no-wake) or `"not_found"` TAB is excluded one level up: it is
+    neither a success nor a failure, so it must never pull `"ok"` down to
+    `"partial"` or inflate `"failed"`'s denominator.
     """
-    ok_count = sum(1 for c in captures.values() if c.get("status") == "ok")
-    if ok_count == len(captures):
+    attempted = {name: c for name, c in captures.items() if c.get("status") != "skipped"}
+    if not attempted:
+        # Every capture reachable at this depth was excluded via `captures` --
+        # `_validate_captures` is meant to make this unreachable (it rejects,
+        # pre-flight, a `captures` set with nothing reachable at all at the
+        # requested depth), but this is the defensive fallback: never
+        # silently report "ok" (nothing succeeded) or "failed" (nothing
+        # failed either) for zero attempted captures.
+        return "skipped"
+    ok_count = sum(1 for c in attempted.values() if c.get("status") == "ok")
+    if ok_count == len(attempted):
         return "ok"
     if ok_count == 0:
         return "failed"
@@ -482,6 +568,30 @@ _SKIP_ASLEEP_REASON = (
 )
 
 
+def _capture_skipped_by_config(name: str) -> dict[str, Any]:
+    """Manifest entry for a per-tab capture the depth ladder would otherwise
+    have attempted at this depth, but that the caller's explicit `captures`
+    argument excluded (module docstring's "Injection budget and explicit
+    capture selection" section). `status: "skipped"` -- the SAME status
+    string an intentional no-wake tab skip and an opt-out `cookies_list`
+    profile skip already use (both equally benign, equally non-failure) --
+    with a `reason` naming exactly why, so it is never confused with a
+    captured-and-failed outcome and never silently absorbed into a plain
+    `"ok"` capture. Never added to `manifest["failures"]` (see
+    `_capture_tab`'s `record`), mirroring how those other two skip kinds are
+    excluded from `failures` too.
+    """
+    return {
+        "status": "skipped",
+        "reason": (
+            f"'{name}' capture excluded by the caller's explicit `captures` argument -- not "
+            "attempted at all (distinct from a captured-and-failed outcome; the depth ladder "
+            "would otherwise have included it at this depth). See docs/PROTOCOL.md's "
+            "'Browser-state archive' section."
+        ),
+    }
+
+
 async def _capture_tab(
     client: _ArchiveClient,
     device_id: str,
@@ -493,6 +603,8 @@ async def _capture_tab(
     all_frames: bool,
     use_capture_hidden: bool,
     timeout_s: float | None,
+    injection_timeout_s: float | None,
+    captures: frozenset[str] | None,
     failures: list[dict[str, Any]],
 ) -> dict[str, Any]:
     tab_id = tab.get("tab_id")
@@ -516,38 +628,68 @@ async def _capture_tab(
     if timeout_s is not None:
         base_args["timeout_s"] = timeout_s
 
+    # Injection-based captures (`read`/`page_state` -- module docstring's
+    # "Injection budget" section) get their OWN, optionally tighter, timeout
+    # budget than CDP-based captures -- a caller archiving many tabs can bound
+    # the wall-clock cost of a hung/heavy SPA's JS-injection captures without
+    # ever reducing what the depth ladder attempts. `injection_timeout_s=None`
+    # (the default) means "no override" -- `injection_args` is then IDENTICAL
+    # to `base_args`, so behavior is byte-for-byte unchanged from before this
+    # argument existed.
+    injection_args: dict[str, Any] = dict(base_args)
+    if injection_timeout_s is not None:
+        injection_args["timeout_s"] = injection_timeout_s
+
+    def allowed(name: str) -> bool:
+        return captures is None or name in captures
+
     def record(name: str, capture_entry: dict[str, Any]) -> None:
         entry["captures"][name] = capture_entry
-        if capture_entry.get("status") != "ok":
+        if capture_entry.get("status") not in ("ok", "skipped"):
             failures.append(
                 {"scope": "tab", "tab_id": tab_id, "capture": name, "error": capture_entry.get("error")}
             )
 
     if depth_idx >= _DEPTH_INDEX["L1"]:
-        read_args = {**base_args}
-        if all_frames:
-            read_args["all_frames"] = True
-        result = await _safe_command(client, target, "read", read_args)
-        record("text", _record_read_capture(tab_dir, result))
+        if allowed("text"):
+            read_args = {**injection_args}
+            if all_frames:
+                read_args["all_frames"] = True
+            result = await _safe_command(client, target, "read", read_args)
+            record("text", _record_read_capture(tab_dir, result))
+        else:
+            record("text", _capture_skipped_by_config("text"))
 
     if depth_idx >= _DEPTH_INDEX["L2"]:
-        result = await _safe_command(client, target, "page_state", dict(base_args))
-        record("dom", _record_page_state_capture(tab_dir, result))
+        if allowed("dom"):
+            result = await _safe_command(client, target, "page_state", dict(injection_args))
+            record("dom", _record_page_state_capture(tab_dir, result))
+        else:
+            record("dom", _capture_skipped_by_config("dom"))
 
     if depth_idx >= _DEPTH_INDEX["L3"]:
-        screenshot_args = {**base_args}
-        if use_capture_hidden:
-            screenshot_args["capture_hidden"] = True
-        result = await _safe_command(client, target, "screenshot", screenshot_args)
-        record("screenshot", _record_screenshot_capture(tab_dir, result))
+        if allowed("screenshot"):
+            screenshot_args = {**base_args}
+            if use_capture_hidden:
+                screenshot_args["capture_hidden"] = True
+            result = await _safe_command(client, target, "screenshot", screenshot_args)
+            record("screenshot", _record_screenshot_capture(tab_dir, result))
+        else:
+            record("screenshot", _capture_skipped_by_config("screenshot"))
 
     if depth_idx >= _DEPTH_INDEX["L4"]:
-        result = await _safe_command(client, target, "mhtml", dict(base_args))
-        record("mhtml", _record_mhtml_capture(tab_dir, result))
+        if allowed("mhtml"):
+            result = await _safe_command(client, target, "mhtml", dict(base_args))
+            record("mhtml", _record_mhtml_capture(tab_dir, result))
+        else:
+            record("mhtml", _capture_skipped_by_config("mhtml"))
 
     if depth_idx >= _DEPTH_INDEX["L5"]:
-        result = await _safe_command(client, target, "nav_history", dict(base_args))
-        record("nav_history", _record_json_capture(tab_dir, "nav_history.json", result))
+        if allowed("nav_history"):
+            result = await _safe_command(client, target, "nav_history", dict(base_args))
+            record("nav_history", _record_json_capture(tab_dir, "nav_history.json", result))
+        else:
+            record("nav_history", _capture_skipped_by_config("nav_history"))
 
     entry["status"] = _tab_status(entry["captures"])
     return entry
@@ -613,6 +755,8 @@ async def run_archive(
     wake: bool = False,
     all_frames: bool = False,
     timeout_s: float | None = None,
+    injection_timeout_s: float | None = None,
+    captures: list[str] | None = None,
 ) -> dict[str, Any]:
     """Capture `device_id`'s browser state at `depth` (see module docstring's depth
     ladder), writing every payload under a fresh timestamped directory inside
@@ -637,14 +781,42 @@ async def run_archive(
     docstring's "Cookies are opt-in" section; the default is False at every
     depth, with no exception.
 
+    `injection_timeout_s`, if given, overrides `timeout_s` for JUST the two
+    JS-injection-based per-tab captures (`read`/`page_state`, L1/L2) -- CDP-based
+    captures (`screenshot`/`mhtml`/`nav_history`) keep using `timeout_s` (or the
+    hub's own default) unchanged. See module docstring's "Injection budget and
+    explicit capture selection" section: on a heavy hydrated SPA, injection
+    captures can time out at the FULL command-timeout budget while CDP-based
+    captures on the same tab succeed in seconds -- for an archive spanning many
+    tabs, a caller can bound the wall-clock cost of that timeout without
+    reducing what the depth ladder attempts. `None` (the default) means no
+    override: `timeout_s` (or the hub default) applies uniformly to every
+    capture, exactly as before this argument existed.
+
+    `captures`, if given, is an explicit allow-list (from `CAPTURE_NAMES`:
+    `"text"`, `"dom"`, `"screenshot"`, `"mhtml"`, `"nav_history"`) that narrows
+    -- never widens -- which per-tab captures actually run at this depth. A
+    capture the depth ladder would otherwise attempt, but that is excluded from
+    `captures`, is recorded as `{"status": "skipped", "reason": ...}` (the SAME
+    status a no-wake tab skip or an opt-out cookies skip already uses) rather
+    than silently omitted -- never confused with a captured-and-failed outcome.
+    `None` (the default) means no narrowing: every capture the depth ladder
+    attempts runs, the pre-existing strict-superset behavior, unchanged. Raises
+    `ArchiveError` pre-flight (see `_validate_captures`) for an empty list, an
+    unrecognized name, or a `captures` set naming nothing reachable at all at
+    the requested `depth` -- a caller must never silently get an archive that
+    captured nothing because of a mismatched `captures`/`depth` combination.
+
     Raises `ArchiveError` for a pre-flight failure (unknown depth, unknown
-    device, or a depth that is impossible on this device -- e.g. L4 on a
-    device without the `debugger` capability) BEFORE anything is captured or
-    written to disk. Never raises for an ordinary per-tab/profile-data capture
-    failure; those are recorded in the returned manifest (`manifest["failures"]`,
-    `manifest["status"]`) and the run continues.
+    device, a depth that is impossible on this device -- e.g. L4 on a device
+    without the `debugger` capability -- or an invalid `captures` argument)
+    BEFORE anything is captured or written to disk. Never raises for an
+    ordinary per-tab/profile-data capture failure; those are recorded in the
+    returned manifest (`manifest["failures"]`, `manifest["status"]`) and the
+    run continues.
     """
     depth_idx = _depth_index(depth)
+    captures_set = _validate_captures(captures, depth=depth, depth_idx=depth_idx)
 
     devices = await client.list_devices()
     record = next((d for d in devices if d.get("device_id") == device_id), None)
@@ -673,6 +845,11 @@ async def run_archive(
     manifest: dict[str, Any] = {
         "device_id": device_id,
         "depth": depth,
+        # `None` (the default) means "no narrowing -- every capture the depth
+        # ladder attempts ran", never silently omitted here just because it
+        # wasn't narrowed -- a caller reading the manifest later must be able
+        # to tell exactly what was asked for, not just infer it from `depth`.
+        "captures_requested": sorted(captures_set) if captures_set is not None else None,
         "archive_dir": str(archive_dir),
         "started_at": started_at.isoformat(),
     }
@@ -746,6 +923,8 @@ async def run_archive(
                 all_frames=all_frames,
                 use_capture_hidden=use_capture_hidden,
                 timeout_s=timeout_s,
+                injection_timeout_s=injection_timeout_s,
+                captures=captures_set,
                 failures=failures,
             )
     # A requested tab_id that vanished (closed) between inventory and capture --

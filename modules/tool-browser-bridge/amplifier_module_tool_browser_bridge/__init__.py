@@ -394,6 +394,8 @@ def _build_tools() -> list[_HubTool]:
                 wake=bool(input_data.get("wake", False)),
                 all_frames=bool(input_data.get("all_frames", False)),
                 timeout_s=input_data.get("timeout_s"),
+                injection_timeout_s=input_data.get("injection_timeout_s"),
+                captures=input_data.get("captures"),
             )
         except ArchiveError as e:
             return {"ok": False, "error": str(e)}
@@ -1104,6 +1106,31 @@ def _build_tools() -> list[_HubTool]:
                     "timeout_s": {
                         "type": "number",
                         "description": "Optional per-command device-round-trip timeout override, in seconds.",
+                    },
+                    "injection_timeout_s": {
+                        "type": "number",
+                        "description": (
+                            "Overrides timeout_s for JUST the JS-injection-based per-tab captures "
+                            "(text/L1, dom/L2) -- CDP-based captures (screenshot/mhtml/nav_history) keep "
+                            "using timeout_s unchanged. Bounds the wall-clock cost of a heavy/hung SPA's "
+                            "injection captures without reducing what the depth ladder attempts. Omit "
+                            "for unchanged behavior (timeout_s applies uniformly to every capture)."
+                        ),
+                    },
+                    "captures": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["text", "dom", "screenshot", "mhtml", "nav_history"],
+                        },
+                        "description": (
+                            "Explicit allow-list that narrows -- never widens -- which per-tab captures "
+                            'actually run at this depth, e.g. ["mhtml", "screenshot", "nav_history"] '
+                            "with depth=L4 for a CDP-only archive that skips text/dom entirely. An "
+                            "excluded capture is recorded as {status: skipped, reason: ...}, never "
+                            "silently omitted. Omit for the default: every capture the depth ladder "
+                            "attempts runs (the pre-existing strict-superset behavior)."
+                        ),
                     },
                 },
                 "required": ["device_id", "dest_dir"],

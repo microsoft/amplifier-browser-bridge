@@ -474,6 +474,119 @@ async def test_overall_status_is_never_plain_ok_when_a_tab_failed(tmp_path: Path
     assert manifest["summary"]["tabs_failed"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Injection budget and explicit capture selection (module docstring's
+# "Injection budget and explicit capture selection" section) -- the fix for
+# the depth ladder making deep captures unaffordable: JS-injection captures
+# (text/dom) can time out on heavy hydrated SPAs while CDP-based captures on
+# the same tab succeed in seconds. `injection_timeout_s` bounds the wait
+# without ever skipping; `captures` lets a caller skip outright.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_injection_timeout_s_overrides_timeout_for_read_and_page_state_only(tmp_path: Path) -> None:
+    """`injection_timeout_s` must reach ONLY `read`/`page_state`'s `timeout_s`
+    arg -- `screenshot`/`mhtml`/`nav_history` keep using the general
+    `timeout_s`, unchanged."""
+    client = _basic_client(capabilities={"debugger": True})
+    await run_archive(client, _DEVICE_ID, tmp_path, depth="L5", timeout_s=120.0, injection_timeout_s=15.0)
+    calls_by_command = {cmd: args for _dev, cmd, args in client.calls}
+    assert calls_by_command["read"]["timeout_s"] == 15.0
+    assert calls_by_command["page_state"]["timeout_s"] == 15.0
+    assert calls_by_command["screenshot"]["timeout_s"] == 120.0
+    assert calls_by_command["mhtml"]["timeout_s"] == 120.0
+    assert calls_by_command["nav_history"]["timeout_s"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_injection_timeout_s_omitted_means_unchanged_behavior(tmp_path: Path) -> None:
+    """Omitting `injection_timeout_s` (the default, `None`) must produce
+    BYTE-FOR-BYTE the same args as before this feature existed -- `timeout_s`
+    applies uniformly to every capture."""
+    client = _basic_client(capabilities={"debugger": True})
+    await run_archive(client, _DEVICE_ID, tmp_path, depth="L5", timeout_s=42.0)
+    for _dev, cmd, args in client.calls:
+        if cmd in ("read", "page_state", "screenshot", "mhtml", "nav_history"):
+            assert args["timeout_s"] == 42.0
+
+
+@pytest.mark.asyncio
+async def test_captures_narrows_to_a_cdp_only_archive(tmp_path: Path) -> None:
+    """`captures` excluding `text`/`dom` must mean `read`/`page_state` are
+    NEVER CALLED AT ALL -- zero wall-clock cost, not attempted-then-bounded --
+    while `screenshot`/`mhtml`/`nav_history` still run normally."""
+    client = _basic_client(capabilities={"debugger": True})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L4", captures=["mhtml", "screenshot"])
+    manifest = result["result"]
+    entry = manifest["tabs"]["101"]
+
+    called_commands = {cmd for _dev, cmd, _args in client.calls}
+    assert "read" not in called_commands
+    assert "page_state" not in called_commands
+    assert "screenshot" in called_commands
+    assert "mhtml" in called_commands
+
+    assert entry["captures"]["text"]["status"] == "skipped"
+    assert "captures" in entry["captures"]["text"]["reason"]
+    assert entry["captures"]["dom"]["status"] == "skipped"
+    assert entry["captures"]["screenshot"]["status"] == "ok"
+    assert entry["captures"]["mhtml"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_captures_config_skip_does_not_count_as_a_failure_or_partial(tmp_path: Path) -> None:
+    """A tab where every ATTEMPTED capture succeeded must still report plain
+    `"ok"` even though `captures` configured some captures out entirely --
+    a config-narrowed request that fully succeeds is not a degraded run."""
+    client = _basic_client(capabilities={"debugger": True})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L4", captures=["mhtml", "screenshot"])
+    manifest = result["result"]
+    assert manifest["tabs"]["101"]["status"] == "ok"
+    assert manifest["status"] == "ok"
+    assert manifest["failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_captures_requested_is_recorded_in_the_manifest(tmp_path: Path) -> None:
+    client = _basic_client(capabilities={"debugger": True})
+
+    result_default = await run_archive(client, _DEVICE_ID, tmp_path, depth="L1")
+    assert result_default["result"]["captures_requested"] is None
+
+    result_narrowed = await run_archive(
+        client, _DEVICE_ID, tmp_path, depth="L4", captures=["mhtml", "screenshot"]
+    )
+    assert result_narrowed["result"]["captures_requested"] == ["mhtml", "screenshot"]
+
+
+@pytest.mark.asyncio
+async def test_captures_empty_list_raises_before_any_capture(tmp_path: Path) -> None:
+    client = _basic_client()
+    with pytest.raises(ArchiveError, match="at least one capture"):
+        await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", captures=[])
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_captures_unknown_name_raises_before_any_capture(tmp_path: Path) -> None:
+    client = _basic_client()
+    with pytest.raises(ArchiveError, match="unrecognized capture"):
+        await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", captures=["outer_html"])
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_captures_unreachable_at_depth_raises_before_any_capture(tmp_path: Path) -> None:
+    """`captures=["mhtml"]` at `depth="L1"` would silently capture NOTHING for
+    every tab in the run (the ladder never reaches `mhtml` at L1) -- this
+    must fail loud, pre-flight, exactly like an impossible depth."""
+    client = _basic_client()
+    with pytest.raises(ArchiveError, match="no capture reachable at depth"):
+        await run_archive(client, _DEVICE_ID, tmp_path, depth="L1", captures=["mhtml"])
+    assert client.calls == []
+
+
 @pytest.mark.asyncio
 async def test_overall_status_is_ok_with_skips_when_only_skips_occurred(tmp_path: Path) -> None:
     client = _basic_client(tabs=[_tab(101, discarded=True)])

@@ -295,6 +295,28 @@ it (a vanished tab was never actually attempted), and `manifest["status"]` becom
 non-failure gaps. The top-level `manifest["requested_tab_ids_not_found"]` list is a
 convenience summary of the same ids.
 
+**Injection budget and explicit capture selection**: because the depth ladder is a
+strict superset, requesting L4 also runs L1/L2 (`text`/`dom`, JS-injection-based)
+first. Real-world finding: on heavy hydrated SPAs, injection captures timed out at
+both 90s and 120s budgets while CDP-based captures (`mhtml`/`screenshot`/
+`nav_history`) succeeded on the same tabs in seconds -- for an archive spanning many
+tabs, every tab pays up to two full injection timeouts before reaching the capture
+actually wanted. Two optional args address this without abandoning the
+strict-superset default: `injection_timeout_s` overrides `timeout_s` for JUST
+`text`/`dom`, bounding the wall-clock cost of a hung SPA's injection captures
+without ever reducing what gets attempted (they still run, they just fail fast
+instead of consuming the full budget); `captures` is an explicit allow-list
+(`"text"`/`"dom"`/`"screenshot"`/`"mhtml"`/`"nav_history"`) that narrows -- never
+widens -- which per-tab captures run at all, e.g. a "CDP-only" archive that skips
+`text`/`dom` entirely (zero cost, not attempted-then-bounded). A capture `captures`
+excludes is recorded as `{"status": "skipped", "reason": ...}` -- the same status a
+no-wake skip or opt-out cookies skip already uses -- and excluded from a tab's own
+ok/failed rollup, so a tab where every attempted capture succeeded still reports
+plain `"ok"` even with some captures configured out. Both default to `None` (no
+change from prior behavior); an invalid `captures` (empty, unrecognized name, or
+nothing reachable at the requested `depth`) raises before anything is captured,
+the same fail-loud posture as an impossible depth.
+
 ## Browser-state archive: MHTML -> markdown conversion
 
 `browser_archive_convert` is the ONE agent-facing tool for converting an existing

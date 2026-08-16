@@ -1003,6 +1003,8 @@ async def browser_archive(
     wake: bool = False,
     all_frames: bool = False,
     timeout_s: float | None = None,
+    injection_timeout_s: float | None = None,
+    captures: list[str] | None = None,
 ) -> dict[str, Any]:
     """Archive the state of a browser at a chosen depth -- from 'just the URLs' to
     'everything we can physically get' -- and get back a MANIFEST, never the
@@ -1076,6 +1078,30 @@ async def browser_archive(
     away from plain `"ok"` (to `"ok_with_skips"`, the same bucket `"skipped"`
     tabs use) and is counted explicitly in
     `manifest["summary"]["tabs_not_found"]`.
+
+    injection_timeout_s overrides timeout_s for JUST the two JS-injection-based
+    per-tab captures (L1's text, L2's dom) -- CDP-based captures (screenshot,
+    mhtml, nav_history) keep using timeout_s (or the hub's own default)
+    unchanged. Real-world finding: on a heavy hydrated SPA, injection captures
+    can time out at 90s AND 120s while CDP-based captures on the SAME tab
+    succeed in seconds -- for an archive spanning many tabs, this bounds the
+    wall-clock cost of that timeout without reducing what the depth ladder
+    attempts. Omit it (the default) for unchanged behavior: timeout_s (or the
+    hub default) applies uniformly to every capture, exactly as before.
+
+    captures, if given, is an explicit allow-list ("text", "dom", "screenshot",
+    "mhtml", "nav_history") that narrows -- never widens -- which per-tab
+    captures actually run at this depth, e.g. captures=["mhtml", "screenshot",
+    "nav_history"] with depth="L4" skips text/dom entirely (a "CDP-only"
+    archive) instead of attempting and waiting on them. A capture excluded
+    this way is recorded as {"status": "skipped", "reason": ...} -- the SAME
+    status a no-wake tab skip or an opt-out cookies skip already uses -- never
+    silently omitted, never confused with a captured-and-failed outcome.
+    Omit it (the default, None) for the pre-existing strict-superset behavior:
+    every capture the depth ladder attempts runs. Raises before anything is
+    captured for an empty list, an unrecognized name, or a captures set naming
+    nothing reachable at the requested depth (e.g. captures=["mhtml"] with
+    depth="L1") -- never silently captures nothing for every tab in the run.
     """
     try:
         return await _run_archive(
@@ -1088,6 +1114,8 @@ async def browser_archive(
             wake=wake,
             all_frames=all_frames,
             timeout_s=timeout_s,
+            injection_timeout_s=injection_timeout_s,
+            captures=captures,
         )
     except (ArchiveError, HubError) as e:
         return {"ok": False, "error": str(e)}
