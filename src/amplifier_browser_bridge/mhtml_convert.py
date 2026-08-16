@@ -80,11 +80,28 @@ captured them.
   MHTML-to-markdown implementation flags it as unsolved). This module FAILS LOUD
   (`ConversionError`, naming every frame's `Content-Location`) rather than
   silently converting only the first body as if it were the whole page.
+
+## Optional dependency: lazy, fail-loud-at-point-of-use, never at import time
+
+`html2text`, `trafilatura`, and `lxml` (trafilatura's own transitive dependency,
+imported directly here too for `_find_tables_with_merged_cells`'s use of
+`lxml.etree.ParserError`/`lxml.html.fromstring`) all live ONLY in this repo's
+optional `convert` extra (`pyproject.toml`'s `[project.optional-dependencies]`)
+-- deliberately, so the core lib/CLI stay lean (see that extra's own comment).
+Importing THIS MODULE must never require them: they are imported lazily, inside
+the functions that actually use them, via `_import_or_raise` below. A caller
+who never touches conversion (e.g. every other browser-bridge tool) pays
+nothing for them and is never blocked from loading by their absence. Only
+actually calling `convert_mhtml`/`convert_mhtml_file` without the `convert`
+extra installed fails -- loudly, with the exact remediation
+(`pip install 'amplifier-browser-bridge[convert]'`), never a bare
+`ModuleNotFoundError` that doesn't name what's missing or how to fix it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
 import mimetypes
 import os
 from email import policy
@@ -93,10 +110,23 @@ from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
-import html2text
-import lxml.etree
-import trafilatura
-from lxml import html as lxml_html
+_CONVERT_EXTRA_HINT = (
+    "MHTML-to-markdown conversion requires the optional 'convert' extra. "
+    "Install it with: pip install 'amplifier-browser-bridge[convert]'"
+)
+
+
+def _import_or_raise(module_name: str) -> Any:
+    """Lazily imports `module_name`, converting any `ImportError` (most often a
+    plain `ModuleNotFoundError`) into the `convert` extra's clear, actionable
+    remediation message -- see module docstring's "Optional dependency"
+    section. Call this from inside a function at the point the dependency is
+    actually needed; never at module import time.
+    """
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(_CONVERT_EXTRA_HINT) from exc
 
 
 class ConversionError(ValueError):
@@ -156,10 +186,15 @@ def _find_tables_with_merged_cells(html_text: str) -> list[dict[str, Any]]:
     malformed HTML lxml cannot parse at all rather than raising: this is
     best-effort diagnostic metadata, not something that should block an otherwise
     successful conversion.
+
+    Lazily imports `lxml` (module docstring's "Optional dependency" section) --
+    only reached from `convert_mhtml`, never at module import time.
     """
+    lxml_etree = _import_or_raise("lxml.etree")
+    lxml_html = _import_or_raise("lxml.html")
     try:
         tree = lxml_html.fromstring(html_text)
-    except lxml.etree.ParserError:
+    except lxml_etree.ParserError:
         return []
     found: list[dict[str, Any]] = []
     for index, table in enumerate(tree.iter("table")):
@@ -179,7 +214,12 @@ def _full_page_markdown(html_text: str) -> str:
     """The deliberately-unfiltered whole-document pass -- see module docstring's
     "Two outputs, never one" section. `body_width = 0` disables html2text's
     default 78-column hard-wrapping, which would otherwise break long URLs and
-    asset paths across lines."""
+    asset paths across lines.
+
+    Lazily imports `html2text` (module docstring's "Optional dependency"
+    section) -- only reached from `convert_mhtml`, never at module import time.
+    """
+    html2text = _import_or_raise("html2text")
     converter = html2text.HTML2Text()
     converter.body_width = 0
     return converter.handle(html_text)
@@ -273,6 +313,9 @@ def convert_mhtml(
     rewritten_html = _rewrite_asset_refs(html_text, ref_map)
     tables_with_merged_cells = _find_tables_with_merged_cells(rewritten_html)
 
+    # Lazily imported (module docstring's "Optional dependency" section) --
+    # this is the point of use, not module import time.
+    trafilatura = _import_or_raise("trafilatura")
     extracted_markdown = trafilatura.extract(
         rewritten_html,
         output_format="markdown",
