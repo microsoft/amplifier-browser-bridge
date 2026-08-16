@@ -12,12 +12,16 @@ bundle:
 
 tools:
   - module: tool-browser-bridge
-    # NOTE: relative paths resolve against THIS FILE's own directory
-    # (behaviors/), not the repo root -- verified by loading this bundle
-    # with amplifier_foundation.load_bundle() and inspecting the resolved
-    # tool source. "../modules/..." is correct; "./modules/..." silently
-    # resolved to behaviors/modules/tool-browser-bridge (nonexistent).
-    source: ../modules/tool-browser-bridge
+    # Self-referencing git+subdirectory URL, NOT a relative path. A relative
+    # `../modules/...` source is resolved once, at YAML-parse time, against
+    # whatever base_path the loading route happens to pass -- which is correct
+    # for a direct load_bundle() call but NOT for the git+subdirectory
+    # registration this behavior is distributed through (settings.yaml sources).
+    # That mismatch makes the tool silently fail to mount while the namespaced
+    # context.include below still resolves. The git+subdirectory URL is
+    # loader-independent (self-describing, needs no base_path), matching the
+    # canonical amplifier-bundle-recipes behavior precedent.
+    source: git+https://github.com/microsoft/amplifier-browser-bridge@main#subdirectory=modules/tool-browser-bridge
 
 context:
   include:
