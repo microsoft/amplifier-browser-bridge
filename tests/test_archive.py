@@ -979,6 +979,86 @@ async def test_no_tab_ids_means_no_not_found_accounting(tmp_path: Path) -> None:
     assert set(manifest["tabs"]) == {"101", "102"}
 
 
+# ---------------------------------------------------------------------------
+# Live gap: L0 silently dropped a requested-but-nonexistent tab_id
+#
+# The not_found fix above lived inside the same `if depth_idx >= L1:` gate as
+# the per-tab CAPTURE loop -- correct for capture (L0 does none, by design),
+# wrong for this accounting (it doesn't need any capture to run at all: the
+# full tab inventory is already read at every depth, including L0). Observed
+# live against a real browser, requesting a tab_id that definitely does not
+# exist (999999999):
+#
+#   L0:  status=ok              tabs_not_found=0   tabs=[]              <- silent
+#   L1:  status=ok_with_skips   tabs_not_found=1   tabs=['999999999']   <- correct
+#
+# At L0 the caller explicitly asked for a tab that doesn't exist and got back
+# a clean "ok" with no mention of it anywhere. None of the pre-existing
+# not_found tests above would have caught this: every one of them requests at
+# least L1, which is exactly the depth this bug did not reproduce at.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_l0_reports_a_requested_but_nonexistent_tab_id_as_not_found(tmp_path: Path) -> None:
+    """The load-bearing regression test for this fix: at L0 (no page contact at
+    all), a `tab_ids` entry absent from the live inventory must still get a
+    `manifest["tabs"][tab_id] = {"status": "not_found", ...}` entry and move
+    `manifest["status"]` off plain "ok" -- exactly like it already does at L1+.
+    Before the fix, `manifest["tabs"]` was `{}` and `status` was plain `"ok"`
+    at L0, because the not_found loop lived inside the `depth_idx >= L1` gate
+    that L0 never enters."""
+    client = _basic_client(tabs=[_tab(101), _tab(102)])
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0", tab_ids=[101, 999999999])
+    manifest = result["result"]
+
+    assert manifest["tabs"]["999999999"]["status"] == "not_found"
+    assert "reason" in manifest["tabs"]["999999999"]
+    assert manifest["summary"]["tabs_not_found"] == 1
+    assert manifest["status"] == "ok_with_skips"
+    assert manifest["status"] != "ok"
+    assert manifest["requested_tab_ids_not_found"] == [999999999]
+    # L0 still does zero page contact -- this fix must not smuggle in a capture.
+    per_tab_commands = {"read", "page_state", "screenshot", "mhtml", "nav_history"}
+    assert not any(cmd in per_tab_commands for (_dev, cmd, _args) in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_l0_reports_not_found_when_only_a_nonexistent_tab_id_is_requested(
+    tmp_path: Path,
+) -> None:
+    """The exact live repro: the caller requests ONLY a tab_id that does not
+    exist (no other real tabs named), at L0. `manifest["tabs"]` must not come
+    back empty."""
+    client = _basic_client(tabs=[_tab(101)])
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth="L0", tab_ids=[999999999])
+    manifest = result["result"]
+
+    assert manifest["tabs"] != {}
+    assert set(manifest["tabs"]) == {"999999999"}
+    assert manifest["tabs"]["999999999"]["status"] == "not_found"
+    assert manifest["status"] == "ok_with_skips"
+
+
+@pytest.mark.parametrize("depth", ["L0", "L1", "L2", "L3", "L4", "L5"])
+@pytest.mark.asyncio
+async def test_not_found_accounting_holds_at_every_depth_including_l0(tmp_path: Path, depth: str) -> None:
+    """The structural guarantee this fix establishes: not_found accounting for
+    an explicitly requested `tab_ids` entry must hold at EVERY depth, not just
+    the depths that happen to run a per-tab capture loop. Parametrizing across
+    the whole depth ladder is what would have caught this bug the first time --
+    the pre-existing not_found tests all happened to only exercise L1, which is
+    precisely why the L0 gap shipped unnoticed."""
+    client = _basic_client(tabs=[_tab(101)], capabilities={"debugger": True})
+    result = await run_archive(client, _DEVICE_ID, tmp_path, depth=depth, tab_ids=[101, 999999999])
+    manifest = result["result"]
+
+    assert manifest["tabs"]["999999999"]["status"] == "not_found"
+    assert manifest["summary"]["tabs_not_found"] == 1
+    assert manifest["status"] == "ok_with_skips"
+    assert not any(f.get("tab_id") == 999999999 for f in manifest["failures"])
+
+
 @pytest.mark.asyncio
 async def test_relative_dest_dir_with_tilde_is_expanded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

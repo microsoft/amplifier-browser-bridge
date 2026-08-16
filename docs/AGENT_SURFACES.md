@@ -264,12 +264,16 @@ containing any partial tab is never reported as plain `"ok"` -- a partial tab
 always adds at least one entry to `manifest["failures"]`.
 
 A `tab_id` named in `tab_ids` that no longer exists in the live inventory (closed
-between the caller reading it and this call) is a FIFTH per-tab state, `"not_found"`
--- distinct from `"ok"`/`"partial"`/`"failed"`/`"skipped"`. Observed live: an archive
-requesting 4 tab_ids reported `tabs_capture_attempted: 3` with entries for only 3 of
-the 4 -- the vanished tab appeared in no `tabs` entry, no `failures` entry, no
-`skipped` record, nothing. `manifest["tabs"][tab_id]` now gets a synthetic
-`{"status": "not_found", "reason": ...}` entry for it. This is benign (not a capture
+between the caller reading it and this call -- or never existed at all) is a FIFTH
+per-tab state, `"not_found"` -- distinct from `"ok"`/`"partial"`/`"failed"`/`"skipped"`.
+Observed live: an archive requesting 4 tab_ids reported `tabs_capture_attempted: 3`
+with entries for only 3 of the 4 -- the vanished tab appeared in no `tabs` entry, no
+`failures` entry, no `skipped` record, nothing. `manifest["tabs"][tab_id]` now gets a
+synthetic `{"status": "not_found", "reason": ...}` entry for it, **at every depth,
+including L0** -- this accounting is computed once against the live inventory and
+does not depend on any per-tab capture running (a prior version of this fix
+computed it only alongside L1+ capture, so an L0 request for a nonexistent `tab_id`
+still silently reported plain `"ok"`). This is benign (not a capture
 failure -- there is nothing left to capture) so it never adds to
 `manifest["failures"]`, but it is never folded into plain `"ok"` either:
 `summary["tabs_not_found"]` counts it, `summary["tabs_capture_attempted"]` excludes

@@ -102,17 +102,26 @@ archive. But the manifest is built so a failure is impossible to miss:
   plain `"ok"`.
 
 - A `tab_id` explicitly named in `tab_ids` can vanish between when the caller read the
-  tab inventory and when this archive ran (the tab was closed) -- it is then absent
-  from the live `tabs` list entirely, with nothing to capture. This is a FIFTH per-tab
-  state, `"not_found"`, distinct from `"ok"`/`"partial"`/`"failed"`/`"skipped"`: those
-  four all describe a tab that existed at capture time; `"not_found"` means it didn't.
-  Observed live: an archive requesting 4 tab_ids got capture entries for only 3 -- the
-  4th (already closed) appeared in no `tabs` entry, no `failures` entry, and no
-  `skipped` record, so nothing in the manifest told the caller their fourth tab was
-  ever requested. `_capture_tab` never runs for a not-found id (there is no tab to
-  target); instead `manifest["tabs"][tab_id]` gets a synthetic `{"status":
-  "not_found", "reason": ...}` entry so every id in `tab_ids` is accounted for one way
-  or another. This is a BENIGN outcome (closed-before-we-got-to-it is not a capture
+  tab inventory and when this archive ran (the tab was closed) -- or simply never
+  existed at all -- and is then absent from the live `tabs` list entirely, with
+  nothing to capture. This is a FIFTH per-tab state, `"not_found"`, distinct from
+  `"ok"`/`"partial"`/`"failed"`/`"skipped"`: those four all describe a tab that
+  existed at capture time; `"not_found"` means it didn't. Observed live: an archive
+  requesting 4 tab_ids got capture entries for only 3 -- the 4th (already closed)
+  appeared in no `tabs` entry, no `failures` entry, and no `skipped` record, so
+  nothing in the manifest told the caller their fourth tab was ever requested.
+  `_capture_tab` never runs for a not-found id (there is no tab to target); instead
+  `manifest["tabs"][tab_id]` gets a synthetic `{"status": "not_found", "reason":
+  ...}` entry so every id in `tab_ids` is accounted for one way or another. This
+  accounting is computed once (from `tab_ids` against the live inventory) and applied
+  **at every depth, including L0** -- L0 does no page contact at all (see the depth
+  ladder above), but "we did no page contact" and "we ignored what you asked for" are
+  different things, and L0 already reads the full tab inventory so it has everything
+  it needs to know which requested ids are absent. (A prior version of this fix
+  computed the per-tab `"not_found"` entries only inside the L1+ per-tab capture
+  loop, so an L0 request for a nonexistent `tab_id` still silently reported plain
+  `"ok"` -- the exact bug this accounting exists to prevent, one depth over.) This is
+  a BENIGN outcome (closed-before-we-got-to-it, or never existed, is not a capture
   failure) so it does not add an entry to `manifest["failures"]`, mirroring how a
   `"skipped"` tab (also benign, also not a failure) is handled -- but, also like
   `"skipped"`, it is never silently folded into a plain `"ok"` run:
@@ -575,13 +584,16 @@ async def run_archive(
     ladder), writing every payload under a fresh timestamped directory inside
     `dest_dir`, and return `{"ok": True, "result": <manifest>}`.
 
-    `tab_ids`, if given, restricts per-tab capture (L1+) to that subset -- the L0
+    `tab_ids`, if given, restricts per-tab CAPTURE (L1+) to that subset -- the L0
     windows/groups/tabs inventory is always captured in full regardless (it is
     already cheap and has no per-tab cost). A requested id absent from the live
     inventory (e.g. the tab was closed between the caller reading it and this
-    call) gets its own `manifest["tabs"][tab_id] = {"status": "not_found", ...}`
-    entry -- see module docstring's "No silent partial success" section -- so
-    every id in `tab_ids` is accounted for, never silently dropped. `wake`, if True, allows per-tab
+    call, or it never existed at all) gets its own `manifest["tabs"][tab_id] =
+    {"status": "not_found", ...}` entry -- see module docstring's "No silent
+    partial success" section -- at every depth, INCLUDING L0: this accounting is
+    computed once against the live inventory and does not depend on whether any
+    per-tab capture ran, so every id in `tab_ids` is accounted for regardless of
+    `depth`, never silently dropped. `wake`, if True, allows per-tab
     capture to reload/attach-wake a discarded or asleep tab -- see module
     docstring's "no-wake guarantee" section; the DEFAULT is to skip such tabs
     entirely rather than disturb them. `all_frames`, if True, is forwarded to the
@@ -702,13 +714,23 @@ async def run_archive(
                 timeout_s=timeout_s,
                 failures=failures,
             )
-        # A requested tab_id that vanished (closed) between inventory and capture is
-        # NEVER just absent -- see module docstring's "not_found" bullet under "No
-        # silent partial success". It gets its own entry here, alongside every other
-        # tab this run touched, rather than living only in the top-level
-        # `requested_tab_ids_not_found` convenience list.
-        for tab_id in missing:
-            tab_manifest[str(tab_id)] = _not_found_tab_entry()
+    # A requested tab_id that vanished (closed) between inventory and capture --
+    # or simply never existed at all -- is NEVER just absent; see module
+    # docstring's "not_found" bullet under "No silent partial success". This
+    # accounting is DEPTH-INDEPENDENT and deliberately lives OUTSIDE the `if`
+    # above: `missing` (computed unconditionally, above, from the same
+    # `all_tabs`/`tab_ids` comparison at every depth) already tells us which
+    # requested ids are absent before any per-tab CAPTURE is even considered.
+    # Nesting this inside the L1+ capture gate was itself the bug this commit
+    # fixes -- it conflated "L0 does no page contact" (correct, by design) with
+    # "L0 ignores what you asked for" (not correct): a caller requesting an
+    # explicit tab_id that does not exist, at L0, got back a clean "ok" with
+    # that id never mentioned anywhere in the manifest. Every id in `tab_ids`
+    # gets an entry here, alongside every other tab this run touched, at every
+    # depth including L0 -- not just living in the top-level
+    # `requested_tab_ids_not_found` convenience list.
+    for tab_id in missing:
+        tab_manifest[str(tab_id)] = _not_found_tab_entry()
     manifest["tabs"] = tab_manifest
 
     profile_result: dict[str, Any] | None

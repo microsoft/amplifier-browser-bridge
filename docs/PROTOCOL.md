@@ -1408,13 +1408,17 @@ contributes at least one entry to `manifest["failures"]`, so a run containing an
 is never reported as plain `"ok"`.
 
 A `tab_id` named in `tab_ids` can also vanish (tab closed) between when the caller read the
-tab inventory and when the archive ran -- a FIFTH per-tab state, `"not_found"`, distinct from
-`"ok"`/`"partial"`/`"failed"`/`"skipped"`. Observed live: a caller requesting 4 tab_ids got
-manifest entries for only 3 -- the vanished tab appeared in no `manifest["tabs"]` entry, no
-`manifest["failures"]` entry, and no `"skipped"` record, so nothing told the caller their
-fourth tab was ever requested. `manifest["tabs"][tab_id]` now always gets a
-`{"status": "not_found", "reason": ...}` entry for a vanished id, so every id in `tab_ids` is
-accounted for one way or another. This is benign (there is no tab left to capture, so it is
+tab inventory and when the archive ran -- or simply never have existed at all -- a FIFTH
+per-tab state, `"not_found"`, distinct from `"ok"`/`"partial"`/`"failed"`/`"skipped"`. Observed
+live: a caller requesting 4 tab_ids got manifest entries for only 3 -- the vanished tab
+appeared in no `manifest["tabs"]` entry, no `manifest["failures"]` entry, and no `"skipped"`
+record, so nothing told the caller their fourth tab was ever requested. `manifest["tabs"][tab_id]`
+now always gets a `{"status": "not_found", "reason": ...}` entry for a vanished id, **at every
+depth, including L0** -- this accounting is computed once from `tab_ids` against the live
+inventory and does not depend on any per-tab capture running (an earlier version of this fix
+computed it only alongside L1+ capture, so an L0 request for a nonexistent `tab_id` still
+silently reported plain `"ok"`), so every id in `tab_ids` is accounted for one way or another
+regardless of depth. This is benign (there is no tab left to capture, so it is
 not a capture failure) and never adds to `manifest["failures"]`, but -- like `"skipped"`
 tabs -- it is never silently folded into a plain `"ok"` run either: `summary["tabs_not_found"]`
 counts it explicitly, `summary["tabs_capture_attempted"]` excludes it (a vanished tab was never
