@@ -118,6 +118,7 @@ async def test_tool_names_match_mcp_server_vocabulary():
         "browser_narrow_scope",
         "browser_archive",
         "browser_archive_convert",
+        "browser_archive_catalog",
         "browser_setup",
         "browser_setup_status",
         "browser_update_extension",
@@ -470,6 +471,93 @@ async def test_browser_archive_convert_bad_archive_dir_returns_ok_false_not_adap
     assert isinstance(output, dict)
     assert output["ok"] is False
     assert "tabs/" in output["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_catalog_routes_through_run_archive_catalog(tmp_path):
+    """Proves this surface actually routes through archive_catalog.py's
+    run_archive_catalog (not just a stub) -- tests/test_archive_catalog.py
+    covers run_archive_catalog's own logic (Layer 1 inventory, Layer 2
+    lens/retry/no_content behavior) in depth."""
+    archive_dir = tmp_path / "archive_d1_20260816T000000Z"
+    archive_dir.mkdir(parents=True)
+    (archive_dir / "tabs.json").write_text(
+        '[{"tab_id": 1, "window_id": 1, "url": "https://example.com/", "title": "Example", '
+        '"discarded": false, "asleep": false, "pinned": false}]',
+        encoding="utf-8",
+    )
+
+    tool = _tool_by_name("browser_archive_catalog")
+    result = await tool.execute({"archive_dir": str(archive_dir)})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is True
+    # catalog=false is the default -- Layer 1 only, no model call attempted.
+    assert output["result"]["catalog"] is None
+    assert output["result"]["inventory"]["total_tabs"] == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_catalog_bad_archive_dir_returns_ok_false_not_adapter_failure(tmp_path):
+    not_an_archive = tmp_path / "not_an_archive"
+    not_an_archive.mkdir()
+
+    tool = _tool_by_name("browser_archive_catalog")
+    result = await tool.execute({"archive_dir": str(not_an_archive)})
+
+    assert result.success is True
+    output = result.output
+    assert isinstance(output, dict)
+    assert output["ok"] is False
+    assert "tabs.json" in output["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_archive_catalog_forwards_lens_and_catalog_flag_to_a_synthetic_summarizer(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Proves catalog=true/lens actually reach Layer 2, using a monkeypatched
+    default summarizer (a fake, synthetic response -- NO real LLM call)."""
+    archive_dir = tmp_path / "archive_d1_20260816T000001Z"
+    archive_dir.mkdir(parents=True)
+    (archive_dir / "tabs.json").write_text(
+        '[{"tab_id": 1, "window_id": 1, "url": "https://example.com/", "title": "Example", '
+        '"discarded": false, "asleep": false, "pinned": false}]',
+        encoding="utf-8",
+    )
+    markdown_dir = archive_dir / "tabs" / "1" / "markdown"
+    markdown_dir.mkdir(parents=True)
+    (markdown_dir / "page.extracted.md").write_text("Fabricated synthetic page text.", encoding="utf-8")
+
+    captured: dict = {}
+
+    def _fake_make_default_summarizer(*, vision_config=None):
+        async def _summarizer(**kwargs):
+            captured.update(kwargs)
+            return {"what": "Synthetic finding.", "who": "", "why_kept": "", "topics": [], "value": "low"}
+
+        return _summarizer
+
+    # `run_archive_catalog` resolves `make_default_summarizer` from its own module
+    # (amplifier_browser_bridge.archive_catalog), not from this tool module's
+    # namespace -- the tool module only imports `run_archive_catalog` itself.
+    monkeypatch.setattr(
+        "amplifier_browser_bridge.archive_catalog.make_default_summarizer", _fake_make_default_summarizer
+    )
+
+    tool = _tool_by_name("browser_archive_catalog")
+    result = await tool.execute(
+        {"archive_dir": str(archive_dir), "catalog": True, "lens": "A fabricated reader."}
+    )
+
+    assert result.success is True
+    output: Any = result.output
+    assert output["ok"] is True
+    assert output["result"]["catalog"]["tabs_cataloged"] == 1
+    # Never the judgment text through the tool surface -- manifest only.
+    assert "Synthetic finding." not in str(output)
 
 
 @pytest.mark.asyncio
