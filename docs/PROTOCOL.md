@@ -1139,6 +1139,18 @@ real cause is "there is no live renderer here right now," not a permissions prob
   rather than opt-in. Any command that escalates to CDP (`trusted: true`, `capture_hidden: true`)
   attaches first via the hub's own pre-flight (`_ensure_cdp_attached`), so this happens before the
   real command ever reaches the device.
+  - **Attaching wakes the renderer; it does not wait for it to finish loading.** A later live
+    proof found that `chrome.debugger.attach()` returning successfully is not the same as the tab
+    having painted a frame or settled navigation -- a CDP capture issued immediately after attach
+    on a cold-waked tab can still fail (`screenshot`: CDP `-32603 Internal error`, no paintable
+    surface yet; `mhtml`: `Detached while handling command`, the target recreated mid-navigation).
+    `background.js`'s `cdpAttach()` now checks the tab's state before attaching and, if it was
+    discarded/asleep, waits for `status==="complete"` (`waitForTabAwake()` -- the same
+    poll-based helper the plain-`read` wake path above already uses) before returning control to
+    the caller, so `attach`/`click`/`type`/`key`/`screenshot`/`mhtml`/`nav_history` alike only
+    ever act on a tab that has actually settled. An already-awake tab is unaffected: one cheap
+    `chrome.tabs.get` to learn its state, no wait. See `archive.py`'s "Per-tab CDP isolation"
+    section below for how this interacts with that module's own per-tab detach recovery.
 
 ### Foregrounding a tab for DOM injection (`args.activate`)
 
@@ -1618,9 +1630,23 @@ were responsible for most of the run's 295s duration.
 attach/detach machinery is unmodified):**
 
 - **Reorder per-tab CDP dispatch.** `mhtml` (L4) and `nav_history` (L5) -- structural
-  document/session snapshots that need no painted frame -- now dispatch BEFORE
-  `screenshot` (L3), the one observed to throw `-32603` on a tab with no paintable
-  surface. Depth-ladder gating is unchanged; only dispatch ORDER moved.
+  document/session snapshots -- now dispatch BEFORE `screenshot` (L3), the one observed
+  to throw `-32603` on a tab with no paintable surface. Depth-ladder gating is unchanged;
+  only dispatch ORDER moved.
+
+  **Correction (`fix/cdp-wake-wait-for-load`): "need no painted frame" above is WRONG for
+  a tab woken from a cold discard.** A later live proof showed `mhtml` ALSO fails on a
+  cold-waked tab (`Detached while handling command`) -- not because `Page.captureSnapshot`
+  needs a painted frame, but because `chrome.debugger.attach()` on a discarded tab forces
+  Edge to instantiate a renderer and returns immediately, before that renderer has
+  finished navigating; any capture issued in that window can lose the race, regardless of
+  which CDP method it calls. Reordering still has standalone value (it stops one tab's
+  `-32603` from cascading into that same tab's mhtml), but the real fix is upstream of
+  dispatch order entirely: `background.js`'s `cdpAttach()` now checks whether a tab was
+  discarded/asleep before attaching and, if so, waits for `status==="complete"`
+  (`waitForTabAwake()` -- the same helper `read`/`click`/`type`/`key`/`navigate`'s
+  `ensureAwake()` already used) before returning -- see "Discarded tabs" above's CDP bullet
+  for the updated behavior.
 - **Isolate remaining per-tab CDP captures from an observed per-tab detach.** If a
   CDP-based capture's own result matches the per-tab signature (`-32603`/`Detached while
   handling command` -- NEVER the genuine-disconnect pair), `_capture_tab` issues one

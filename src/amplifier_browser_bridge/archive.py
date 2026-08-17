@@ -352,6 +352,29 @@ what to do with a result already received):**
    is unchanged for every capture -- only the DISPATCH ORDER within one `_capture_tab`
    call moved; `CAPTURE_NAMES`'s tuple order (used for depth-reachability bookkeeping,
    never for dispatch sequencing) is unaffected.
+
+   **Correction (extension-side fix, `fix/cdp-wake-wait-for-load`): "neither requiring a
+   painted frame" above is WRONG for a tab woken from a cold discard.** A later live proof
+   showed `mhtml` ALSO fails on a cold-waked tab -- `Detached while handling command` --
+   not because `Page.captureSnapshot` itself needs a painted frame, but because
+   `chrome.debugger.attach()` on a discarded tab forces Edge to instantiate a renderer and
+   returns immediately, well before that renderer has finished navigating; a capture
+   issued in that window races a target that is still being recreated and loses,
+   regardless of which CDP method it calls. Reordering `mhtml`/`nav_history` ahead of
+   `screenshot` (this section) still has value -- it stops one tab's `-32603` from
+   cascading into that SAME tab's mhtml -- but it does not, by itself, fix a cold-waked
+   tab's mhtml/nav_history captures, which can fail on the FIRST CDP dispatch for that tab
+   regardless of order. The actual fix is in the extension (`background.js`'s
+   `cdpAttach()`): check whether the tab was discarded/asleep before attaching, and if so,
+   wait for it to reach `status==="complete"` (`waitForTabAwake()` -- the same helper the
+   injection path's `ensureAwake()` already uses) before returning control to the
+   caller -- so `mhtml`/`nav_history`/`screenshot` alike only ever capture a tab that has
+   actually settled. See `docs/PROTOCOL.md`'s CDP section and `background.js`'s
+   `cdpAttach()` docstring for the live evidence and the fix itself. This module's
+   reactive `reattach_if_needed()`/`_PER_TAB_CDP_SIGNATURES` recovery (item 2 below)
+   remains as a backstop for whatever the proactive wake-wait doesn't catch (a genuinely
+   slow tab past the wait's timeout, a mid-session detach unrelated to waking) -- it is
+   no longer the primary defense against a cold-wake race.
 2. **Isolate remaining per-tab CDP captures from an observed per-tab detach**
    (`_is_per_tab_cdp_session_error`, matched against `_PER_TAB_CDP_SIGNATURES` --
    `Detached while handling command` and CDP `-32603` ONLY, deliberately excluding the
@@ -1819,12 +1842,18 @@ async def _capture_tab(
     # deliberately NOT the depth ladder's own introduction order (see module
     # docstring's "Per-tab CDP isolation" section). `Page.captureScreenshot` is the
     # capture observed to throw CDP `-32603` on a tab with no paintable surface
-    # (e.g. woken from discard); `Page.captureSnapshot`/`Page.getNavigationHistory`
-    # need no painted frame and are not implicated. Capturing the structurally safer,
-    # higher-value snapshots FIRST means a screenshot-induced detach can no longer
-    # cascade into them -- only `screenshot` itself, last, is ever at risk of being
-    # doomed by an earlier failure on this tab (there is nothing scheduled after it).
-    # Depth-ladder gating is unchanged; only DISPATCH ORDER moved.
+    # (e.g. woken from discard). This reordering still has value -- it stops a
+    # screenshot-induced detach on one tab from cascading into that SAME tab's
+    # mhtml/nav_history -- but do NOT read it as "mhtml/nav_history are immune to a
+    # cold-wake race": a later live proof showed `Page.captureSnapshot` ALSO fails on a
+    # tab woken from a cold discard (`Detached while handling command`, the target
+    # recreated mid-navigation), the same as `Page.captureScreenshot`'s `-32603`. Neither
+    # is really about "needing a painted frame" -- both race a tab whose renderer
+    # `chrome.debugger.attach()` just forced into existence but that hasn't finished
+    # loading yet. That race is now closed at the source (`background.js`'s
+    # `cdpAttach()` waits for load-complete after waking a discarded tab, before this
+    # dispatch code ever runs), not by reordering alone -- see docs/PROTOCOL.md's CDP
+    # section. Depth-ladder gating is unchanged; only DISPATCH ORDER moved.
     if depth_idx >= _DEPTH_INDEX["L4"]:
         if allowed("mhtml"):
             result = await _safe_command(client, target, "mhtml", dict(base_args), support, is_cdp=True)

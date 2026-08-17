@@ -2131,6 +2131,11 @@ async function waitDownload(args) {
 
 const attachedTabs = new Set(); // tab_ids with a live chrome.debugger session held by THIS extension
 
+// Bounded wait budget after CDP wakes a discarded/asleep tab -- mirrors ensureAwake()'s
+// injection-path timeout (waitForTabAwake() above, 15000ms) so both wake paths give a
+// freshly-woken tab the same grace period to finish loading/painting before giving up.
+const CDP_WAKE_TIMEOUT_MS = 15000;
+
 function hasDebuggerApi() {
   return typeof chrome.debugger !== "undefined" && typeof chrome.debugger.attach === "function";
 }
@@ -2145,14 +2150,57 @@ async function cdpAttach(tabId) {
   // against a real discarded background tab (attach succeeded, and a plain
   // injection-only `read` immediately afterward -- no explicit reload/wake --
   // then succeeded where it had failed before attaching). CDP does not need
-  // its own separate discarded-tab check: attaching is itself an implicit
-  // wake. This is NOT free of the same state-loss caveat as an explicit
+  // its own separate discarded-tab check to trigger a wake: attaching alone
+  // forces one. This is NOT free of the same state-loss caveat as an explicit
   // wake=true reload (a discarded tab has no renderer at all, so making one
   // live is observably equivalent to a reload) -- it is simply automatic
   // rather than opt-in. See docs/PROTOCOL.md's CDP section.
+  //
+  // Wake-wait fix (found in a later live proof): forcing a renderer to EXIST is not the
+  // same as that renderer having PAINTED A FRAME or finished navigating. attach() above
+  // returns as soon as the debugger session is established -- well before
+  // Page.captureScreenshot has anything to paint, or Page.captureSnapshot has a settled
+  // DOM to serialize. Proven live: capturing immediately after a cold wake fails for BOTH
+  // screenshot (CDP `-32603 Internal error` -- no paintable surface yet) and mhtml
+  // (`Detached while handling command` -- the target is recreated mid-navigation, tearing
+  // down the just-established debugger session); navigating the same tab and waiting for
+  // load-complete FIRST, then capturing, succeeds (screenshot 3/3). The injection path
+  // (ensureAwake()/waitForTabAwake() above) already solved this exact ordering problem for
+  // read/click/type/key/navigate -- reuse it here rather than inventing a second wake
+  // mechanism. Check tab state BEFORE attaching (attach() is what triggers the renderer
+  // instantiation, so "was this tab asleep" must be captured before that side effect), then
+  // only wait if it actually needed waking -- a tab that was already awake takes the
+  // untouched fast path: one extra chrome.tabs.get to learn its state, no wait, no
+  // slowdown for the common (already-awake) case.
+  let tabBeforeAttach;
+  try {
+    tabBeforeAttach = await chrome.tabs.get(tabId);
+  } catch {
+    // Tab may already be gone (e.g. closed between the caller resolving it and this call)
+    // -- attach() below will fail with its own real, specific error; no need to duplicate
+    // that here.
+    tabBeforeAttach = null;
+  }
+  const wasAsleep = isAsleep(tabBeforeAttach);
   await chrome.debugger.attach({ tabId }, "1.3");
   attachedTabs.add(tabId);
   markEngaged(tabId);
+  if (wasAsleep) {
+    try {
+      await waitForTabAwake(tabId, CDP_WAKE_TIMEOUT_MS);
+    } catch (err) {
+      // Best-effort, not fail-loud: a capture is still attempted even if the wait times
+      // out (the tab may simply be slow, not stuck) -- turning a slow-loading page into a
+      // hard failure for a capture that might otherwise have succeeded would be worse than
+      // trying anyway. waitForTabAwake() already produces a specific, actionable error
+      // message; log it rather than silently swallowing it so a genuinely stuck tab is
+      // still visible in the extension's own console.
+      console.warn(
+        `amplifier-browser-bridge: CDP wake-wait for tab ${tabId} did not settle before ${CDP_WAKE_TIMEOUT_MS}ms: ` +
+          `${(err && err.message) || err} -- proceeding with capture anyway (best-effort).`
+      );
+    }
+  }
   return { tab_id: tabId, attached: true };
 }
 
@@ -2439,111 +2487,125 @@ if (typeof chrome.debugger !== "undefined" && chrome.debugger.onDetach) {
 // Lifecycle wiring -- the service worker can be evicted at any moment (MV3), so
 // every entry point independently attempts to (re)connect. `connect()` itself is
 // idempotent/single-flight, so overlapping triggers here are harmless.
+//
+// Skipped entirely when extension/background.test.mjs sets
+// __AMPLIFIER_BROWSER_BRIDGE_BACKGROUND_TEST__ before importing this file -- these
+// listeners/connect() assume a real browser (chrome.alarms, a real WebSocket, a real
+// hub) and have no place running under `node --test`. Same gate options.js's own
+// __AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ already established for this exact class of
+// chrome.*-heavy entry-point file -- see options.js's identical comment.
 // ---------------------------------------------------------------------------
 
-chrome.runtime.onInstalled.addListener(async () => {
-  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
-  // Adopt a build-time-baked hub URL/token (Android zero-config installs -- see
-  // "Bundled first-run config" section above) BEFORE opening the options page or
-  // attempting to connect, so if the options page DOES render (reliable on Desktop;
-  // unreliable on Edge Android, which is the whole reason this feature exists), it
-  // shows the real adopted values on its very first paint instead of a blank one.
-  // Idempotent and guarded by amplifier_browser_bridge_setup_completed -- connect()
-  // below also calls this on every invocation (a worker restart without a fresh
-  // onInstalled event still needs the same one-time adoption to happen eventually),
-  // so this call is a deliberate, harmless duplicate of what would happen anyway.
-  await adoptBundledConfigIfNeeded();
-  // First-run UX: open the options page immediately so a fresh install's very first
-  // screen is "set the hub URL/token", not a silently-failing connection attempt.
-  // Harmless on a re-install/update of an already-configured install -- an extra tab
-  // the user can close; it never touches the config already sitting in
-  // chrome.storage.local (see this file's "Runtime configuration" section).
-  chrome.runtime.openOptionsPage();
-  connect();
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  connect();
-});
-
-// The toolbar icon has no default_popup (see manifest.json's "action" key) specifically
-// so a click always reaches this handler -- the options page IS the extension's only UI.
-chrome.action.onClicked.addListener(() => {
-  chrome.runtime.openOptionsPage();
-});
-
-// Saving valid config on the options page re-triggers connect() immediately, rather than
-// waiting for the next alarm tick (up to 30s) -- see options.js's save handler.
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local") return;
-  if ("amplifier_browser_bridge_hub_url" in changes || "amplifier_browser_bridge_hub_token" in changes) {
-    reconnectAttempt = 0;
-    if (ws) {
-      try {
-        ws.close();
-      } catch {
-        // already closed/closing -- connect() below handles re-establishing either way
-      }
-    }
+if (!globalThis.__AMPLIFIER_BROWSER_BRIDGE_BACKGROUND_TEST__) {
+  chrome.runtime.onInstalled.addListener(async () => {
+    chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+    // Adopt a build-time-baked hub URL/token (Android zero-config installs -- see
+    // "Bundled first-run config" section above) BEFORE opening the options page or
+    // attempting to connect, so if the options page DOES render (reliable on Desktop;
+    // unreliable on Edge Android, which is the whole reason this feature exists), it
+    // shows the real adopted values on its very first paint instead of a blank one.
+    // Idempotent and guarded by amplifier_browser_bridge_setup_completed -- connect()
+    // below also calls this on every invocation (a worker restart without a fresh
+    // onInstalled event still needs the same one-time adoption to happen eventually),
+    // so this call is a deliberate, harmless duplicate of what would happen anyway.
+    await adoptBundledConfigIfNeeded();
+    // First-run UX: open the options page immediately so a fresh install's very first
+    // screen is "set the hub URL/token", not a silently-failing connection attempt.
+    // Harmless on a re-install/update of an already-configured install -- an extra tab
+    // the user can close; it never touches the config already sitting in
+    // chrome.storage.local (see this file's "Runtime configuration" section).
+    chrome.runtime.openOptionsPage();
     connect();
-  }
-});
+  });
 
-// Status query for options.js -- never echoes the token back (options.js reads that
-// directly from chrome.storage.local itself for prefill; this is purely "are we
-// connected right now" for the options page's live status line).
-//
-// Defensive try/catch (bug report, 2026-08): this handler responds synchronously, so
-// `return true` here is belt-and-suspenders (sendResponse has already fired either
-// way) -- but if reading `ws`/`configured`/etc. ever threw for any reason, an
-// uncaught exception here would leave the message channel open with no response
-// ever sent, and the sender's `chrome.runtime.sendMessage` promise would hang until
-// Chrome eventually closes the port with "message port closed before a response was
-// received" -- indistinguishable, from options.js's side, from the background script
-// never having run at all. Catching and reporting the error explicitly closes that
-// gap; see options.js's queryStatusOnce()/pollStatusUntilKnown() for the client-side
-// half of this fail-loud guarantee.
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message && message.type === "amplifier_browser_bridge_get_status") {
-    try {
-      sendResponse({
-        configured,
-        connected: !!(ws && ws.readyState === WebSocket.OPEN),
-        hubUrl,
-        deviceId,
-        legacyConfigDetected,
-        // See this module's `lastConnectError` docstring -- null whenever the
-        // most recent attempt is still in flight or the connection is currently
-        // up; otherwise `{code, message, at}` naming exactly why it isn't.
-        lastError: lastConnectError,
-      });
-    } catch (err) {
-      sendResponse({ error: String((err && err.message) || err) });
+  chrome.runtime.onStartup.addListener(() => {
+    connect();
+  });
+
+  // The toolbar icon has no default_popup (see manifest.json's "action" key) specifically
+  // so a click always reaches this handler -- the options page IS the extension's only UI.
+  chrome.action.onClicked.addListener(() => {
+    chrome.runtime.openOptionsPage();
+  });
+
+  // Saving valid config on the options page re-triggers connect() immediately, rather than
+  // waiting for the next alarm tick (up to 30s) -- see options.js's save handler.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    if ("amplifier_browser_bridge_hub_url" in changes || "amplifier_browser_bridge_hub_token" in changes) {
+      reconnectAttempt = 0;
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // already closed/closing -- connect() below handles re-establishing either way
+        }
+      }
+      connect();
     }
-    return true;
-  }
-  return false;
-});
+  });
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) {
-    connect(); // the revival path for a killed connection
-    maybeReprobe(); // periodic fallback re-probe (Phase 1 fix) -- reuses the
-    // existing keepalive alarm rather than adding a second one.
-  }
-});
+  // Status query for options.js -- never echoes the token back (options.js reads that
+  // directly from chrome.storage.local itself for prefill; this is purely "are we
+  // connected right now" for the options page's live status line).
+  //
+  // Defensive try/catch (bug report, 2026-08): this handler responds synchronously, so
+  // `return true` here is belt-and-suspenders (sendResponse has already fired either
+  // way) -- but if reading `ws`/`configured`/etc. ever threw for any reason, an
+  // uncaught exception here would leave the message channel open with no response
+  // ever sent, and the sender's `chrome.runtime.sendMessage` promise would hang until
+  // Chrome eventually closes the port with "message port closed before a response was
+  // received" -- indistinguishable, from options.js's side, from the background script
+  // never having run at all. Catching and reporting the error explicitly closes that
+  // gap; see options.js's queryStatusOnce()/pollStatusUntilKnown() for the client-side
+  // half of this fail-loud guarantee.
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message && message.type === "amplifier_browser_bridge_get_status") {
+      try {
+        sendResponse({
+          configured,
+          connected: !!(ws && ws.readyState === WebSocket.OPEN),
+          hubUrl,
+          deviceId,
+          legacyConfigDetected,
+          // See this module's `lastConnectError` docstring -- null whenever the
+          // most recent attempt is still in flight or the connection is currently
+          // up; otherwise `{code, message, at}` naming exactly why it isn't.
+          lastError: lastConnectError,
+        });
+      } catch (err) {
+        sendResponse({ error: String((err && err.message) || err) });
+      }
+      return true;
+    }
+    return false;
+  });
 
-// Prompt re-probe as soon as a real tab becomes available, rather than
-// waiting up to 30s for the next alarm tick -- the common case the Phase 1
-// bug actually hits (a browser launched with zero tabs, then the user opens
-// one).
-chrome.tabs.onActivated.addListener(() => {
-  maybeReprobe();
-});
-chrome.tabs.onUpdated.addListener((_tabId, info) => {
-  if (info.status === "complete") maybeReprobe();
-});
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === ALARM_NAME) {
+      connect(); // the revival path for a killed connection
+      maybeReprobe(); // periodic fallback re-probe (Phase 1 fix) -- reuses the
+      // existing keepalive alarm rather than adding a second one.
+    }
+  });
 
-// A freshly-revived service worker shouldn't wait for the next half-minute alarm
-// tick to reconnect -- try immediately on load too.
-connect();
+  // Prompt re-probe as soon as a real tab becomes available, rather than
+  // waiting up to 30s for the next alarm tick -- the common case the Phase 1
+  // bug actually hits (a browser launched with zero tabs, then the user opens
+  // one).
+  chrome.tabs.onActivated.addListener(() => {
+    maybeReprobe();
+  });
+  chrome.tabs.onUpdated.addListener((_tabId, info) => {
+    if (info.status === "complete") maybeReprobe();
+  });
+
+  // A freshly-revived service worker shouldn't wait for the next half-minute alarm
+  // tick to reconnect -- try immediately on load too.
+  connect();
+}
+
+// Exported for extension/background.test.mjs only -- not used by any other runtime file.
+// See that test file's own comment for why (and how) background.js -- a real MV3 entry
+// point, not an importable library -- is dynamically imported under `node --test` at all.
+export { executeCommand, cdpAttach, isAsleep, waitForTabAwake, CDP_WAKE_TIMEOUT_MS };
