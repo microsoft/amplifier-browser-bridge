@@ -86,10 +86,10 @@ dev = [
 
 [tool.uv.sources]
 amplifier-browser-bridge = { workspace = true }
-amplifier-module-tool-browser-bridge = { path = "modules/tool-browser-bridge", editable = true }
+amplifier-module-tool-browser-bridge = { workspace = true }
 
 [tool.uv.workspace]
-members = ["."]
+members = [".", "modules/tool-browser-bridge"]
 
 [project.scripts]
 amplifier-browser-bridge = "amplifier_browser_bridge.cli:main"

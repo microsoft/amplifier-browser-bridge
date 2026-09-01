@@ -7,8 +7,19 @@ license = { text = "MIT" }
 # amplifier-core is a peer dependency -- do NOT declare it here (see
 # creating-amplifier-modules skill). amplifier-browser-bridge is the lib this
 # module wraps; it lives at the root of this same repository.
+#
+# PEP 508 direct git reference, not a bare name: `amplifier update` refreshes
+# an already-installed bundle module with
+# `uv pip install -e <module-dir> --python <app venv> --no-sources`, and
+# `--no-sources` disables [tool.uv.sources] entirely. A bare "amplifier-browser-bridge"
+# name then resolves only against the PyPI registry, where this unpublished
+# package does not exist ("was not found in the package registry"), and the
+# refresh fails outright. A direct git URL survives --no-sources because it
+# needs no [tool.uv.sources] entry to resolve. See the amplifier-engram
+# project's identical fix (same failure, same repo shape: an Amplifier module
+# depending on its own repo's root package) for precedent.
 dependencies = [
-    "amplifier-browser-bridge",
+    "amplifier-browser-bridge @ git+https://github.com/microsoft/amplifier-browser-bridge@main",
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -22,19 +33,10 @@ build-backend = "hatchling.build"
 packages = ["amplifier_module_tool_browser_bridge"]
 
 [tool.hatch.metadata]
-# Needed once `amplifier-browser-bridge` in [tool.uv.sources] (or a published
-# git dependency) resolves via a direct reference rather than PyPI.
+# Required because `dependencies` above resolves `amplifier-browser-bridge` via
+# a direct git reference rather than PyPI -- hatchling refuses to build a wheel
+# declaring a direct-reference dependency unless this is set.
 allow-direct-references = true
-
-[tool.uv.sources]
-# Monorepo local-dev resolution: this module's sibling package lives two
-# directories up (modules/tool-browser-bridge -> repo root). Only respected by
-# `uv`; a plain `pip install` of this module (e.g. after publishing, via
-# `git+https://.../amplifier-browser-bridge@main#subdirectory=modules/tool-browser-bridge`)
-# falls back to resolving `amplifier-browser-bridge` as a normal dependency --
-# see docs/AGENT_SURFACES.md for the production dependency once the repo is
-# published.
-amplifier-browser-bridge = { path = "../..", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
