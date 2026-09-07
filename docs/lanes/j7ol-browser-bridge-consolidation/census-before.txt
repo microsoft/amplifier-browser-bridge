@@ -1,0 +1,38 @@
+   311  browser_devices
+   911  browser_tabs
+  1032  browser_snapshot
+   765  browser_read
+   297  browser_click
+   306  browser_type
+   337  browser_key
+   280  browser_scroll
+   260  browser_navigate
+   463  browser_tab_open
+   436  browser_reload
+   248  browser_tab_close
+   462  browser_tab_activate
+  1414  browser_screenshot
+  1318  browser_vision_read
+   333  browser_wait_for
+   343  browser_wait_text
+   940  browser_fetch_bytes
+   797  browser_grab_image
+   618  browser_downloads_list
+   461  browser_download
+   826  browser_wait_download
+   322  browser_poll
+   518  browser_establish_session
+   550  browser_narrow_scope
+  1386  browser_setup
+   420  browser_setup_status
+  2692  browser_archive
+  1821  browser_archive_convert
+  2079  browser_archive_catalog
+  2123  browser_update_extension
+
+tools                : 31
+description chars    : 25069
+input_schema chars   : 19915
+name chars           : 529
+wire, per-tool sum   : 47186
+wire, single array   : 47248

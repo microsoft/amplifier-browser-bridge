@@ -1,4 +1,4 @@
-"""Per-tool description bytes + serialized wire bytes for this repo's 31 tools.
+"""Per-tool description bytes + serialized wire bytes for this repo's mounted tools.
 
 Run from the repo root:  uv run python docs/lanes/hd-browser-bridge/tools/census.py
 Compare against the merge-base with:  git stash && <rerun> && git stash pop

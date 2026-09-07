@@ -1,0 +1,14 @@
+   481  browser_devices
+  1096  browser_tabs
+  1519  browser_page
+  1789  browser_capture
+   963  browser_download
+  1720  browser_archive
+  1527  browser_admin
+
+tools                : 7
+description chars    : 9095
+input_schema chars   : 9966
+name chars           : 98
+wire, per-tool sum   : 19597
+wire, single array   : 19611
