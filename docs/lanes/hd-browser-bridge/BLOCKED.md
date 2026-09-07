@@ -1,5 +1,40 @@
 # BLOCKED — the tracker leg only. The deliverables are DONE and shipped.
 
+## THE TERMINAL OUTCOME WAS NOT REACHED. Say it first, say it plainly.
+
+`model_performance-6f80` was **never claimed and never resolved by this lane.** No member of the goal's
+"exhaustive" A/B/C set was satisfiable:
+
+| branch | requires | why unreachable |
+|---|---|---|
+| **A** | 6f80 resolved + deliverables exist | claim refused; and the item describes a *different repo's* work — resolving it would have published a false record |
+| **B** | 6f80 resolved, at the cap | inapplicable: $0 authority, $0 spent, cap never bound, no deliverable dropped |
+| **C** | `BLOCKED.md` + `work_release` | **half-executable**: this file exists and names the cause; `work_release` is impossible for a session that was refused the claim and never held the item |
+
+The deliverables are separately, genuinely DONE and shipped. **Deliverables are not the terminal outcome,
+and nothing in this lane's output should be read as claiming they are.** `../../../DONE.json` carries
+`"goal_terminal_outcome_reached": false` at top level for exactly this reason.
+
+## UPDATE 2026-09-07T21:0xZ — 6f80 is now resolved, correctly, by someone else
+
+`agent-spark-1-104757` — the tool-delegate lane, its legitimate owner — resolved it at
+**2026-09-07T20:39:48Z** (PR `microsoft/amplifier-foundation#376`, delegate description 49,954 → 40,480
+chars, CI 6/6). **That record is correct and must not be touched by this lane:** no `work_reopen` (it
+would clear `closed_at` and destroy a correct resolution), no re-resolve (different text against a
+resolved item fails and writes nothing, by design), no erratum (the record is not wrong — it is simply
+not ours).
+
+**And it corroborates the defect.** 6f80's own resolution text names a *second* victim lane, verbatim:
+
+> *"lanes/hd-work-tracker's GOAL.md names model_performance-6f80 in its OUTCOME block while its actual
+> work is work-tracker tool descriptions; it claimed this item at launch and released it 2.5 min later.
+> Cost nothing here, but it has no correct id of its own to resolve."*
+
+So the same id was handed to **at least three lanes** across the `hd-*` head-cost fan-out — tool-delegate
+(the real owner), hd-work-tracker, and hd-browser-bridge — each doing a different repo. Exactly one could
+ever have resolved it. Filed and upgraded as `model_performance-40d8`.
+
+
 **Read this together with `DONE-NOTE.md` §0.** This file records one thing: the goal's work item could
 not be claimed and could not be resolved. It does **not** mean the lane produced nothing — all seven
 deliverables are DONE, on `lane/hd-browser-bridge`, in a draft PR.
