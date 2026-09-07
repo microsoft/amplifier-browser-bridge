@@ -1,14 +1,28 @@
 """Amplifier tool module: browser-bridge.
 
 Wraps `amplifier_browser_bridge` (the Python lib -- the single home for all logic,
-see the repo root's client.py/addressing.py) as Amplifier-callable tools. Same tool
-vocabulary as `mcp_server.py`, for consistency across both agent surfaces (design
-doc section 3.3): one Amplifier tool per browser-bridge command, each a thin
-wrapper over `HubClient`. No policy or business logic lives here -- every tool's
-`execute()` does nothing but build a `Target`, call the lib, and hand the hub's
-response straight back (including `{"status": "queued", ...}` for a non-live
-device -- see `_HubTool.execute` for the one place that pass-through is
-guaranteed).
+see the repo root's client.py/addressing.py) as Amplifier-callable tools. No policy
+or business logic lives here -- every operation's runner does nothing but build a
+`Target`, call the lib, and hand the hub's response straight back (including
+`{"status": "queued", ...}` for a non-live device -- see `_HubTool.execute` for the
+one place that pass-through is guaranteed).
+
+SEVEN tools, not one per command. Every mounted tool's name + description +
+input_schema is serialised into the request on EVERY request of EVERY session that
+mounts this bundle, called or not -- so the tool surface is a permanent per-request
+cost, not a documentation surface. This module used to mount 31 flat tools, one per
+browser-bridge command; it now mounts seven subject-area tools with an `operation`
+enum inside each, the shape `android_inspector`/`ios_inspector`/`terminal_inspector`
+already establish. Shared parameters (device_id/tab_id/window_id/timeout_s) are
+declared once per tool instead of once per command.
+
+Nothing was deleted in that move: `LEGACY_TOOLS` below maps every one of the 31
+former tool names to exactly one `(tool, operation)` pair, and
+`tests/test_consolidated_surface.py` fails if any of them stops resolving.
+
+This surface therefore NO LONGER matches `mcp_server.py`'s vocabulary, which still
+mounts 29 flat tools. That divergence is deliberate and recorded in
+docs/AGENT_SURFACES.md; the MCP server was left unedited by this change.
 
 `HubClient` is already async (it awaits a websocket round-trip), so tools call it
 directly with `await` -- no `asyncio.to_thread` needed; that's only for wrapping
@@ -24,7 +38,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from amplifier_core import ToolResult
 
@@ -77,13 +91,12 @@ DEFAULT_HUB_URL = resolve_hub_url()
 # when no env var is set (auth.py's `resolve_default_token`).
 DEFAULT_TOKEN = resolve_default_token()
 
-# Repeated verbatim in every tab-acting tool's description below -- see
-# mcp_server.py's module docstring for why this is plain repeated text rather
-# than a string spliced onto multiple docstrings.
+# Appended to the four device-addressing tools' descriptions. Before the
+# consolidation this text was repeated on 20 separate tools (235 chars x 20);
+# four subject-area tools now carry it once each.
 _QUEUE_NOTE = (
-    'Non-live device: returns {"status": "queued", command_id, tier, last_seen, queue_position} instead '
-    'of {"ok": ...} -- normal and actionable, not an error or a hang; call browser_poll(device_id, '
-    "command_id) later for the eventual result."
+    'Non-live device: {"status": "queued", command_id, tier, queue_position} instead of {"ok": ...} -- '
+    'normal and actionable, not an error; browser_devices(operation="poll") returns the eventual result.'
 )
 
 
@@ -94,20 +107,50 @@ def _client() -> HubClient:
 Runner = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
-class _HubTool:
-    """Generic thin Amplifier tool: one instance per browser-bridge command.
+class _Op(NamedTuple):
+    """One operation inside a subject-area tool.
 
-    Holds no command-specific logic of its own -- it exists only to satisfy the
-    Tool protocol (name/description/input_schema/execute) around whatever
-    `runner` coroutine it's constructed with. Each `runner` below is a small
-    function that maps `input_data` to one `HubClient` call.
+    `line` is the single description line the agent sees for this operation
+    (<= ~160 chars -- longer contract detail goes in the NOTES block under the
+    operation list, or in the parameter's own description). `required` names the
+    parameters this operation cannot run without; JSON Schema cannot express
+    "required, but only for operation=X", so it is enforced in `execute` and
+    reported by name rather than failing somewhere deeper with a KeyError.
     """
 
-    def __init__(self, name: str, description: str, input_schema: dict[str, Any], runner: Runner) -> None:
+    line: str
+    required: tuple[str, ...]
+    runner: Runner
+
+
+class _HubTool:
+    """Generic thin Amplifier tool: one instance per subject area.
+
+    Holds no command-specific logic of its own -- it exists only to satisfy the
+    Tool protocol (name/description/input_schema/execute) around the `_Op`
+    registry it's constructed with. Each op's `runner` is a small function that
+    maps `input_data` to one `HubClient` call.
+    """
+
+    def __init__(
+        self, name: str, header: str, ops: dict[str, _Op], props: dict[str, Any], notes: str = ""
+    ) -> None:
         self._name = name
-        self._description = description
-        self._input_schema = input_schema
-        self._runner = runner
+        self._ops = ops
+        op_lines = "\n".join(f"- {op_name}: {op.line}" for op_name, op in ops.items())
+        self._description = "\n".join(part for part in (header, op_lines, notes) if part)
+        self._input_schema = {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": list(ops),
+                    "description": "Which operation to perform -- see the tool description.",
+                },
+                **props,
+            },
+            "required": ["operation"],
+        }
 
     @property
     def name(self) -> str:
@@ -122,17 +165,34 @@ class _HubTool:
         return self._input_schema
 
     async def execute(self, input_data: dict[str, Any]) -> ToolResult:
-        """Run the command and pass the hub's response straight back as output.
+        """Dispatch on `operation`, then pass the hub's response straight back.
 
         This is the one place the tier pass-through guarantee lives for this
         surface: whatever dict the hub returned (ok/result, ok/error, or
         status=queued/tier/...) becomes `ToolResult(success=True, output=<that
         dict>)` verbatim. `success=False` is reserved for adapter-level failures
-        (a HubError -- e.g. the hub itself is unreachable), not for `ok: false`
+        (an unknown/missing operation, a missing required parameter, or a
+        HubError -- e.g. the hub itself is unreachable), not for `ok: false`
         command results, which are legitimate data the calling agent must see.
         """
+        operation = input_data.get("operation")
+        op = self._ops.get(operation) if isinstance(operation, str) else None
+        if op is None:
+            return ToolResult(
+                success=False,
+                output=(
+                    f"{self._name}: unknown operation {operation!r}. "
+                    f"Valid operations: {', '.join(self._ops)}."
+                ),
+            )
+        missing = [p for p in op.required if input_data.get(p) is None]
+        if missing:
+            return ToolResult(
+                success=False,
+                output=f"{self._name}(operation={operation!r}) requires: {', '.join(missing)}.",
+            )
         try:
-            result = await self._runner(input_data)
+            result = await op.runner(input_data)
         except HubError as e:
             return ToolResult(success=False, output=f"hub error: {e}")
         return ToolResult(success=True, output=result)
@@ -173,9 +233,9 @@ def _no_args(_input_data: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# One (name, description, input_schema, runner) tuple per browser-bridge
-# command. Descriptions and schemas mirror mcp_server.py's tool set exactly, so
-# an agent sees the same vocabulary regardless of which surface it's using.
+# Shared parameters, declared ONCE and spread into whichever tools need them --
+# the point of the consolidation. Before this, device_id/tab_id/window_id/
+# timeout_s were re-serialised into 20+ separate tool schemas.
 # ---------------------------------------------------------------------------
 
 _DEVICE_ID_PROP = {"device_id": {"type": "string", "description": "Device id, from browser_devices."}}
@@ -183,24 +243,86 @@ _SESSION_ID_PROP = {
     "session_id": {
         "type": "string",
         "description": (
-            "Optional session id from a prior browser_establish_session call. If given, the hub "
-            "enforces that session's declared write scope (docs/designs/confirmation-gate.md "
-            "section 11.2) against this command before it reaches the device."
+            "Optional write-scope session id from browser_admin(operation='establish_session'); the "
+            "hub enforces that scope on click/type/key/navigate before they reach the device."
         ),
     }
 }
 _TAB_TARGET_PROPS = {
     **_DEVICE_ID_PROP,
-    "tab_id": {"type": "integer", "description": "Tab id, from browser_tabs."},
+    "tab_id": {"type": "integer", "description": "Tab id, from browser_tabs(operation='list')."},
     "window_id": {"type": "integer", "description": "Optional window id (disambiguates reused tab ids)."},
     "timeout_s": {
         "type": "number",
         "description": (
-            "Optional override of the hub's default device-round-trip wait, in seconds, for this "
-            "command only -- useful for a heavy/slow-hydrating page (see docs/PROTOCOL.md's "
-            "'Command timeout' section)."
+            "Override the hub's default device-round-trip wait, in seconds, for this call only -- "
+            "for a heavy/slow-hydrating page (docs/PROTOCOL.md, 'Command timeout')."
         ),
     },
+}
+_TAB_IDS_PROP = {
+    "tab_ids": {
+        "type": "array",
+        "items": {"type": "integer"},
+        "description": "Restrict to this subset of tabs. Omit for every tab.",
+    }
+}
+_MAX_BYTES_PROP = {
+    "max_bytes": {"type": "integer", "description": "Raise the 25MB byte-size cap for this fetch."}
+}
+_CAPTURE_SHAPE_PROPS = {
+    "frame_id": {"type": "integer", "description": "Crop to this frame's on-screen region."},
+    "multi_page": {"type": "boolean", "default": False},
+    "max_pages": {"type": "integer", "default": 10, "description": "Cap for multi_page (max 50)."},
+    "scroll_selector": {"type": "string", "description": "CSS selector of the scroll container."},
+    "page_delay_ms": {"type": "integer", "description": "Settle delay between scroll and capture."},
+}
+
+# ---------------------------------------------------------------------------
+# COMPATIBILITY TABLE.
+#
+# Every one of the 31 flat tools this module mounted before the consolidation,
+# mapped to exactly one (tool, operation) pair. Nothing was deleted: the five
+# operations nobody has ever called (download start, narrow_scope, archive
+# convert, archive catalog, update_extension) are still here, marked RARELY
+# USED in their description lines rather than dropped.
+#
+# tests/test_consolidated_surface.py fails if any former name stops resolving,
+# if two map to the same pair, or if any live operation has no former name.
+# ---------------------------------------------------------------------------
+
+LEGACY_TOOLS: dict[str, tuple[str, str]] = {
+    "browser_devices": ("browser_devices", "list"),
+    "browser_poll": ("browser_devices", "poll"),
+    "browser_tabs": ("browser_tabs", "list"),
+    "browser_tab_open": ("browser_tabs", "open"),
+    "browser_tab_close": ("browser_tabs", "close"),
+    "browser_tab_activate": ("browser_tabs", "activate"),
+    "browser_snapshot": ("browser_page", "snapshot"),
+    "browser_read": ("browser_page", "read"),
+    "browser_click": ("browser_page", "click"),
+    "browser_type": ("browser_page", "type"),
+    "browser_key": ("browser_page", "key"),
+    "browser_scroll": ("browser_page", "scroll"),
+    "browser_navigate": ("browser_page", "navigate"),
+    "browser_wait_for": ("browser_page", "wait_for"),
+    "browser_wait_text": ("browser_page", "wait_text"),
+    "browser_screenshot": ("browser_capture", "screenshot"),
+    "browser_vision_read": ("browser_capture", "vision_read"),
+    "browser_fetch_bytes": ("browser_capture", "fetch_bytes"),
+    "browser_grab_image": ("browser_capture", "grab_image"),
+    "browser_downloads_list": ("browser_download", "list"),
+    "browser_download": ("browser_download", "start"),
+    "browser_wait_download": ("browser_download", "wait"),
+    "browser_archive": ("browser_archive", "archive"),
+    "browser_archive_convert": ("browser_archive", "convert"),
+    "browser_archive_catalog": ("browser_archive", "catalog"),
+    "browser_setup": ("browser_admin", "setup"),
+    "browser_setup_status": ("browser_admin", "status"),
+    "browser_reload": ("browser_admin", "reload"),
+    "browser_update_extension": ("browser_admin", "update_extension"),
+    "browser_establish_session": ("browser_admin", "establish_session"),
+    "browser_narrow_scope": ("browser_admin", "narrow_scope"),
 }
 
 
@@ -422,831 +544,518 @@ def _build_tools() -> list[_HubTool]:
         except CatalogError as e:
             return {"ok": False, "error": str(e)}
 
+    async def setup_runner(input_data: dict[str, Any]) -> dict[str, Any]:
+        return await run_auto_setup(
+            host=input_data.get("host"),
+            port=input_data.get("port", DEFAULT_PORT),
+            token_file=input_data.get("token_file"),
+            dest=input_data.get("dest"),
+            install_service=bool(input_data.get("install_service", True)),
+            force_token=bool(input_data.get("force_token", False)),
+            wait_reachable_s=float(input_data.get("wait_reachable_s", DEFAULT_WAIT_REACHABLE_S)),
+        )
+
     return [
         _HubTool(
             "browser_devices",
-            "List every known browser device: id, label, platform, connectivity tier "
-            "(live/intermittent/dormant), behaviorally-probed capabilities (e.g. whether CDP/debugger "
-            "or background-tab screenshot is available), and current queue length. ALWAYS call this "
-            "first -- it is the entry point for addressing every other tool.",
-            {"type": "object", "properties": {}},
-            devices_runner,
+            "Browser devices, and the results of commands they have not run yet. ALWAYS call "
+            'operation="list" first -- every other tool\'s device_id comes from nowhere else.',
+            {
+                "list": _Op(
+                    "every known device: id, label, platform, connectivity tier "
+                    "(live/intermittent/dormant), behaviourally-probed capabilities (e.g. "
+                    "debugger/CDP), queue length.",
+                    (),
+                    devices_runner,
+                ),
+                "poll": _Op(
+                    'check on / retrieve a queued command: {"status":"queued", queue_position, '
+                    'tier}, then {"status":"pending"} while it runs, then the final {"ok":...}.',
+                    ("device_id", "command_id"),
+                    poll_runner,
+                ),
+            },
+            {
+                **_DEVICE_ID_PROP,
+                "command_id": {"type": "string", "description": "command_id from a queued result."},
+            },
         ),
         _HubTool(
             "browser_tabs",
-            "List a device's open tabs -- the source of `tab_id` for every other tool; call "
-            "browser_devices() first for the device_id. USE WHEN you need tab ids or an inventory. DO NOT "
-            "USE WHEN profile size is unknown: call with summary=true FIRST for ONLY per-window tab counts, "
-            "totals and discarded/asleep counts (no tab list at all). PAGED by default (limit=100, offset=0; "
-            "limit=0 = unpaged) -- an unpaged listing of hundreds of tabs can truncate before it reaches "
-            "your context. window_id (exact), url_contains and title_contains (case-insensitive substrings) "
-            "filter BEFORE offset/limit. `result` carries total (unfiltered), matched (post-filter), "
-            "returned, offset, limit and has_more. " + _QUEUE_NOTE,
+            "A device's tabs: inventory and lifecycle. Every other tool's tab_id comes from "
+            'operation="list".',
             {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "window_id": {
-                        "type": "integer",
-                        "description": "Filter to tabs in this window only (exact match).",
-                    },
-                    "url_contains": {
-                        "type": "string",
-                        "description": "Filter to tabs whose url contains this substring (case-insensitive).",
-                    },
-                    "title_contains": {
-                        "type": "string",
-                        "description": "Filter to tabs whose title contains this substring (case-insensitive).",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": DEFAULT_LIMIT,
-                        "description": "Max tabs to return (after filtering). 0 means unlimited.",
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "default": 0,
-                        "description": "Skip this many matched tabs before returning a page.",
-                    },
-                    "summary": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Return ONLY per-window counts/totals/discarded/asleep aggregates -- no tab "
-                            "list. Call this first against a large or unknown-size profile."
-                        ),
-                    },
+                "list": _Op(
+                    "paged, filtered tab inventory; each entry carries discarded/status. Reports "
+                    "total (unfiltered), matched, returned, offset, limit, has_more.",
+                    ("device_id",),
+                    tabs_runner,
+                ),
+                "open": _Op(
+                    "new tab, device-only target. active defaults to false, so it opens in the "
+                    "background without stealing focus.",
+                    ("device_id",),
+                    tab_open_runner,
+                ),
+                "close": _Op(
+                    "close one tab.",
+                    ("device_id", "tab_id"),
+                    lambda input_data: _command("tab_close", _no_args, input_data),
+                ),
+                "activate": _Op(
+                    "foreground a tab -- the one operation allowed to steal focus, because it was "
+                    "asked to. Prefer background tabs wherever a command allows it.",
+                    ("device_id", "tab_id"),
+                    lambda input_data: _command("tab_activate", _no_args, input_data),
+                ),
+            },
+            {
+                **_TAB_TARGET_PROPS,
+                "url": {
+                    "type": "string",
+                    "default": "about:blank",
+                    "description": "open: url for the new tab.",
                 },
-                "required": ["device_id"],
-            },
-            tabs_runner,
-        ),
-        _HubTool(
-            "browser_snapshot",
-            "Accessibility-style element tree for a tab, with stable frame-qualified `ref` ids (e.g. "
-            "'f0.e12') for browser_click/browser_type/browser_key. USE WHEN you need refs to act on a page. "
-            "DO NOT USE WHEN you only need its text (browser_read). Each node carries a `generation`: a ref "
-            "is valid only from the MOST RECENT snapshot of that frame, and a superseded one fails loud with "
-            "a 'stale ref' error rather than silently doing nothing; refs reset on navigation, so "
-            "re-snapshot after navigating. A discarded background tab (see browser_tabs' `discarded`) fails "
-            "loud naming that cause; wake=true reloads and retries, DESTROYING in-page state, so it is "
-            "opt-in and reports 'woke': true. activate=true foregrounds a heavy/slow-hydrating SPA first -- "
-            "never automatic, steals focus, reports 'activated': true. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "wake": {"type": "boolean", "default": False},
-                    "activate": {"type": "boolean", "default": False},
+                "active": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "open: foreground the new tab.",
                 },
-                "required": ["device_id", "tab_id"],
-            },
-            lambda input_data: _command("snapshot", read_or_snapshot_args, input_data),
-        ),
-        _HubTool(
-            "browser_read",
-            "Read a tab's full visible text. USE WHEN you want page content as text. DO NOT USE WHEN you "
-            "need refs to act on elements (browser_snapshot), or the content is canvas-rendered and absent "
-            "from the DOM (browser_vision_read). A discarded background tab (see browser_tabs' `discarded`) "
-            "fails loud naming that cause; wake=true reloads and retries, DESTROYING in-page state, so it is "
-            "opt-in and reports 'woke': true. activate=true foregrounds a heavy/slow-hydrating SPA first -- "
-            "never automatic, steals focus, reports 'activated': true. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "wake": {"type": "boolean", "default": False},
-                    "activate": {"type": "boolean", "default": False},
+                "url_contains": {
+                    "type": "string",
+                    "description": "list: filter by url substring (case-insensitive).",
                 },
-                "required": ["device_id", "tab_id"],
-            },
-            lambda input_data: _command("read", read_or_snapshot_args, input_data),
-        ),
-        _HubTool(
-            "browser_click",
-            "Click an element by ref (from a prior browser_snapshot call). " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    **_SESSION_ID_PROP,
-                    "ref": {"type": "string", "description": "Element ref."},
+                "title_contains": {
+                    "type": "string",
+                    "description": "list: filter by title substring (case-insensitive).",
                 },
-                "required": ["device_id", "tab_id", "ref"],
-            },
-            lambda input_data: _command("click", click_args, input_data),
-        ),
-        _HubTool(
-            "browser_type",
-            "Type text into an element by ref (from a prior browser_snapshot call). " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    **_SESSION_ID_PROP,
-                    "ref": {"type": "string", "description": "Element ref."},
-                    "text": {"type": "string", "description": "Text to type."},
+                "limit": {
+                    "type": "integer",
+                    "default": DEFAULT_LIMIT,
+                    "description": "list: 0 means unlimited.",
                 },
-                "required": ["device_id", "tab_id", "ref", "text"],
-            },
-            lambda input_data: _command("type", type_args, input_data),
-        ),
-        _HubTool(
-            "browser_key",
-            "Send a key press (e.g. 'Enter', 'Escape', 'Tab'), optionally focused on a specific "
-            "element ref first. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    **_SESSION_ID_PROP,
-                    "key": {"type": "string", "description": "Key name, e.g. 'Enter'."},
-                    "ref": {"type": "string", "description": "Optional element ref to focus first."},
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "list: skip this many matched tabs.",
                 },
-                "required": ["device_id", "tab_id", "key"],
-            },
-            lambda input_data: _command("key", key_args, input_data),
-        ),
-        _HubTool(
-            "browser_scroll",
-            "Scroll a tab to absolute coordinates (x, y). " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "x": {"type": "integer", "default": 0},
-                    "y": {"type": "integer", "default": 0},
+                "summary": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "list: counts only, no tab list.",
                 },
-                "required": ["device_id", "tab_id"],
             },
-            lambda input_data: _command("scroll", scroll_args, input_data),
+            "list is PAGED by default (limit=100, offset=0; limit=0 unpaged), and "
+            "window_id/url_contains/title_contains filter BEFORE offset/limit. Against an "
+            "unknown-size profile call summary=true FIRST -- per-window counts, totals and "
+            "discarded/asleep only, no tab list at all -- because an unpaged listing of hundreds "
+            "of tabs can truncate before it reaches your context.\n" + _QUEUE_NOTE,
         ),
         _HubTool(
-            "browser_navigate",
-            "Navigate a tab to a URL. " + _QUEUE_NOTE,
+            "browser_page",
+            'Read and act on one tab. Element refs come from operation="snapshot": each node '
+            "carries a generation, a ref is valid only from the MOST RECENT snapshot of that "
+            "frame, and a superseded one fails loud with 'stale ref' rather than silently doing "
+            "nothing. Refs reset on navigation.",
             {
-                "type": "object",
-                "properties": {**_TAB_TARGET_PROPS, **_SESSION_ID_PROP, "url": {"type": "string"}},
-                "required": ["device_id", "tab_id", "url"],
+                "snapshot": _Op(
+                    "accessibility-style element tree with frame-qualified ref ids (e.g. 'f0.e12') "
+                    "for click/type/key, plus each frame's on-screen region in `frames`.",
+                    ("device_id", "tab_id"),
+                    lambda input_data: _command("snapshot", read_or_snapshot_args, input_data),
+                ),
+                "read": _Op(
+                    "full visible text. Use when you want content, not refs; canvas-rendered "
+                    "content is never in the DOM -- see browser_capture vision_read.",
+                    ("device_id", "tab_id"),
+                    lambda input_data: _command("read", read_or_snapshot_args, input_data),
+                ),
+                "click": _Op(
+                    "click the element at ref.",
+                    ("device_id", "tab_id", "ref"),
+                    lambda input_data: _command("click", click_args, input_data),
+                ),
+                "type": _Op(
+                    "type `text` into the element at ref.",
+                    ("device_id", "tab_id", "ref", "text"),
+                    lambda input_data: _command("type", type_args, input_data),
+                ),
+                "key": _Op(
+                    "press `key` (e.g. 'Enter', 'Escape', 'Tab'), optionally focusing ref first.",
+                    ("device_id", "tab_id", "key"),
+                    lambda input_data: _command("key", key_args, input_data),
+                ),
+                "scroll": _Op(
+                    "scroll to absolute x, y.",
+                    ("device_id", "tab_id"),
+                    lambda input_data: _command("scroll", scroll_args, input_data),
+                ),
+                "navigate": _Op(
+                    "go to url.",
+                    ("device_id", "tab_id", "url"),
+                    lambda input_data: _command("navigate", navigate_args, input_data),
+                ),
+                "wait_for": _Op(
+                    "poll (never sleep blindly) until CSS `selector` matches, or timeout_ms elapses.",
+                    ("device_id", "tab_id", "selector"),
+                    lambda input_data: _command("wait_for", wait_for_args, input_data),
+                ),
+                "wait_text": _Op(
+                    "poll (never sleep blindly) until the visible text contains `text`, or "
+                    "timeout_ms elapses.",
+                    ("device_id", "tab_id", "text"),
+                    lambda input_data: _command("wait_text", wait_text_args, input_data),
+                ),
             },
-            lambda input_data: _command("navigate", navigate_args, input_data),
-        ),
-        _HubTool(
-            "browser_tab_open",
-            "Open a new tab on a device. No tab_id exists yet, so target is device-only. `active` "
-            "defaults to false (co-working etiquette: don't steal focus) -- the new tab opens in the "
-            "background unless active=true is explicitly requested. " + _QUEUE_NOTE,
             {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "url": {"type": "string", "default": "about:blank"},
-                    "active": {"type": "boolean", "default": False},
+                **_TAB_TARGET_PROPS,
+                **_SESSION_ID_PROP,
+                "wake": {"type": "boolean", "default": False},
+                "activate": {"type": "boolean", "default": False},
+                "ref": {"type": "string", "description": "Element ref from a prior snapshot."},
+                "text": {
+                    "type": "string",
+                    "description": "type: text to type. wait_text: substring to wait for.",
                 },
-                "required": ["device_id"],
-            },
-            tab_open_runner,
-        ),
-        _HubTool(
-            "browser_reload",
-            "Reload the extension on a device (chrome.runtime.reload()). Self-service for "
-            "unpacked-extension iteration: after updating extension/ files on the device's "
-            "machine, this picks up the change without a manual click in edge://extensions. "
-            "Note: the very first deployment of this command itself still requires one manual "
-            "reload -- an extension has to already understand `reload` before it can reload "
-            "itself into a version that understands it.",
-            {"type": "object", "properties": _DEVICE_ID_PROP, "required": ["device_id"]},
-            reload_runner,
-        ),
-        _HubTool(
-            "browser_tab_close",
-            "Close a tab. " + _QUEUE_NOTE,
-            {"type": "object", "properties": _TAB_TARGET_PROPS, "required": ["device_id", "tab_id"]},
-            lambda input_data: _command("tab_close", _no_args, input_data),
-        ),
-        _HubTool(
-            "browser_tab_activate",
-            "Bring a tab to the foreground. This is the one command explicitly allowed to steal "
-            "focus, because it was asked to -- prefer acting on background tabs wherever a command "
-            "allows it (co-working etiquette, design doc section 6.3). " + _QUEUE_NOTE,
-            {"type": "object", "properties": _TAB_TARGET_PROPS, "required": ["device_id", "tab_id"]},
-            lambda input_data: _command("tab_activate", _no_args, input_data),
-        ),
-        _HubTool(
-            "browser_screenshot",
-            "Screenshot a tab -- returns PIXELS (base64 + format), no model call. USE WHEN you can see "
-            "images directly. DO NOT USE WHEN you need TEXT out of the image (e.g. you cannot process "
-            "images, or want OCR'd text in context): browser_vision_read is the distinct mechanism that "
-            "makes a real vision-model API call; this one never does. capture_hidden=true captures a tab "
-            "that is NOT the active tab of a focused window (auto-escalates to CDP; requires the debugger "
-            "capability -- check browser_devices' capabilities.debugger); without it only the active tab of "
-            "a focused window can be captured, and it fails loud rather than silently activating the tab. "
-            "frame_id crops to one frame's on-screen region (from a prior browser_snapshot/browser_read's "
-            "`frames`) and requires capture_hidden. multi_page=true scrolls and re-captures up to max_pages "
-            "(default 10, hard cap 50) until the scrollable region ends, returning a `pages` array plus "
-            "`capped`/`stopped_reason` -- never a partial result reported as complete; scroll_selector picks "
-            "the scroll container (CSS selector), page_delay_ms is the settle delay between scroll and "
-            "capture. On Android (no CDP) only the active tab can ever be captured. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "capture_hidden": {"type": "boolean", "default": False},
-                    "frame_id": {"type": "integer", "description": "Crop to this frame's on-screen region."},
-                    "multi_page": {"type": "boolean", "default": False},
-                    "max_pages": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Cap for multi_page (max 50).",
-                    },
-                    "scroll_selector": {"type": "string", "description": "CSS selector of scroll container."},
-                    "page_delay_ms": {
-                        "type": "integer",
-                        "description": "Settle delay between scroll and capture.",
-                    },
+                "key": {"type": "string", "description": "key: key name, e.g. 'Enter'."},
+                "x": {"type": "integer", "default": 0},
+                "y": {"type": "integer", "default": 0},
+                "url": {"type": "string", "description": "navigate: url to load."},
+                "selector": {"type": "string", "description": "wait_for: CSS selector to wait for."},
+                "timeout_ms": {
+                    "type": "integer",
+                    "default": 10000,
+                    "description": "wait_for/wait_text deadline.",
                 },
-                "required": ["device_id", "tab_id"],
             },
-            lambda input_data: _command("screenshot", screenshot_args, input_data),
-        ),
-        _HubTool(
-            "browser_vision_read",
-            "Capture pixels and extract TEXT from them via a vision-capable LLM -- a real, separate model "
-            "call. USE WHEN the content was never in the DOM as text (a canvas-rendered viewer, e.g. "
-            "Word/PowerPoint Online) and you want text back rather than an image. DO NOT USE WHEN pixels "
-            "suffice: browser_screenshot never calls a model. Requires a vision provider set by environment "
-            "variable on the machine running this hub/tool (ANTHROPIC_API_KEY / OPENAI_API_KEY / "
-            "GOOGLE_API_KEY, or AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to pin one); with none configured "
-            "it fails loud with setup instructions ({'ok': false, 'error': ...}) and never silently returns "
-            "empty text. capture_hidden defaults to TRUE here, unlike browser_screenshot. "
-            "frame_id/multi_page/max_pages/scroll_selector/page_delay_ms mean exactly what they mean on "
-            "browser_screenshot. Returns {'ok': true, 'result': {text, vision_provider, vision_model, "
-            "image_count, page_count, capped, stopped_reason}}, or the hub's own queued/error shape if the "
-            "capture itself queued or failed (the model is never called without a real captured image). "
+            "snapshot/read on a discarded background tab (browser_tabs' `discarded`) fail loud "
+            "naming that cause. wake=true reloads and retries, DESTROYING unsaved in-page state, "
+            "and reports 'woke': true; activate=true foregrounds a heavy/slow-hydrating SPA "
+            "first, stealing focus, and reports 'activated': true. Neither is ever automatic.\n"
             + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "prompt": {"type": "string", "description": "What to extract/ask about the image(s)."},
-                    "frame_id": {"type": "integer", "description": "Crop to this frame's on-screen region."},
-                    "multi_page": {"type": "boolean", "default": False},
-                    "max_pages": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Cap for multi_page (max 50).",
-                    },
-                    "scroll_selector": {"type": "string", "description": "CSS selector of scroll container."},
-                    "page_delay_ms": {
-                        "type": "integer",
-                        "description": "Settle delay between scroll and capture.",
-                    },
-                    "capture_hidden": {"type": "boolean", "default": True},
-                },
-                "required": ["device_id", "tab_id"],
-            },
-            vision_read_runner,
         ),
         _HubTool(
-            "browser_wait_for",
-            "Poll (never sleep blindly) until a CSS selector matches an element, or time out after "
-            "timeout_ms. " + _QUEUE_NOTE,
+            "browser_capture",
+            "Get pixels or bytes out of a page.",
             {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "selector": {"type": "string"},
-                    "timeout_ms": {"type": "integer", "default": 10000},
+                "screenshot": _Op(
+                    "PIXELS (base64 + format), no model call. Use when you can see images directly.",
+                    ("device_id", "tab_id"),
+                    lambda input_data: _command("screenshot", screenshot_args, input_data),
+                ),
+                "vision_read": _Op(
+                    "pixels -> TEXT via a real, separate vision-model call. Use only when the "
+                    "content was never in the DOM (a canvas-rendered viewer, e.g. Word Online).",
+                    ("device_id", "tab_id"),
+                    vision_read_runner,
+                ),
+                "fetch_bytes": _Op(
+                    "fetch `url` from the EXTENSION's own cookied context; no tab_id needed. For a "
+                    "file a page only links to (.docx/.pdf) behind the user's login.",
+                    ("device_id", "url"),
+                    fetch_bytes_runner,
+                ),
+                "grab_image": _Op(
+                    "fetch `url` from the PAGE's own script context, carrying its Referer -- the "
+                    "fallback when fetch_bytes trips hotlink/Referer protection.",
+                    ("device_id", "tab_id", "url"),
+                    lambda input_data: _command("grab_image", grab_image_args, input_data),
+                ),
+            },
+            {
+                **_TAB_TARGET_PROPS,
+                "capture_hidden": {
+                    "type": "boolean",
+                    "description": (
+                        "Capture a tab that is NOT the active tab of a focused window. Defaults "
+                        "false for screenshot, true for vision_read."
+                    ),
                 },
-                "required": ["device_id", "tab_id", "selector"],
-            },
-            lambda input_data: _command("wait_for", wait_for_args, input_data),
-        ),
-        _HubTool(
-            "browser_wait_text",
-            "Poll (never sleep blindly) until the tab's visible text contains a substring, or time "
-            "out after timeout_ms. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "text": {"type": "string"},
-                    "timeout_ms": {"type": "integer", "default": 10000},
+                **_CAPTURE_SHAPE_PROPS,
+                "prompt": {
+                    "type": "string",
+                    "description": "vision_read: what to extract from the image(s).",
                 },
-                "required": ["device_id", "tab_id", "text"],
+                "url": {"type": "string", "description": "fetch_bytes/grab_image: url to fetch."},
+                **_MAX_BYTES_PROP,
             },
-            lambda input_data: _command("wait_text", wait_text_args, input_data),
-        ),
-        _HubTool(
-            "browser_fetch_bytes",
-            "Fetch a URL from the EXTENSION's own context, with credentials -- rides the user's real "
-            "logged-in session (cookies) for that origin. No tab_id needed. USE WHEN you need a file a page "
-            "only links to (.docx/.pdf/binary) behind the user's existing login: "
-            "browser_read/browser_snapshot only ever see text already in the DOM, and a canvas-rendered "
-            "viewer (e.g. Word Online) has none. DO NOT USE WHEN the target blocks extension-context "
-            "requests (some CDNs/hotlink protection check Referer/Origin) -- browser_grab_image fetches from "
-            "the PAGE's own script context instead. Returns {url, content_type, byte_length, base64}; "
-            "refuses past a byte-size cap (default 25MB, naming the limit) unless max_bytes raises it. "
-            + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "url": {"type": "string"},
-                    "max_bytes": {"type": "integer", "description": "Override the default byte-size cap."},
-                },
-                "required": ["device_id", "url"],
-            },
-            fetch_bytes_runner,
-        ),
-        _HubTool(
-            "browser_grab_image",
-            "Fetch a URL from the PAGE's own main-world script context, not the extension's. The request "
-            "carries the page's own Referer and cookie context, defeating hotlink/Referer protection that an "
-            "extension-context fetch (browser_fetch_bytes) would trip. Requires a tab_id: the page whose "
-            "script context does the fetching. USE WHEN browser_fetch_bytes failed with an HTTP error, or "
-            "the target needs the page's own session context. Returns {url, content_type, byte_length, "
-            "base64}; refuses past a byte-size cap (default 25MB, naming the limit) unless max_bytes raises "
-            "it. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {
-                    **_TAB_TARGET_PROPS,
-                    "url": {"type": "string"},
-                    "max_bytes": {"type": "integer", "description": "Override the default byte-size cap."},
-                },
-                "required": ["device_id", "tab_id", "url"],
-            },
-            lambda input_data: _command("grab_image", grab_image_args, input_data),
-        ),
-        _HubTool(
-            "browser_downloads_list",
-            "List recent downloads on a device (chrome.downloads.search), plus max_download_id -- the "
-            "highest download id chrome currently knows about. Call this BEFORE an action that triggers a "
-            "native/indirect download (e.g. clicking a page's own Download control) and pass its "
-            "max_download_id as browser_wait_download's since_id, so one the human started is never mistaken "
-            "for the agent's own. " + _QUEUE_NOTE,
-            {
-                "type": "object",
-                "properties": {**_DEVICE_ID_PROP, "limit": {"type": "integer", "default": 20}},
-                "required": ["device_id"],
-            },
-            downloads_list_runner,
+            "capture_hidden auto-escalates to CDP and needs browser_devices' "
+            "capabilities.debugger; without it the capture fails loud rather than silently "
+            "activating the tab, and on Android (no CDP) only the active tab is ever capturable. "
+            "frame_id crops to one frame's region and requires capture_hidden. multi_page=true "
+            "scrolls and re-captures up to max_pages (default 10, hard cap 50) until the "
+            "scrollable region ends, returning a `pages` array plus capped/stopped_reason -- "
+            "never a partial result reported as complete.\n"
+            "vision_read needs a provider env var on the machine running this hub "
+            "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, or "
+            "AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to pin one); with none set it fails loud "
+            "with setup instructions and never returns empty text. It returns text, "
+            "vision_provider, vision_model, image_count, page_count, capped, stopped_reason.\n"
+            "fetch_bytes/grab_image return {url, content_type, byte_length, base64} and refuse "
+            "past a 25MB cap unless max_bytes raises it.\n" + _QUEUE_NOTE,
         ),
         _HubTool(
             "browser_download",
-            "Trigger a download of a URL directly (chrome.downloads.download) -- returns a download_id known "
-            "precisely, since this command started the download itself. Pass it to browser_wait_download's "
-            "download_id to poll for completion. " + _QUEUE_NOTE,
+            "Downloads on a device.",
             {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "url": {"type": "string"},
-                    "filename": {"type": "string", "description": "Suggested filename for the download."},
-                },
-                "required": ["device_id", "url"],
+                "list": _Op(
+                    "recent downloads (chrome.downloads.search) plus max_download_id, the highest "
+                    "download id chrome currently knows about.",
+                    ("device_id",),
+                    downloads_list_runner,
+                ),
+                "start": _Op(
+                    "RARELY USED. Trigger a download of `url` directly (chrome.downloads.download); "
+                    "returns a download_id this call definitely owns.",
+                    ("device_id", "url"),
+                    download_runner,
+                ),
+                "wait": _Op(
+                    "poll for a completed download: {download_id, filename, url, mime, "
+                    "byte_length, state}, or an error if interrupted or timeout_ms passed.",
+                    ("device_id",),
+                    wait_download_runner,
+                ),
             },
-            download_runner,
-        ),
-        _HubTool(
-            "browser_wait_download",
-            "Poll (never sleep blindly) for a completed download. Pass EXACTLY ONE of download_id (from a "
-            "prior browser_download) or since_id (a baseline max_download_id from browser_downloads_list, "
-            "taken BEFORE the action that triggers an indirect download) -- since_id never matches a "
-            "download at or below the baseline, so it structurally cannot claim one the human started. "
-            "pattern (optional regex) narrows a since_id search by filename. Returns {download_id, filename, "
-            "url, mime, byte_length, state} once complete, or an error if the download was interrupted or "
-            "the timeout_ms deadline passed first. " + _QUEUE_NOTE,
             {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "download_id": {"type": "integer"},
-                    "since_id": {"type": "integer", "description": "Baseline max_download_id."},
-                    "pattern": {"type": "string", "description": "Optional regex on the filename."},
-                    "timeout_ms": {"type": "integer", "default": 30000},
+                **_DEVICE_ID_PROP,
+                "limit": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "list: how many recent downloads.",
                 },
-                "required": ["device_id"],
+                "url": {"type": "string", "description": "start: url to download."},
+                "filename": {"type": "string", "description": "start: suggested filename."},
+                "download_id": {"type": "integer", "description": "wait: the id start returned."},
+                "since_id": {"type": "integer", "description": "wait: baseline max_download_id from list."},
+                "pattern": {"type": "string", "description": "wait: optional regex on the filename."},
+                "timeout_ms": {"type": "integer", "default": 30000, "description": "wait: deadline."},
             },
-            wait_download_runner,
-        ),
-        _HubTool(
-            "browser_poll",
-            "Check on, or retrieve the eventual result of, a command previously reported as queued. Returns "
-            'one of three shapes: {"status": "queued", "queue_position": ..., "tier": ...} if still waiting '
-            'for the device, {"status": "pending"} if the device is live and executing it now, or the final '
-            '{"ok": ...} once it has actually run.',
-            {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "command_id": {"type": "string", "description": "command_id from a queued result."},
-                },
-                "required": ["device_id", "command_id"],
-            },
-            poll_runner,
-        ),
-        _HubTool(
-            "browser_establish_session",
-            "Create a new session with a caller-declared WRITE scope "
-            "(docs/designs/confirmation-gate.md, Candidate C) -- a boundary the page itself can never "
-            "touch. Pass the returned session_id to browser_click/browser_type/browser_key/"
-            "browser_navigate to enforce this scope on those commands. ALWAYS creates a brand-new "
-            "session with a fresh session_id -- can never be used to reset an existing session's scope "
-            "back to broad. To change an existing session, use browser_narrow_scope instead, which can "
-            "only ever narrow, never widen.",
-            {
-                "type": "object",
-                "properties": {
-                    "write": {
-                        "type": "string",
-                        "default": "*",
-                        "description": (
-                            "'*' (default, unrestricted) or comma-separated hostnames (subdomain-inclusive)."
-                        ),
-                    },
-                    "read": {"type": "string", "default": "*"},
-                    "on_unknown": {
-                        "type": "string",
-                        "enum": ["allow", "gate", "deny"],
-                        "default": "allow",
-                    },
-                    "redeem": {"type": "string", "enum": ["agent", "unredeemable"], "default": "agent"},
-                    "unattended": {"type": "boolean", "default": False},
-                },
-            },
-            establish_session_runner,
-        ),
-        _HubTool(
-            "browser_narrow_scope",
-            "Narrow an EXISTING session's scope -- NEVER widens (docs/designs/confirmation-gate.md "
-            "section 11.2). write/read may only shrink to a strict subset of the current grant, "
-            "on_unknown may only move allow -> gate -> deny, redeem only agent -> unredeemable, "
-            "unattended only False -> True. Only the parameters you pass are touched. Once the "
-            "session has ingested any page content (a browser_read/browser_snapshot/browser_tabs "
-            "result), the hub SEALS it and every subsequent call -- including this one -- is rejected "
-            "outright, no matter how narrow the request.",
-            {
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string"},
-                    "write": {"type": "string", "description": "Comma-separated hostnames to narrow to."},
-                    "read": {"type": "string", "description": "Comma-separated hostnames to narrow to."},
-                    "on_unknown": {"type": "string", "enum": ["allow", "gate", "deny"]},
-                    "redeem": {"type": "string", "enum": ["agent", "unredeemable"]},
-                    "unattended": {"type": "boolean", "default": False},
-                },
-                "required": ["session_id"],
-            },
-            narrow_scope_runner,
-        ),
-        _HubTool(
-            "browser_setup",
-            "Get from 'bundle installed' to 'my browser is connected' -- no CLI on PATH required. Generates "
-            "a hub token if none exists, stages the extension's runtime files, resolves and persists the "
-            "hub's host address (auto-detects this machine's Tailscale IP; falls back to 127.0.0.1, which is "
-            "loopback-only), and -- unless install_service=false -- installs the hub as a background OS "
-            "service (systemd --user on Linux, launchd on macOS) so it survives logout and reboot. If the "
-            "hub is reachable it mints a short-lived pairing code and returns ONE link "
-            "(result.pairing.pair_url): opening it on the browser being added downloads the extension, walks "
-            "through 'Load unpacked', and pairs itself automatically -- Edge exposes no CLI/API for that "
-            "step, so result.pairing.pair_url (or result.setup_url) is the one remaining manual step. Never "
-            "prompts, never blocks waiting for a browser; call browser_setup_status afterward (any time) to "
-            "check whether one connected. If the hub is not reachable yet (service still starting, "
-            "unsupported platform, or install_service=false with nothing running), result.hub_reachable is "
-            "false, result.pairing is null, and result.warnings/result.service/result.manual_hub_command "
-            "name exactly what is missing. Safe to call repeatedly: an existing token is reused, never "
-            "rotated, unless force_token=true, and a previously-configured browser's saved settings are "
-            "never touched.",
-            {
-                "type": "object",
-                "properties": {
-                    "host": {
-                        "type": "string",
-                        "description": (
-                            "Explicit hub bind/advertise host. Default: auto-detect this machine's "
-                            "Tailscale IP; falls back to 127.0.0.1 (NOT reachable from another device) "
-                            "if Tailscale isn't detected."
-                        ),
-                    },
-                    "port": {"type": "integer", "default": DEFAULT_PORT},
-                    "install_service": {
-                        "type": "boolean",
-                        "default": True,
-                        "description": (
-                            "Install/start the hub as a background OS service. Set false if a hub is "
-                            "already running some other way (already a service, started manually, "
-                            "started by someone else) -- this tool then only checks reachability "
-                            "instead of installing anything."
-                        ),
-                    },
-                    "force_token": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Regenerate the hub token even if one already exists. Rotating requires "
-                            "re-pasting the new token into any already-configured browser's options page."
-                        ),
-                    },
-                    "wait_reachable_s": {
-                        "type": "number",
-                        "default": DEFAULT_WAIT_REACHABLE_S,
-                        "description": "How long to wait for the hub to answer before giving up.",
-                    },
-                    "token_file": {
-                        "type": "string",
-                        "description": (
-                            "Advanced: override the default token file path "
-                            "(~/.config/amplifier-browser-bridge/tokens.json)."
-                        ),
-                    },
-                    "dest": {
-                        "type": "string",
-                        "description": (
-                            "Advanced: override the default staged-extension directory path "
-                            "(~/.local/share/amplifier-browser-bridge/extension)."
-                        ),
-                    },
-                },
-            },
-            lambda input_data: run_auto_setup(
-                host=input_data.get("host"),
-                port=input_data.get("port", DEFAULT_PORT),
-                token_file=input_data.get("token_file"),
-                dest=input_data.get("dest"),
-                install_service=bool(input_data.get("install_service", True)),
-                force_token=bool(input_data.get("force_token", False)),
-                wait_reachable_s=float(input_data.get("wait_reachable_s", DEFAULT_WAIT_REACHABLE_S)),
-            ),
-        ),
-        _HubTool(
-            "browser_setup_status",
-            "Diagnose exactly which link in the setup chain is broken or still pending: token store, "
-            "persisted hub location, network exposure, background-service status, hub reachability, "
-            "token match, and whether any browser device has actually connected. Same checks as "
-            "`amplifier-browser-bridge doctor`. Call this any time after browser_setup to confirm a "
-            "browser has connected, or to see exactly what's still missing if it hasn't.",
-            {"type": "object", "properties": {}},
-            setup_status_runner,
+            "Pass EXACTLY ONE of download_id or since_id to wait. Take since_id from list BEFORE "
+            "the action that triggers an indirect download (clicking a page's own Download "
+            "control): since_id never matches a download at or below that baseline, so it "
+            "structurally cannot claim one the human started. pattern narrows a since_id search "
+            "by filename.\n" + _QUEUE_NOTE,
         ),
         _HubTool(
             "browser_archive",
-            "Archive a browser's state at a chosen depth. Returns a MANIFEST -- paths, counts, byte sizes, "
-            "per-tab status -- never the payload: every captured page/profile payload is written straight to "
-            "disk under a fresh timestamped directory inside dest_dir.\n\n"
-            "DEPTH LADDER, each level a strict superset of the one below. L0: windows/tab-groups/tabs "
-            "inventory, NO tab wake, NO page contact. L1: +visible text per tab. L2: "
-            "+DOM/forms/localStorage/sessionStorage/scroll. L3: +screenshots. L4: +MHTML -- requires the "
-            "'debugger' capability (CDP-only, no fallback); L4/L5 on a device without it fails loud "
-            "immediately, before anything is captured, rather than silently degrading. L5: +per-tab "
-            "navigation history AND browser-wide profile data "
-            "(history/bookmarks/sessions/top_sites/reading_list).\n\n"
-            "NO-WAKE GUARANTEE: waking a discarded/asleep tab destroys real, unsaved in-page state, so every "
-            "tab flagged discarded/asleep in the L0 inventory is SKIPPED for L1+ capture -- recorded in the "
-            "manifest, never silently dropped -- unless wake=true is explicitly passed.\n\n"
-            "tab_ids restricts L1+ per-tab capture to a subset; the L0 inventory always covers every tab. "
-            "all_frames is forwarded to the L1 text capture only. captures narrows -- never widens -- which "
-            "per-tab captures run at this depth; an excluded one is recorded {status: skipped, reason}, "
-            "never silently omitted. injection_timeout_s overrides timeout_s for the JS-injection captures "
-            "(text, dom) ONLY; CDP captures (screenshot, mhtml, nav_history) keep timeout_s. include_cookies "
-            "gates cookie collection at L5, defaults to false, and is NEVER implied by depth.\n\n"
-            "manifest['status'] is 'ok' only if nothing failed or was skipped, else 'ok_with_skips' or "
-            "'ok_with_failures'; manifest['failures'] lists every failure/skip explicitly. "
-            "manifest['summary'] never collapses how many tabs/windows/tab-groups EXIST into how many had "
-            "content captured: tabs_inventoried/windows_inventoried/tab_groups_inventoried are populated "
-            "even at L0, while tabs_captured/tabs_skipped/tabs_failed/tabs_partial/tabs_not_found describe "
-            "per-tab CONTENT capture and are honestly 0 at L0 -- success, not an empty archive. Per-tab "
-            "status is five-valued, not binary: 'ok' (every attempted capture succeeded), 'failed' (every "
-            "one failed), 'partial' (some of each -- e.g. a browser error page where CDP captures succeed "
-            "but JS-injection captures cannot run), 'skipped' (the no-wake guarantee), and 'not_found' (a "
-            "tab_id in tab_ids absent from the live inventory, closed in between or never existing -- "
-            "accounted for at every depth including L0, benign so it never enters failures, but it does move "
-            "status to 'ok_with_skips'). A run containing any partial tab is never reported as plain 'ok'.",
+            "Capture a browser's whole state to disk, then optionally process it locally. Every "
+            "operation returns a MANIFEST -- paths, counts, byte sizes, per-tab status -- never "
+            "the payload itself.",
             {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "dest_dir": {
-                        "type": "string",
-                        "description": "Base directory to write the timestamped archive directory into.",
-                    },
-                    "depth": {
-                        "type": "string",
-                        "enum": ["L0", "L1", "L2", "L3", "L4", "L5"],
-                        "default": DEFAULT_DEPTH,
-                        "description": "Archive depth -- see the tool description's depth ladder.",
-                    },
-                    "tab_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Restrict L1+ per-tab capture to this subset. Omit for every tab.",
-                    },
-                    "include_cookies": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Opt-in to cookie collection at L5. Never implied by depth alone -- see "
-                            "the tool description."
-                        ),
-                    },
-                    "wake": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Allow waking a discarded/asleep tab to capture it. Default: such tabs are "
-                            "skipped, never woken implicitly."
-                        ),
-                    },
-                    "all_frames": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Forwarded to the L1 text capture only -- gather every frame's text.",
-                    },
-                    "timeout_s": {
-                        "type": "number",
-                        "description": "Optional per-command device-round-trip timeout override, in seconds.",
-                    },
-                    "injection_timeout_s": {
-                        "type": "number",
-                        "description": (
-                            "Overrides timeout_s for JUST the JS-injection-based per-tab captures "
-                            "(text/L1, dom/L2) -- CDP-based captures (screenshot/mhtml/nav_history) keep "
-                            "using timeout_s unchanged. Bounds the wall-clock cost of a heavy/hung SPA's "
-                            "injection captures without reducing what the depth ladder attempts. Omit "
-                            "for unchanged behavior (timeout_s applies uniformly to every capture)."
-                        ),
-                    },
-                    "captures": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "enum": ["text", "dom", "screenshot", "mhtml", "nav_history"],
-                        },
-                        "description": (
-                            "Explicit allow-list that narrows -- never widens -- which per-tab captures "
-                            'actually run at this depth, e.g. ["mhtml", "screenshot", "nav_history"] '
-                            "with depth=L4 for a CDP-only archive that skips text/dom entirely. An "
-                            "excluded capture is recorded as {status: skipped, reason: ...}, never "
-                            "silently omitted. Omit for the default: every capture the depth ladder "
-                            "attempts runs (the pre-existing strict-superset behavior)."
-                        ),
-                    },
-                },
-                "required": ["device_id", "dest_dir"],
+                "archive": _Op(
+                    "capture a device at depth L0 (inventory only, no page contact) through L5 "
+                    "(+MHTML, navigation history, profile data) into dest_dir.",
+                    ("device_id", "dest_dir"),
+                    archive_runner,
+                ),
+                "convert": _Op(
+                    "RARELY USED. Turn an existing archive's captured MHTML into markdown. Local "
+                    "CPU only, no browser interaction.",
+                    ("archive_dir",),
+                    archive_convert_runner,
+                ),
+                "catalog": _Op(
+                    "RARELY USED. Inventory an existing archive's tabs; catalog=true adds an "
+                    "opt-in per-tab LLM judgment.",
+                    ("archive_dir",),
+                    archive_catalog_runner,
+                ),
             },
-            archive_runner,
+            {
+                **_DEVICE_ID_PROP,
+                "dest_dir": {
+                    "type": "string",
+                    "description": "archive: base dir for a fresh timestamped archive.",
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["L0", "L1", "L2", "L3", "L4", "L5"],
+                    "default": DEFAULT_DEPTH,
+                    "description": "archive: see the depth ladder in the tool description.",
+                },
+                **_TAB_IDS_PROP,
+                "include_cookies": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "archive: opt in to cookies at L5. Never implied by depth alone.",
+                },
+                "wake": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "archive: allow waking a slept tab.",
+                },
+                "all_frames": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "archive: forwarded to the L1 text capture only.",
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": "Per-command device-round-trip timeout override.",
+                },
+                "injection_timeout_s": {
+                    "type": "number",
+                    "description": (
+                        "archive: overrides timeout_s for the JS-injection captures (text/L1, "
+                        "dom/L2) only; CDP captures keep timeout_s."
+                    ),
+                },
+                "captures": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["text", "dom", "screenshot", "mhtml", "nav_history"],
+                    },
+                    "description": (
+                        "archive: allow-list that NARROWS -- never widens -- which per-tab "
+                        "captures run at this depth. An excluded one is recorded skipped."
+                    ),
+                },
+                "archive_dir": {
+                    "type": "string",
+                    "description": "convert/catalog: the archive dir a prior archive manifest reported.",
+                },
+                "catalog": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "catalog: opt in to Layer 2 (per-tab LLM judgment). False returns only "
+                        "the free local Layer 1 inventory."
+                    ),
+                },
+                "lens": {
+                    "type": "string",
+                    "description": "catalog: freeform reader context, used only when catalog=true.",
+                },
+                "concurrency": {
+                    "type": "integer",
+                    "default": DEFAULT_CONCURRENCY,
+                    "description": "catalog: concurrent per-tab model calls.",
+                },
+                "top_n": {
+                    "type": "integer",
+                    "default": DEFAULT_TOP_N,
+                    "description": "catalog: entries in Layer 1's duplicates/by_domain lists.",
+                },
+            },
+            "Depth ladder, each level a strict superset of the one below: L0 inventory (no tab "
+            "wake, no page contact); L1 +visible text; L2 +DOM/forms/localStorage/sessionStorage/"
+            "scroll; L3 +screenshots; L4 +MHTML; L5 +per-tab navigation history and browser-wide "
+            "profile data. L4/L5 need browser_devices' capabilities.debugger and fail loud "
+            "immediately, before anything is captured, without it.\n"
+            "NO-WAKE GUARANTEE: waking a discarded/asleep tab destroys unsaved in-page state, so "
+            "every such tab is SKIPPED for L1+ capture -- recorded in the manifest, never "
+            "silently dropped -- unless wake=true.\n"
+            "manifest['status'] is 'ok' only if nothing failed or was skipped, else "
+            "'ok_with_skips'/'ok_with_failures', and manifest['failures'] lists every one. "
+            "Per-tab status is five-valued, not binary: ok, failed, partial, skipped, not_found. "
+            "Counts of what EXISTS (tabs_inventoried/windows_inventoried/tab_groups_inventoried) "
+            "are never collapsed into counts of what was CAPTURED (tabs_captured/tabs_skipped/"
+            "tabs_failed/tabs_partial/tabs_not_found), which are honestly 0 at L0 -- success, not "
+            "an empty archive.\n"
+            "convert's two output files and catalog's two layers: docs/AGENT_SURFACES.md.",
         ),
         _HubTool(
-            "browser_archive_convert",
-            "Convert an existing browser_archive output's captured MHTML pages into markdown, AFTER THE "
-            "FACT, from what is already on disk. archive_dir is the directory browser_archive's own manifest "
-            "reported (manifest['archive_dir']), not an individual tab directory. A distinct, later, OPT-IN "
-            "step: it never runs automatically as part of browser_archive and does no browser interaction at "
-            "all -- pure local CPU work over MHTML captured at depth L4 or deeper.\n\n"
-            "For each tab with a page.mhtml it writes TWO markdown files -- page.extracted.md (trafilatura's "
-            "best-effort main-content extraction) and page.full_page.md (a deliberately unfiltered "
-            "whole-page conversion, so a bad extraction is recoverable rather than lossy) -- plus "
-            "content-addressed asset sidecars (images/CSS/fonts) under a SHARED archive_dir/assets/, so an "
-            "asset repeated across pages dedupes instead of being duplicated per tab.\n\n"
-            "Returns only a MANIFEST (paths, byte counts, per-tab status, warnings), NEVER the markdown "
-            "itself. tab_ids restricts conversion to a subset; a requested id with no page.mhtml on disk "
-            "gets {'status': 'not_captured', ...} rather than being silently dropped, mirroring "
-            "browser_archive's own 'not_found' state. Omitted, every tab directory under archive_dir/tabs/ "
-            "with a page.mhtml is converted. A table with merged cells (colspan/rowspan) has no markdown "
-            "pipe-table form -- a format limitation, not a tooling gap -- so affected tables are named in "
-            "result['tabs'][tab_id]['tables_with_merged_cells'] rather than silently mangled. A page "
-            "containing more than one text/html body (an iframe-heavy page captured as separate frame "
-            "documents) is the documented hard case this converter does not merge: that tab reports "
-            "{'status': 'failed', 'error': ...} naming every frame found, rather than converting only the "
-            "first as if it were the whole page.",
+            "browser_admin",
+            "Setup, diagnosis and write-scope sessions -- no browser page involved.",
             {
-                "type": "object",
-                "properties": {
-                    "archive_dir": {
-                        "type": "string",
-                        "description": "The archive directory browser_archive's manifest reported.",
-                    },
-                    "tab_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Restrict conversion to this subset. Omit to convert every captured tab.",
-                    },
-                },
-                "required": ["archive_dir"],
+                "setup": _Op(
+                    "get from 'bundle installed' to 'browser connected': token, staged extension, "
+                    "hub host, background service, and ONE pairing link (result.pairing.pair_url).",
+                    (),
+                    setup_runner,
+                ),
+                "status": _Op(
+                    "diagnose which link in the setup chain is broken: token store, hub location, "
+                    "network exposure, service, reachability, token match, connected browsers.",
+                    (),
+                    setup_status_runner,
+                ),
+                "reload": _Op(
+                    "reload the extension on a device (chrome.runtime.reload()) so edited unpacked "
+                    "files take effect.",
+                    ("device_id",),
+                    reload_runner,
+                ),
+                "update_extension": _Op(
+                    "RARELY USED. Restage + reload a device's extension, then VERIFY by "
+                    "re-reading its command set; else a `guided` block with a download_url.",
+                    ("device_id",),
+                    update_extension_runner,
+                ),
+                "establish_session": _Op(
+                    "RARELY USED. New session with a caller-declared write scope the page can "
+                    "never touch; pass its session_id to browser_page writes.",
+                    (),
+                    establish_session_runner,
+                ),
+                "narrow_scope": _Op(
+                    "RARELY USED. Narrow an existing session -- never widens; SEALED once the "
+                    "session has ingested any page content.",
+                    ("session_id",),
+                    narrow_scope_runner,
+                ),
             },
-            archive_convert_runner,
-        ),
-        _HubTool(
-            "browser_archive_catalog",
-            "Catalog an existing browser_archive output's tabs, AFTER THE FACT, from what is already on "
-            "disk. archive_dir is the directory browser_archive's own manifest reported "
-            "(manifest['archive_dir']), not an individual tab directory. Does no browser interaction at all.\n\n"
-            "Layer 1 (structural inventory: duplicate URLs and how many could be closed, per-window and "
-            "per-domain breakdowns, awake/asleep/discarded/pinned counts) ALWAYS runs -- pure, local, no "
-            "model, no network. Layer 2 (a per-tab LLM judgment: what/who/why_kept/topics/value) is OPT-IN "
-            "via catalog=true, a distinct later step that never runs automatically as part of "
-            "browser_archive/browser_archive_convert, mirroring the mechanism/policy split "
-            "browser_vision_read establishes for an external model. catalog=false (the default) returns ONLY "
-            "the Layer 1 inventory: free, instant, no API key required.\n\n"
-            "lens (used only when catalog=true) is optional freeform reader context -- who you are, whose "
-            "voices/authors you weight highly, what you are working on, what makes a page worth keeping FOR "
-            "YOU -- threaded into every tab's judgment as trusted context the page's own content can never "
-            "override. concurrency bounds how many per-tab model calls run at once (default 4); top_n bounds "
-            "how many entries land in Layer 1's duplicates/by_domain lists (default 20) and never affects "
-            "the aggregate counts.\n\n"
-            "Returns only a MANIFEST (paths, per-tab STATUS, counts, a per-value tally, a best-effort "
-            "token-usage summary) -- NEVER the catalog judgment text itself (what/who/why_kept), which is "
-            "written to a catalog.json sidecar in archive_dir. tab_ids restricts Layer 2 only; Layer 1 "
-            "always covers every tab in tabs.json, and a requested id absent from tabs.json gets {'status': "
-            "'not_found', ...} in the sidecar rather than being silently ignored. A tab with NEITHER a "
-            "screenshot NOR extracted markdown on disk is recorded {'status': 'no_content', ...} -- a real, "
-            "visible non-result, never a fabricated summary. A model response missing required fields is "
-            "rejected and retried exactly once before being recorded 'failed' with the real reason.",
             {
-                "type": "object",
-                "properties": {
-                    "archive_dir": {
-                        "type": "string",
-                        "description": "The archive directory browser_archive's manifest reported.",
-                    },
-                    "catalog": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Opt-in to Layer 2 (per-tab LLM judgment). false (default) returns ONLY the "
-                            "free, local Layer 1 structural inventory."
-                        ),
-                    },
-                    "lens": {
-                        "type": "string",
-                        "description": (
-                            "Optional freeform reader context (only used when catalog=true) -- who you "
-                            "are, whose voices/authors you weight highly, what you're working on."
-                        ),
-                    },
-                    "tab_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Restrict Layer 2 cataloging to this subset. Omit to catalog every tab.",
-                    },
-                    "concurrency": {
-                        "type": "integer",
-                        "default": DEFAULT_CONCURRENCY,
-                        "description": "How many per-tab model calls run concurrently.",
-                    },
-                    "top_n": {
-                        "type": "integer",
-                        "default": DEFAULT_TOP_N,
-                        "description": "How many entries land in Layer 1's duplicates/by_domain lists.",
-                    },
+                **_DEVICE_ID_PROP,
+                "host": {
+                    "type": "string",
+                    "description": (
+                        "setup: explicit hub bind/advertise host. Default: this machine's "
+                        "Tailscale IP, falling back to 127.0.0.1 (loopback-only)."
+                    ),
                 },
-                "required": ["archive_dir"],
-            },
-            archive_catalog_runner,
-        ),
-        _HubTool(
-            "browser_update_extension",
-            "Verify-or-guide update of one device's extension (the version-skew story). ALWAYS attempts the "
-            "automatic path first, then VERIFIES it actually worked by re-reading the device's reported "
-            "command set after it reconnects -- never reports success without that proof. Whether this "
-            "browser's unpacked extension lives on THIS machine or a genuinely remote one cannot be detected "
-            "reliably (a network mount can look local), so it does not try: it restages a fresh build from "
-            "this hub's own source (the same mechanism `amplifier-browser-bridge init` uses) and sends the "
-            "device a `reload` command, which drops its websocket -- chrome.runtime.reload() re-reads files "
-            "from disk close to immediately. It then polls (never a bare sleep) for the device to reconnect "
-            "with a NEW connection (not the stale pre-reload one) within reconnect_timeout_s, and compares "
-            "its command set before and after.\n\n"
-            "Already reporting every command this hub knows -> no-op (already_current: true, updated: "
-            "false). Command set genuinely changed -> the automatic update reached this device's real "
-            "extension files (updated: true). Reload succeeded and the device reconnected but its set is "
-            "UNCHANGED -> this hub's restage did not reach wherever the browser actually loads its extension "
-            "from (most likely a different machine), reported plainly with a `guided` block: a real "
-            "download_url (this hub's own GET /setup/extension.zip, resolvable from wherever this tool is "
-            "called from) plus the manual unzip/reload steps to follow on that machine. The device never "
-            "acknowledges `reload` at all -> its extension predates self-service reload entirely (a one-time "
-            "bootstrap limit, not a bug), also guided, with that reason named explicitly. Not currently "
-            "connected, or never reconnects within reconnect_timeout_s -> fails loud naming exactly which "
-            "happened, never silently treated as success. A device that has NEVER reported a command set is "
-            "not a crash and not 'unknown' -- it is a definitively stale extension, and the automatic path "
-            "is still attempted for it: seeing its set go from unreported to real and populated after reload "
-            "IS the proof the automatic update worked.",
-            {
-                "type": "object",
-                "properties": {
-                    **_DEVICE_ID_PROP,
-                    "reconnect_timeout_s": {
-                        "type": "number",
-                        "default": DEFAULT_RECONNECT_TIMEOUT_S,
-                        "description": (
-                            "How long to wait for the device to reconnect after sending reload "
-                            "before failing loud, in seconds."
-                        ),
-                    },
+                "port": {"type": "integer", "default": DEFAULT_PORT, "description": "setup: hub port."},
+                "install_service": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "setup: install/start the hub as a background OS service.",
                 },
-                "required": ["device_id"],
+                "force_token": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "setup: rotate the hub token (requires re-pasting it into every browser).",
+                },
+                "wait_reachable_s": {
+                    "type": "number",
+                    "default": DEFAULT_WAIT_REACHABLE_S,
+                    "description": "setup: how long to wait for the hub to answer.",
+                },
+                "token_file": {
+                    "type": "string",
+                    "description": "setup: advanced, override the token file path.",
+                },
+                "dest": {
+                    "type": "string",
+                    "description": "setup: advanced, override the staged-extension dir.",
+                },
+                "reconnect_timeout_s": {
+                    "type": "number",
+                    "default": DEFAULT_RECONNECT_TIMEOUT_S,
+                    "description": "update_extension: how long to wait for the device to reconnect.",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "narrow_scope: the session to narrow.",
+                },
+                "write": {
+                    "type": "string",
+                    "description": "'*' (unrestricted) or comma-separated hostnames, subdomain-inclusive.",
+                },
+                "read": {"type": "string", "description": "As write, for reads."},
+                "on_unknown": {"type": "string", "enum": ["allow", "gate", "deny"], "default": "allow"},
+                "redeem": {"type": "string", "enum": ["agent", "unredeemable"], "default": "agent"},
+                "unattended": {"type": "boolean", "default": False},
             },
-            update_extension_runner,
+            "setup is safe to re-run: an existing token is reused, never rotated, unless "
+            "force_token=true, and an already-configured browser's saved settings are never "
+            "touched. If the hub is not reachable yet, result.hub_reachable is false, "
+            "result.pairing is null, and result.warnings/result.service/result.manual_hub_command "
+            "name exactly what is missing (result.setup_url is the manual route). status runs the "
+            "same checks as `amplifier-browser-bridge doctor`.\n"
+            "narrow_scope may only shrink write/read, move on_unknown allow -> gate -> deny, "
+            "redeem agent -> unredeemable, and unattended false -> true.",
         ),
     ]
 

@@ -7,6 +7,11 @@ option with honest tradeoffs and lets the calling agent choose. This guide is th
 that makes those tradeoffs legible in one place, grounded in what was actually
 measured against real pages, not guessed.
 
+**Tool names below are the MCP server's flat `browser_<command>` vocabulary.** The native
+Amplifier tool module now mounts the same commands as seven `operation`-enum tools; every
+name here maps to exactly one `(tool, operation)` pair in `docs/AGENT_SURFACES.md`'s table.
+The mechanisms and tradeoffs are identical either way.
+
 Read this alongside `docs/PROTOCOL.md`'s "Command vocabulary", "Frames", and
 "Content-extraction mechanisms" sections, which define each mechanism precisely --
 this guide is the decision layer on top, not a replacement.
@@ -155,8 +160,9 @@ amplifier-browser-bridge session-establish --write github.com,contoso.com
 amplifier-browser-bridge click d1/7 e12 --session 9f2c...hex
 ```
 
-(MCP: `browser_establish_session(write="github.com,contoso.com")` then pass the returned
-`session_id` to `browser_click`/`browser_type`/`browser_key`/`browser_navigate`.)
+(MCP: `browser_establish_session(write="github.com,contoso.com")`; native Amplifier tool:
+`browser_admin(operation="establish_session", write="github.com,contoso.com")`. Either way,
+pass the returned `session_id` to the click/type/key/navigate call.)
 
 **Declaring a broad (or even narrow-but-including-the-right-origin) write scope does NOT, by
 itself, let this session confirm its own privilege escalations there.** `permission_change` --

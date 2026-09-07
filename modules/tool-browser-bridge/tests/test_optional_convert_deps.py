@@ -33,6 +33,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from conftest import legacy_tool
 
 # Every package this repo's optional `convert` extra provides (trafilatura,
 # html2text) or that arrives transitively through it (lxml, imported directly
@@ -84,16 +85,19 @@ def test_tool_module_imports_and_registers_every_tool_without_convert_extra(
     tools = module._build_tools()
     names = {t.name for t in tools}
 
-    # The two tools that (indirectly, via archive_convert/mhtml_convert) touch
-    # the optional convert deps must still be registered -- only calling them
-    # is gated on the extra, not the tool module loading at all.
-    assert "browser_archive_convert" in names
-    assert "browser_archive_catalog" in names
+    # The two OPERATIONS that (indirectly, via archive_convert/mhtml_convert)
+    # touch the optional convert deps must still be registered -- only calling
+    # them is gated on the extra, not the tool module loading at all.
+    archive_ops = next(t for t in tools if t.name == "browser_archive").input_schema["properties"][
+        "operation"
+    ]["enum"]
+    assert "convert" in archive_ops
+    assert "catalog" in archive_ops
     # Every other tool this module ships must also still be present -- the
-    # original bug crashed the ENTIRE module, not just these two tools.
+    # original bug crashed the ENTIRE module, not just these two.
     assert "browser_devices" in names
     assert "browser_archive" in names
-    assert len(tools) == 31
+    assert len(tools) == 7
 
 
 @pytest.mark.asyncio
@@ -108,7 +112,8 @@ async def test_tool_module_mounts_every_tool_without_convert_extra(convert_extra
     registered_names = {c.kwargs.get("name") for c in coordinator.mount.call_args_list}
     assert registered_names == expected_names
     assert coordinator.mount.call_count == len(expected_names)
-    assert "browser_archive_convert" in result["provides"]
+    assert "browser_archive" in result["provides"]
+    assert module.LEGACY_TOOLS["browser_archive_convert"] == ("browser_archive", "convert")
 
 
 def test_archive_convert_module_itself_imports_without_convert_extra(convert_extra_missing: None) -> None:
@@ -179,8 +184,7 @@ async def test_browser_archive_convert_tool_surfaces_clear_remediation_without_c
     tab_dir.mkdir(parents=True)
     (tab_dir / "page.mhtml").write_bytes(_SYNTHETIC_MHTML)
 
-    tools = module._build_tools()
-    tool = next(t for t in tools if t.name == "browser_archive_convert")
+    tool = legacy_tool("browser_archive_convert", module)
 
     with pytest.raises(ImportError) as exc_info:
         await tool.execute({"archive_dir": str(archive_dir)})

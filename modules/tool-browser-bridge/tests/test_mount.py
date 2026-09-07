@@ -12,8 +12,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from amplifier_browser_bridge import Target
 from amplifier_core import ToolResult
+from conftest import legacy_tool
 
-from amplifier_module_tool_browser_bridge import _build_tools, _client, mount
+from amplifier_module_tool_browser_bridge import LEGACY_TOOLS, _build_tools, _client, mount
 
 
 class _FakeHubClient:
@@ -47,10 +48,12 @@ class _FakeHubClient:
 
 
 def _tool_by_name(name: str):
-    tools = _build_tools()
-    matches = [t for t in tools if t.name == name]
-    assert len(matches) == 1, f"expected exactly one tool named {name!r}, found {len(matches)}"
-    return matches[0]
+    """Resolve a PRE-CONSOLIDATION tool name through the compatibility table.
+
+    Every call here is also a live check that `name` still resolves to exactly
+    one (tool, operation) pair -- see tests/conftest.py.
+    """
+    return legacy_tool(name)
 
 
 # ---------------------------------------------------------------------------
@@ -86,44 +89,24 @@ async def test_every_tool_satisfies_the_tool_protocol():
         assert callable(tool.execute)
 
 
-@pytest.mark.asyncio
-async def test_tool_names_match_mcp_server_vocabulary():
-    """Same tool vocabulary as mcp_server.py, for consistency across surfaces."""
+def test_the_mounted_surface_is_the_seven_consolidated_tools():
+    """Seven subject-area tools, not one per browser-bridge command.
+
+    This surface deliberately no longer matches mcp_server.py's 29 flat tools;
+    the divergence is recorded in docs/AGENT_SURFACES.md, and LEGACY_TOOLS is
+    what keeps every former name reachable (see test_consolidated_surface.py).
+    """
     names = {t.name for t in _build_tools()}
-    expected = {
+    assert names == {
         "browser_devices",
         "browser_tabs",
-        "browser_snapshot",
-        "browser_read",
-        "browser_click",
-        "browser_type",
-        "browser_key",
-        "browser_scroll",
-        "browser_navigate",
-        "browser_tab_open",
-        "browser_tab_close",
-        "browser_tab_activate",
-        "browser_screenshot",
-        "browser_vision_read",
-        "browser_wait_for",
-        "browser_wait_text",
-        "browser_poll",
-        "browser_reload",
-        "browser_fetch_bytes",
-        "browser_grab_image",
-        "browser_downloads_list",
+        "browser_page",
+        "browser_capture",
         "browser_download",
-        "browser_wait_download",
-        "browser_establish_session",
-        "browser_narrow_scope",
         "browser_archive",
-        "browser_archive_convert",
-        "browser_archive_catalog",
-        "browser_setup",
-        "browser_setup_status",
-        "browser_update_extension",
+        "browser_admin",
     }
-    assert names == expected
+    assert {tool for tool, _ in LEGACY_TOOLS.values()} == names
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +229,8 @@ def test_browser_tabs_schema_declares_new_filter_and_paging_properties():
     props = tool.input_schema["properties"]
     for name in ("window_id", "url_contains", "title_contains", "limit", "offset", "summary"):
         assert name in props, f"browser_tabs schema missing {name!r}"
-    assert tool.input_schema["required"] == ["device_id"]
+    assert tool.input_schema["required"] == ["operation"]
+    assert props["operation"]["enum"] == ["list", "open", "close", "activate"]
 
 
 @pytest.mark.asyncio

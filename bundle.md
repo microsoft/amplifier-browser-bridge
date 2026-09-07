@@ -63,8 +63,9 @@ time, only when a tool is actually called (`hub error: ...`). Point
 
 ## What this bundle provides
 
-27 `browser_*` tools -- see `docs/AGENT_SURFACES.md` for the full vocabulary. 25 drive an
-already-connected browser; `browser_setup`/`browser_setup_status` do the rest of onboarding
+7 `browser_*` tools, each an `operation` enum -- see `docs/AGENT_SURFACES.md` for the full
+vocabulary and the map from the 31 former flat tool names. Six of them drive an
+already-connected browser; `browser_admin`'s `setup`/`status` do the rest of onboarding
 in-process, so `amplifier bundle add ... --app` is the complete install path -- no separate
 `uv tool install`, no CLI on PATH required.
 [`context/awareness.md`](context/awareness.md) (loaded into every session

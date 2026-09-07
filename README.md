@@ -111,10 +111,12 @@ amplifier bundle add git+https://github.com/microsoft/amplifier-browser-bridge@m
 
 Verified 2026-08-10 against this exact repo and commit: `amplifier bundle add ... --app` ->
 `✓ Added app bundle`, and `amplifier bundle show` confirms it resolves the `tool-browser-bridge`
-module. This mounts 27 `browser_*` tools into every Amplifier session on this machine -- 25 for
-driving an already-connected browser, plus two that do the REST of onboarding in-process:
+module. This mounts 7 `browser_*` tools into every Amplifier session on this machine -- each one an
+`operation` enum over the commands it covers (see `docs/AGENT_SURFACES.md` for the full
+vocabulary and the map from the 31 former flat tool names). Two of `browser_admin`'s operations
+do the REST of onboarding in-process:
 
-- **`browser_setup`** -- generates a hub token if one doesn't exist yet, stages the extension,
+- **`browser_admin(operation="setup")`** -- generates a hub token if one doesn't exist yet, stages the extension,
   installs the hub as a background OS service (systemd --user / launchd, so it survives logout
   and reboot) unless you pass `install_service: false`, and -- once the hub answers -- mints a
   short-lived pairing code. The one field that matters comes back as `result.pairing.pair_url`:
@@ -123,13 +125,13 @@ driving an already-connected browser, plus two that do the REST of onboarding in
   unpacked" (the one genuinely manual step -- Edge has no CLI/API for it), and pairs itself.
   Setup never needs the CLI on PATH: because the bundle pulls in the `tool-browser-bridge`
   module, which depends on the `amplifier-browser-bridge` library, that library is already
-  present in Amplifier's own Python environment -- `browser_setup` runs entirely in-process.
-- **`browser_setup_status`** -- the same six checks `amplifier-browser-bridge doctor` runs
+  present in Amplifier's own Python environment -- setup runs entirely in-process.
+- **`browser_admin(operation="status")`** -- the same six checks `amplifier-browser-bridge doctor` runs
   (token store, network exposure, service status, hub reachability, token match, whether a
-  device has connected). Call it any time after `browser_setup` to confirm pairing completed, or
+  device has connected). Call it any time after setup to confirm pairing completed, or
   to see exactly what's still missing if it hasn't.
 
-Unlike the interactive `init` CLI flow it wraps, `browser_setup` never prompts (a tool call
+Unlike the interactive `init` CLI flow it wraps, `setup` never prompts (a tool call
 returns exactly once, to a chat transcript, not a terminal) and never blocks for minutes waiting
 for a browser to connect -- if the hub isn't reachable yet (service still starting, an
 unsupported platform, or `install_service: false` with nothing running yet),

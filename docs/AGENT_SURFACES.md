@@ -5,62 +5,87 @@ Phase 1. This doc covers the two Phase 2 surfaces -- both are thin adapters over
 the same lib (`client.py`, `addressing.py`, `tiers.py`); neither implements any
 new logic.
 
-**Hand-verified 2026-08-16 (counted directly against the code, not assumed --
-`grep -c '^@mcp.tool()' src/amplifier_browser_bridge/mcp_server.py` and
-`len(_build_tools())` from a real Python session against this branch, not
-carried forward from any prior claim):** the native Amplifier tool module
-registers **31** tools; the MCP server registers **29**. They are not
-byte-identical sets -- the native module has three the MCP server does not
-(`browser_reload`, `browser_setup`, `browser_setup_status`), and the MCP
-server has one the native module does not (`browser_confirm`). Every other
-name below is shared by both, named `browser_<command>` (mirroring
-Playwright MCP's vocabulary, design doc section 9), including
-`browser_archive` (D2, browser-state archive), `browser_archive_convert`
-(MHTML-to-markdown conversion -- see "Browser-state archive: MHTML ->
-markdown conversion" below), `browser_archive_catalog` (the new tab-cataloging
-step -- see "Browser-state archive: tab cataloging" below), and
-`browser_update_extension` (the version-skew story -- see "Extension
-update (Tier 0/1/2)" below). A prior revision of this doc claimed "30 and
-28" -- that count was already stale before this update (it predated
-`browser_archive_catalog` being added to both surfaces); this is exactly the
-kind of drift this note exists to catch -- **do not carry either number
-forward again without re-counting**; re-run the two commands above against
-whatever HEAD you're documenting.
+**THE TWO SURFACES NO LONGER MATCH, AND THAT IS DELIBERATE.** As of the
+consolidation (lane `j7ol-browser-bridge-consolidation`), the native Amplifier
+tool module mounts **7** tools, each with an `operation` enum -- the shape
+`android_inspector`/`ios_inspector`/`terminal_inspector` already establish. The MCP
+server still mounts **29** flat tools, one per command, and was left unedited.
 
-| Tool | Command | Notes | Surface |
-|---|---|---|---|
-| `browser_devices` | `list_devices` | Entry point -- call first | both |
-| `browser_tabs` | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status`; PAGED by default (`limit`/`offset`), filterable (`window_id`/`url_contains`/`title_contains`), and has a `summary` mode -- see "browser_tabs: pagination, filtering, and summary mode" below | both |
-| `browser_snapshot` | `snapshot` | Accessibility-style tree with element `ref`s; optional `wake`/`activate` (see Discarded tabs, docs/PROTOCOL.md) | both |
-| `browser_read` | `read` | Full visible text across all frames; optional `wake`/`activate` | both |
-| `browser_click` | `click` | `ref`, optional `session_id` | both |
-| `browser_type` | `type` | `ref`, `text`, optional `session_id` | both |
-| `browser_key` | `key` | `key`, optional `ref`, `session_id` | both |
-| `browser_scroll` | `scroll` | `x`, `y` | both |
-| `browser_navigate` | `navigate` | `url`, optional `session_id` | both |
-| `browser_tab_open` | `tab_open` | device-only target; `url`, `active` (default background) | both |
-| `browser_tab_close` | `tab_close` | | both |
-| `browser_tab_activate` | `tab_activate` | the one command allowed to steal focus | both |
-| `browser_screenshot` | `screenshot` | pixels only, no model call; `capture_hidden`, `frame_id`, `multi_page` | both |
-| `browser_vision_read` | (composed: `screenshot` + vision-model extraction) | TEXT extracted from pixels via a configured vision provider | both |
-| `browser_wait_for` | `wait_for` | `selector`, `timeout_ms` | both |
-| `browser_wait_text` | `wait_text` | `text`, `timeout_ms` | both |
-| `browser_fetch_bytes` | `fetch_bytes` | device-only target; fetch a URL from the extension's own (cookied) context | both |
-| `browser_grab_image` | `grab_image` | fetch a URL from the PAGE's own script context (defeats Referer/hotlink protection) | both |
-| `browser_downloads_list` | `downloads_list` | device-only target; baseline for `since_id` | both |
-| `browser_download` | `download` | device-only target; triggers `chrome.downloads.download` | both |
-| `browser_wait_download` | `wait_download` | device-only target; poll for a completed download | both |
-| `browser_poll` | (agent-only `poll`) | check on / retrieve a previously queued command | both |
-| `browser_establish_session` | (agent-only) | create a session with a declared write scope (confirmation-gate.md) | both |
-| `browser_narrow_scope` | (agent-only) | narrow an existing session's scope -- never widens | both |
-| `browser_reload` | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) | **native module only** |
-| `browser_confirm` | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
-| `browser_archive` | (composed: `windows`/`tabs`/`page_state`/`mhtml`/`nav_history`/profile-data commands) | D2, browser-state archive -- capture browser state at a chosen depth (L0-L5), write payloads to disk, return a MANIFEST (never the payload) -- see "Browser-state archive" below | both |
-| `browser_archive_convert` | (no wire command -- pure local conversion over an existing archive on disk) | Convert a `browser_archive` output's captured MHTML pages into markdown, AFTER THE FACT -- see "Browser-state archive: MHTML -> markdown conversion" below | both |
-| `browser_archive_catalog` | (no wire command -- pure local Layer 1 inventory + opt-in Layer 2 LLM judgment over an existing archive on disk) | Catalog a `browser_archive` output's tabs, AFTER THE FACT: a free structural inventory (duplicates, per-window/domain breakdowns, awake/asleep/discarded/pinned counts) always, plus an opt-in per-tab what/who/why_kept/value judgment through vision.py -- see "Browser-state archive: tab cataloging" below | both |
-| `browser_update_extension` | (composed: restage + `reload` + polled `list_devices`) | verify-or-guide extension update -- see "Extension update (Tier 0/1/2)" below | both |
-| `browser_setup` | (native, in-process `init` equivalent) | first-run/re-run setup, no CLI on PATH required | **native module only** |
-| `browser_setup_status` | (native, in-process `doctor` equivalent) | diagnose the setup chain | **native module only** |
+Why the module moved and the MCP server did not: every mounted tool's
+name + description + input_schema is serialised into the request on EVERY request of
+EVERY Amplifier session that mounts this bundle, called or not. Thirty-one flat tools
+cost 47,248 serialised chars per request; the seven cost 19,611 (-58.5%). An MCP
+client pays that cost differently (the client decides what it forwards, and several
+strip or summarise tool lists), and the MCP surface has its own test suite
+(`tests/test_mcp.py`) pinned to the 29 names -- so consolidating it is separate,
+optional work, not a prerequisite. **Nothing about the wire protocol changed:** both
+surfaces still speak exactly the same `docs/PROTOCOL.md` commands to the same hub.
+
+### The seven native tools
+
+| Tool | Operations |
+|---|---|
+| `browser_devices` | `list`, `poll` |
+| `browser_tabs` | `list`, `open`, `close`, `activate` |
+| `browser_page` | `snapshot`, `read`, `click`, `type`, `key`, `scroll`, `navigate`, `wait_for`, `wait_text` |
+| `browser_capture` | `screenshot`, `vision_read`, `fetch_bytes`, `grab_image` |
+| `browser_download` | `list`, `start`, `wait` |
+| `browser_archive` | `archive`, `convert`, `catalog` |
+| `browser_admin` | `setup`, `status`, `reload`, `update_extension`, `establish_session`, `narrow_scope` |
+
+Shared parameters (`device_id`/`tab_id`/`window_id`/`timeout_s`) are declared once per
+tool instead of once per command, and every operation is named in its tool's
+description -- never hidden in code only.
+
+**Nothing was deleted.** `LEGACY_TOOLS` in
+`modules/tool-browser-bridge/amplifier_module_tool_browser_bridge/__init__.py` maps
+each of the 31 former tool names to exactly one `(tool, operation)` pair; the table
+below carries the same mapping, and
+`modules/tool-browser-bridge/tests/test_consolidated_surface.py` fails if any former
+name stops resolving. The five operations nobody has ever called (`browser_download`
+`start`, `browser_admin` `narrow_scope`/`update_extension`, `browser_archive`
+`convert`/`catalog`) are marked RARELY USED in their description lines rather than
+dropped.
+
+**Do not carry any tool count forward without re-counting.** Re-derive both with
+`grep -c '^@mcp.tool()' src/amplifier_browser_bridge/mcp_server.py` and
+`len(_build_tools())`; a prior revision of this doc shipped "30 and 28" and then
+"31 and 29" while the code had already moved on.
+
+| Former tool name | Native tool (operation) | Command | Notes | Surface |
+|---|---|---|---|---|
+| `browser_devices` | `browser_devices` (`list`) | `list_devices` | Entry point -- call first | both |
+| `browser_tabs` | `browser_tabs` (`list`) | `tabs` | Entry point -- call second, to get `tab_id` values; each entry carries `discarded`/`status`; PAGED by default (`limit`/`offset`), filterable (`window_id`/`url_contains`/`title_contains`), and has a `summary` mode -- see "browser_tabs: pagination, filtering, and summary mode" below | both |
+| `browser_snapshot` | `browser_page` (`snapshot`) | `snapshot` | Accessibility-style tree with element `ref`s; optional `wake`/`activate` (see Discarded tabs, docs/PROTOCOL.md) | both |
+| `browser_read` | `browser_page` (`read`) | `read` | Full visible text across all frames; optional `wake`/`activate` | both |
+| `browser_click` | `browser_page` (`click`) | `click` | `ref`, optional `session_id` | both |
+| `browser_type` | `browser_page` (`type`) | `type` | `ref`, `text`, optional `session_id` | both |
+| `browser_key` | `browser_page` (`key`) | `key` | `key`, optional `ref`, `session_id` | both |
+| `browser_scroll` | `browser_page` (`scroll`) | `scroll` | `x`, `y` | both |
+| `browser_navigate` | `browser_page` (`navigate`) | `navigate` | `url`, optional `session_id` | both |
+| `browser_tab_open` | `browser_tabs` (`open`) | `tab_open` | device-only target; `url`, `active` (default background) | both |
+| `browser_tab_close` | `browser_tabs` (`close`) | `tab_close` | | both |
+| `browser_tab_activate` | `browser_tabs` (`activate`) | `tab_activate` | the one command allowed to steal focus | both |
+| `browser_screenshot` | `browser_capture` (`screenshot`) | `screenshot` | pixels only, no model call; `capture_hidden`, `frame_id`, `multi_page` | both |
+| `browser_vision_read` | `browser_capture` (`vision_read`) | (composed: `screenshot` + vision-model extraction) | TEXT extracted from pixels via a configured vision provider | both |
+| `browser_wait_for` | `browser_page` (`wait_for`) | `wait_for` | `selector`, `timeout_ms` | both |
+| `browser_wait_text` | `browser_page` (`wait_text`) | `wait_text` | `text`, `timeout_ms` | both |
+| `browser_fetch_bytes` | `browser_capture` (`fetch_bytes`) | `fetch_bytes` | device-only target; fetch a URL from the extension's own (cookied) context | both |
+| `browser_grab_image` | `browser_capture` (`grab_image`) | `grab_image` | fetch a URL from the PAGE's own script context (defeats Referer/hotlink protection) | both |
+| `browser_downloads_list` | `browser_download` (`list`) | `downloads_list` | device-only target; baseline for `since_id` | both |
+| `browser_download` | `browser_download` (`start`) | `download` | device-only target; triggers `chrome.downloads.download` | both |
+| `browser_wait_download` | `browser_download` (`wait`) | `wait_download` | device-only target; poll for a completed download | both |
+| `browser_poll` | `browser_devices` (`poll`) | (agent-only `poll`) | check on / retrieve a previously queued command | both |
+| `browser_establish_session` | `browser_admin` (`establish_session`) | (agent-only) | create a session with a declared write scope (confirmation-gate.md) | both |
+| `browser_narrow_scope` | `browser_admin` (`narrow_scope`) | (agent-only) | narrow an existing session's scope -- never widens | both |
+| `browser_reload` | `browser_admin` (`reload`) | `reload` | device-only target; self-service extension reload (see docs/PROTOCOL.md) | **native module only** |
+| `browser_confirm` | -- (MCP server only) | (agent-only) | redeem a single-use confirmation-gate token | **MCP server only** |
+| `browser_archive` | `browser_archive` (`archive`) | (composed: `windows`/`tabs`/`page_state`/`mhtml`/`nav_history`/profile-data commands) | D2, browser-state archive -- capture browser state at a chosen depth (L0-L5), write payloads to disk, return a MANIFEST (never the payload) -- see "Browser-state archive" below | both |
+| `browser_archive_convert` | `browser_archive` (`convert`) | (no wire command -- pure local conversion over an existing archive on disk) | Convert a `browser_archive` output's captured MHTML pages into markdown, AFTER THE FACT -- see "Browser-state archive: MHTML -> markdown conversion" below | both |
+| `browser_archive_catalog` | `browser_archive` (`catalog`) | (no wire command -- pure local Layer 1 inventory + opt-in Layer 2 LLM judgment over an existing archive on disk) | Catalog a `browser_archive` output's tabs, AFTER THE FACT: a free structural inventory (duplicates, per-window/domain breakdowns, awake/asleep/discarded/pinned counts) always, plus an opt-in per-tab what/who/why_kept/value judgment through vision.py -- see "Browser-state archive: tab cataloging" below | both |
+| `browser_update_extension` | `browser_admin` (`update_extension`) | (composed: restage + `reload` + polled `list_devices`) | verify-or-guide extension update -- see "Extension update (Tier 0/1/2)" below | both |
+| `browser_setup` | `browser_admin` (`setup`) | (native, in-process `init` equivalent) | first-run/re-run setup, no CLI on PATH required | **native module only** |
+| `browser_setup_status` | `browser_admin` (`status`) | (native, in-process `doctor` equivalent) | diagnose the setup chain | **native module only** |
 
 See `docs/PROTOCOL.md` for the exact command semantics and `docs/designs/browser-bridge.md`
 for the addressing model (`device_id` -> `window_id`/`tab_id` -> `ref`) and the
@@ -208,12 +233,20 @@ not block, and it was not reported as an error.
 
 ## Amplifier tool module
 
-`modules/tool-browser-bridge/` wraps the same lib as 28 Amplifier tools: the 26 in the
-table above, plus `browser_setup` and `browser_setup_status` (native-module-only --
-in-process first-run/re-run setup and diagnostics, no CLI on PATH required; see
-`auto_setup.py` and the README's "Recommended: install via the Amplifier bundle").
-Every tool follows the `mount()` Iron Law (`creating-amplifier-modules`
-skill): each tool is registered via `await coordinator.mount("tools", tool, name=tool.name)`.
+`modules/tool-browser-bridge/` wraps the same lib as **7** Amplifier tools, each with
+an `operation` enum covering the 31 commands the table above lists (including
+`browser_admin`'s `setup`/`status` -- native-module-only, in-process first-run/re-run
+setup and diagnostics, no CLI on PATH required; see `auto_setup.py` and the README's
+"Recommended: install via the Amplifier bundle"). Every tool follows the `mount()`
+Iron Law (`creating-amplifier-modules` skill): each tool is registered via
+`await coordinator.mount("tools", tool, name=tool.name)`.
+
+Dispatch is one `_Op` registry per tool: `execute()` resolves `operation`, checks the
+parameters that operation cannot run without (JSON Schema cannot express "required,
+but only for operation=X", so an unknown operation or a missing parameter comes back
+named, as an adapter-level failure, rather than as a `KeyError` deeper down), then
+hands the hub's response straight back -- the tier pass-through guarantee below is
+unchanged.
 
 ## Browser-state archive (D2)
 

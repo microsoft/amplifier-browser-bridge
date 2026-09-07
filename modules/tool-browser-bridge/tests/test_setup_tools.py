@@ -16,15 +16,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from amplifier_core import ToolResult
-
-from amplifier_module_tool_browser_bridge import _build_tools
+from conftest import legacy_tool
 
 
 def _tool_by_name(name: str):
-    tools = _build_tools()
-    matches = [t for t in tools if t.name == name]
-    assert len(matches) == 1, f"expected exactly one tool named {name!r}, found {len(matches)}"
-    return matches[0]
+    """Resolve a PRE-CONSOLIDATION tool name through the compatibility table."""
+    return legacy_tool(name)
 
 
 @pytest.mark.asyncio
