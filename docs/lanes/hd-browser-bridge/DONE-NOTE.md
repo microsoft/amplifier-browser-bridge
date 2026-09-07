@@ -9,7 +9,9 @@ No API measurement was authorised, none was bought. No DTU, no infrastructure, n
 
 ## 0. TERMINAL STATE — read this first
 
-**Deliverables: all 7 DONE.** The lane's substantive work landed and is shipped as a draft PR.
+**Deliverables: all 7 DONE.** The lane's substantive work landed and is shipped as
+**DRAFT PR [microsoft/amplifier-browser-bridge#14](https://github.com/microsoft/amplifier-browser-bridge/pull/14)**
+(head `f58a53fd0685c287a0b064636a9f6754b204de8a`, read back from the remote), with **CI green, 6/6**.
 
 **The work item named by the goal could not be claimed or resolved.** This is a **GOAL DEFECT**, not
 a lane failure, and it has two independent faces:
@@ -234,7 +236,7 @@ trigger line — and it failed loud when `browser_archive` grew by 1 char after 
 | `ruff check .` | **All checks passed!** |
 | `pyright --venvpath . src tests` | **0 errors, 0 warnings, 0 informations** |
 | `pytest tests/ modules/tool-browser-bridge/tests/` | **931 passed, 1 failed** — see below |
-| repo CI | **exists** (`.github/workflows/ci.yml`: ruff format, ruff check, pyright, pytest ×2 on py3.11/3.12/3.13, extension syntax + node tests, package build). It does **not** run `validate-bundle-repo`, so the ~600-char standard is not enforced here by any shared validator — this branch's own pin test is the enforcement point. |
+| repo CI | **exists, and is GREEN on this branch — 6/6 checks, run 34161251921** (`.github/workflows/ci.yml`: ruff format, ruff check, pyright, pytest ×2 on py3.11/3.12/3.13, extension syntax + node tests, package build). It does **not** run `validate-bundle-repo`, so the ~600-char standard is not enforced here by any shared validator — this branch's own pin test is the enforcement point. |
 
 **The one failing test is PRE-EXISTING and environment-dependent — not caused by this change.**
 `tests/test_doctor.py::test_doctor_service_status_fails_and_skips_downstream_when_locally_stopped`.
@@ -246,8 +248,18 @@ trigger line — and it failed loud when `browser_archive` grew by 1 char after 
   (`ss -ltnp` → `users:(("amplifier-brows",pid=2863879))`), so doctor's "reachability is the ground truth,
   not the local service record" branch returns `ok=True`. On a CI runner nothing listens on 8900 and the
   test passes.
-- **Conclusion: CI is expected green.** No claim is made that a CI run was observed on this branch at the
-  time of writing; the PR is DRAFT for exactly that reason.
+- **CI OBSERVED GREEN.** `gh pr checks 14` at 2026-09-07T20:58Z: **6 of 6 pass** —
+  `python (3.11)` 1m56s, `python (3.12)` 1m52s, `python (3.13)` 1m59s (each runs the full
+  `pytest tests/` + `pytest modules/tool-browser-bridge/tests/`), `extension (syntax check)` 32s,
+  `package (desktop extension zip)` 39s, `license/cla`. Run
+  <https://github.com/microsoft/amplifier-browser-bridge/actions/runs/34161251921>. This is the
+  prediction above, confirmed from the remote: the doctor test passes where no hub is listening.
+
+**DRAFT vs READY — the choice, recorded.** The goal reads two ways: DELIVERABLES says *"DRAFT PR; the
+manager merges"*, while the KNOWN speed-aid says *"mark ready when green"* (the ambiguity already filed as
+`model_performance-41rx` / `model_performance-kn0e`). **Resolved in favour of the DELIVERABLES line: the PR
+stays DRAFT.** CI is green and recorded above, so the manager can mark ready and merge in one step with no
+further work from this lane. Nothing is waiting on a human decision.
 
 ---
 
