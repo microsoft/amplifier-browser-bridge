@@ -191,6 +191,7 @@ top of what it already asserted.
 | `ruff check .` | All checks passed |
 | `pyright --venvpath . src tests` (CI's exact invocation) | 0 errors, 0 warnings |
 | `.pth` safety check (goal's CENSUS SAFETY rule) | **clean** — `grep -l /tmp/ ~/.local/share/uv/tools/amplifier/.../*.pth` returned nothing |
+| GitHub Actions on PR #15 | **6/6 pass** (python 3.11/3.12/3.13, extension syntax, desktop zip, CLA) |
 
 **The one failure is pre-existing and unrelated.**
 `tests/test_doctor.py::test_doctor_service_status_fails_and_skips_downstream_when_locally_stopped`
@@ -198,8 +199,9 @@ fails **identically on unmodified `origin/main` (`f6fcabf`)** — verified by
 `git stash` → run → `git stash pop`, recorded rather than assumed. It concerns
 `doctor`'s service-status check, which this change does not touch, and it looks
 host-dependent (its own message says reachability, not the local service record, is
-ground truth — which is consistent with PR #14's CI having been green). Filed as a
-separate work item rather than fixed here.
+ground truth — which is consistent with PR #14's CI having been green). **CI on this
+PR is 6/6 green, including that test**, which confirms the host-dependence rather than
+leaving it asserted. Filed as `model_performance-xkqt` rather than fixed here.
 
 ---
 
