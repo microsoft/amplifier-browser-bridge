@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp.test_utils import TestServer
 
 from amplifier_browser_bridge.audit import AuditLog
 from amplifier_browser_bridge.auth import TokenStore
+from amplifier_browser_bridge.client import HubError
 from amplifier_browser_bridge.doctor import all_ok, run_doctor
 from amplifier_browser_bridge.hub import Hub
 
@@ -339,9 +340,16 @@ def test_doctor_service_status_fails_and_skips_downstream_when_locally_stopped(
         unit_path=Path("/home/x/.config/systemd/user/amplifier-browser-bridge.service"),
         detail="installed but NOT active (unit: .../amplifier-browser-bridge.service)",
     )
-    with patch("amplifier_browser_bridge.doctor.describe_service", return_value=stopped):
+    with (
+        patch("amplifier_browser_bridge.doctor.describe_service", return_value=stopped),
+        patch(
+            "amplifier_browser_bridge.doctor.HubClient.list_devices",
+            new=AsyncMock(side_effect=HubError("connection refused")),
+        ) as list_devices,
+    ):
         checks = asyncio.run(run_doctor("ws://127.0.0.1:8900/agent", "secret-123", token_file))
 
+    list_devices.assert_awaited_once()
     service_check = _by_name(checks, "service_status")
     assert not service_check.ok
     assert "NOT running" in service_check.message
