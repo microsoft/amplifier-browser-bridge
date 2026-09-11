@@ -739,13 +739,12 @@ def _build_tools() -> list[_HubTool]:
             "Get pixels or bytes out of a page.",
             {
                 "screenshot": _Op(
-                    "PIXELS (base64 + format), no model call. Use when you can see images directly.",
+                    "pixel data only, no model call: base64 TEXT, not an image attachment; use vision_read for visual QA.",
                     ("device_id", "tab_id"),
                     lambda input_data: _command("screenshot", screenshot_args, input_data),
                 ),
                 "vision_read": _Op(
-                    "pixels -> TEXT via a real, separate vision-model call. Use only when the "
-                    "content was never in the DOM (a canvas-rendered viewer, e.g. Word Online).",
+                    "visual QA/interpretation + OCR: capture pixels, then make a separate external vision-model call.",
                     ("device_id", "tab_id"),
                     vision_read_runner,
                 ),
@@ -774,7 +773,7 @@ def _build_tools() -> list[_HubTool]:
                 **_CAPTURE_SHAPE_PROPS,
                 "prompt": {
                     "type": "string",
-                    "description": "vision_read: what to extract from the image(s).",
+                    "description": "vision_read: what to inspect or transcribe from the image(s).",
                 },
                 "url": {"type": "string", "description": "fetch_bytes/grab_image: url to fetch."},
                 **_MAX_BYTES_PROP,
@@ -786,10 +785,10 @@ def _build_tools() -> list[_HubTool]:
             "scrolls and re-captures up to max_pages (default 10, hard cap 50) until the "
             "scrollable region ends, returning a `pages` array plus capped/stopped_reason -- "
             "never a partial result reported as complete.\n"
-            "vision_read needs a provider env var on the machine running this hub "
-            "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY, or "
-            "AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER to pin one); with none set it fails loud "
-            "with setup instructions and never returns empty text. It returns text, "
+            "vision_read reads ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY or "
+            "AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER (to pin one) from the process running "
+            "this tool, not necessarily the hub host; with none set it fails loud "
+            "with setup instructions, not empty text. Returns text, "
             "vision_provider, vision_model, image_count, page_count, capped, stopped_reason.\n"
             "fetch_bytes/grab_image return {url, content_type, byte_length, base64} and refuse "
             "past a 25MB cap unless max_bytes raises it.\n" + _QUEUE_NOTE,
