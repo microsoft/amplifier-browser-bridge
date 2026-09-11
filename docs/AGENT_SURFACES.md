@@ -94,6 +94,15 @@ three-tier connectivity model (`live` / `intermittent` / `dormant`). See
 read/act mechanisms plus modifiers (`wake`, `activate`, `trusted`, `capture_hidden`) is
 real power with no map otherwise.
 
+### Screenshot output shapes
+
+All screenshot variants return pixel data without a model call, but their output shapes
+are deliberately different: native `browser_capture(operation="screenshot")` returns
+base64 **text** (not an image attachment); the CLI writes bytes to a file and returns
+`saved_path`; MCP `browser_screenshot` returns image-native content block(s) plus
+metadata. `vision_read` is the separate external-model path that returns text. See the
+[visual-inspection decision guide](DECISION_GUIDE.md#i-want-to-inspect-how-the-page-looks).
+
 ## The one thing both surfaces must get right: tier pass-through
 
 A command sent to a device that is not `live` returns **immediately** as

@@ -549,9 +549,16 @@ async def test_browser_screenshot_maps_capture_hidden_and_frame_id(monkeypatch: 
     fake = _FakeHubClient({"ok": True, "result": {"tab_id": 7, "base64": "abc"}})
     monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
 
-    tool = _tool_by_name("browser_screenshot")
-    await tool.execute({"device_id": "d1", "tab_id": 7, "capture_hidden": True, "frame_id": 862})
+    async def _unexpected_vision_call(*_args, **_kwargs):
+        raise AssertionError("screenshot must not invoke vision extraction")
 
+    monkeypatch.setattr("amplifier_browser_bridge.vision_read.extract_text", _unexpected_vision_call)
+
+    tool = _tool_by_name("browser_screenshot")
+    result = await tool.execute({"device_id": "d1", "tab_id": 7, "capture_hidden": True, "frame_id": 862})
+
+    assert result.success is True
+    assert result.output == {"ok": True, "result": {"tab_id": 7, "base64": "abc"}}
     _, command, args = fake.command_calls[0]
     assert command == "screenshot"
     assert args == {"capture_hidden": True, "frame_id": 862}
@@ -581,6 +588,8 @@ async def test_browser_vision_read_composes_screenshot_and_extraction(monkeypatc
     monkeypatch.setattr("amplifier_module_tool_browser_bridge._client", lambda: fake)
 
     async def _fake_extract_text(images, prompt, **kwargs):
+        assert images == [raw]
+        assert prompt == "read this"
         return {"text": "hi", "provider": "anthropic", "model": "claude-3-5-sonnet-latest", "image_count": 1}
 
     monkeypatch.setattr("amplifier_browser_bridge.vision_read.extract_text", _fake_extract_text)
@@ -596,6 +605,7 @@ async def test_browser_vision_read_composes_screenshot_and_extraction(monkeypatc
     _, command, args = fake.command_calls[0]
     assert command == "screenshot"
     assert args["capture_hidden"] is True  # vision_read defaults capture_hidden=True
+    assert len(fake.command_calls) == 1
 
 
 @pytest.mark.asyncio
