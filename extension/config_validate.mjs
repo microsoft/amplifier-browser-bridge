@@ -68,6 +68,21 @@ export function validateHubUrl(url) {
   return { valid: true, normalized: parsed.toString(), error: null };
 }
 
+/** Recovery advice for a failed plain-WebSocket connection through a hostname.
+ * Keep hostname support: this is guidance, not validation or an automatic rewrite.
+ * TLS hostnames must stay intact for certificate verification. */
+export function hubAddressHint(url) {
+  const result = validateHubUrl(url);
+  if (!result.valid) return "";
+  const parsed = new URL(result.normalized);
+  const host = parsed.hostname;
+  if (parsed.protocol !== "ws:" || host === "localhost" || host.endsWith(".localhost") ||
+      host.includes(":") || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return "";
+  return "If the hub is running, try its Tailscale IP address in Manual setup > Hub URL, " +
+    "keeping the existing token. Browser DNS can differ from terminal DNS; a hostname " +
+    "may fail here even when it works in a terminal.";
+}
+
 /**
  * Validate a hub token as entered on the options page. A token is optional (a hub may run
  * with auth disabled -- dev-only, loudly logged on the hub side, see auth.py), so an empty

@@ -91,7 +91,7 @@
 // at the same time, for the same device. Step 2 now says "Paired with <host>", which is
 // true independent of whatever step 3 is currently reporting.
 
-import { validateHubUrl, validateHubToken } from "./config_validate.mjs";
+import { validateHubUrl, validateHubToken, hubAddressHint } from "./config_validate.mjs";
 import { describeConfigProvenance, CONFIG_SOURCE_MANUAL, CONFIG_SOURCE_PAIRED } from "./bundled_config.mjs";
 import { parsePairingCode, buildDeviceWsUrl, buildRedeemUrl } from "./pairing_code.mjs";
 import { discoverPairingCandidate } from "./pair_discovery.mjs";
@@ -258,7 +258,9 @@ function renderLadder(response) {
       step3El.setAttribute("data-marker-class", "alert");
       step3MarkerEl.textContent = "!";
       step3TitleEl.textContent = `Can't reach ${hostPortFromHubUrl(response.hubUrl)}`;
-      step3LineEl.textContent = `${lastError.message} Check the hub is running.`;
+      const addressHint = hubAddressHint(response.hubUrl);
+      step3LineEl.textContent = `${lastError.message} Check the hub is running.` +
+        (addressHint ? ` ${addressHint}` : "");
       mountPairingControls();
     } else if (lastError && lastError.code === "hub_error") {
       step3El.setAttribute("data-marker-class", "alert");

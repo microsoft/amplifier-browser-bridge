@@ -757,6 +757,23 @@ confirmed byte-for-byte unchanged. This is the structural fix: configuration liv
 `chrome.storage.local`, keyed to the extension's stable install path -- never in a file that an
 update overwrites.
 
+### Recovering a connection after reboot
+
+Pairing is stored in the extension's local storage and the hub's token file. A disconnected
+browser does not by itself mean that pairing was lost. The extension checks its repeating
+reconnect alarm whenever its service worker loads and at browser startup, restoring it if
+the browser cleared it. This keeps a wake-up path available when the hub or network was
+unavailable at startup and the worker's temporary retry timers have been discarded.
+
+If the options page says **Can't reach** a hostname, check that the hub service is running
+and both devices are on the tailnet. If those checks pass, use the hub's Tailscale IPv4
+address in **Manual setup → Hub URL**, keeping the existing token, then Save. Use
+`ws://<hub-tailnet-ip>:8900/device` for the standard transport. Browser DNS can differ from
+terminal DNS; a hostname working over SSH does not prove the extension can reach it.
+The failure message now surfaces this advice for plain `ws://` hostname connections.
+Keep a `wss://` hostname intact when using the optional TLS configuration, since its
+certificate is issued for that name.
+
 ## Connectivity tiers
 
 A command's behavior depends on how reachable the target device currently is. This is a
