@@ -2496,9 +2496,25 @@ if (typeof chrome.debugger !== "undefined" && chrome.debugger.onDetach) {
 // chrome.*-heavy entry-point file -- see options.js's identical comment.
 // ---------------------------------------------------------------------------
 
+async function ensureReconnectAlarm() {
+  // Alarms can be cleared across browser restarts. A setTimeout retry belongs
+  // only to this worker, so it cannot revive a worker evicted while the hub or
+  // network is unavailable. Restore the durable wake-up path on every load.
+  // Leave an existing repeating alarm alone so reconnect activity cannot keep
+  // postponing its next tick. Alarm failures must not block an immediate connect.
+  try {
+    const alarm = await chrome.alarms.get(ALARM_NAME);
+    if (!alarm || alarm.periodInMinutes !== 0.5) {
+      await chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+    }
+  } catch (err) {
+    console.error("amplifier-browser-bridge: failed to restore reconnect alarm", err);
+  }
+}
+
 if (!globalThis.__AMPLIFIER_BROWSER_BRIDGE_BACKGROUND_TEST__) {
   chrome.runtime.onInstalled.addListener(async () => {
-    chrome.alarms.create(ALARM_NAME, { periodInMinutes: 0.5 });
+    await ensureReconnectAlarm();
     // Adopt a build-time-baked hub URL/token (Android zero-config installs -- see
     // "Bundled first-run config" section above) BEFORE opening the options page or
     // attempting to connect, so if the options page DOES render (reliable on Desktop;
@@ -2519,6 +2535,7 @@ if (!globalThis.__AMPLIFIER_BROWSER_BRIDGE_BACKGROUND_TEST__) {
   });
 
   chrome.runtime.onStartup.addListener(() => {
+    ensureReconnectAlarm();
     connect();
   });
 
@@ -2602,6 +2619,7 @@ if (!globalThis.__AMPLIFIER_BROWSER_BRIDGE_BACKGROUND_TEST__) {
 
   // A freshly-revived service worker shouldn't wait for the next half-minute alarm
   // tick to reconnect -- try immediately on load too.
+  ensureReconnectAlarm();
   connect();
 }
 

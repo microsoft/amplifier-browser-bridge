@@ -392,6 +392,30 @@ test("renderLadder shows the unreachable message verbatim when nothing answered 
   assert.match(elements["step-3-line"].textContent, /Could not reach the hub/);
 });
 
+test("hostname connection failure surfaces IP recovery guidance while preserving the paired state", async () => {
+  const elements = installFakeDom();
+  globalThis.__AMPLIFIER_BROWSER_BRIDGE_OPTIONS_TEST__ = true;
+  globalThis.chrome = defaultFakeChrome();
+  const mod = await importOptionsFresh();
+  const response = {
+    configured: true, connected: false, hubUrl: "ws://hub:8900/device",
+    lastError: { code: "unreachable", message: "Could not reach the hub." },
+  };
+  mod.renderLadder(response);
+  assert.equal(elements["step-2-title"].textContent, "Paired with hub:8900");
+  assert.match(elements["step-3-line"].textContent, /Tailscale IP address/);
+  assert.match(elements["step-3-line"].textContent, /keeping the existing token/);
+
+  // Address advice is specific to failed hostname connections, not healthy
+  // connections, TLS configurations or a token that the hub actually rejected.
+  mod.renderLadder({ ...response, connected: true });
+  assert.doesNotMatch(elements["step-3-line"].textContent, /Tailscale IP address/);
+  mod.renderLadder({ ...response, hubUrl: "wss://hub.example/device" });
+  assert.doesNotMatch(elements["step-3-line"].textContent, /Tailscale IP address/);
+  mod.renderLadder({ ...response, lastError: { code: "auth_rejected", message: "Token rejected." } });
+  assert.doesNotMatch(elements["step-3-line"].textContent, /Tailscale IP address/);
+});
+
 test("renderLadder falls back to a calm PENDING state (not alert) when lastError is null (attempt still in flight)", async () => {
   // craft-inspector/emotion-reader fix: the window right after Save/Pair, before the
   // hub round trip has had time to succeed or fail, is expected and transient -- not a

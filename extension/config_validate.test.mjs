@@ -4,7 +4,23 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateHubUrl, validateHubToken, isConfigured } from "./config_validate.mjs";
+import { validateHubUrl, validateHubToken, isConfigured, hubAddressHint } from "./config_validate.mjs";
+
+test("failed plain-WebSocket hostname connections get IP guidance without rejecting the URL", () => {
+  for (const url of ["ws://hub:8900/device", "ws://hub.example-tailnet.ts.net:8900/device"]) {
+    assert.equal(validateHubUrl(url).valid, true);
+    assert.match(hubAddressHint(url), /Tailscale IP address/);
+    assert.match(hubAddressHint(url), /keeping the existing token/);
+  }
+});
+
+test("address guidance leaves TLS, IP literals, loopback names and invalid URLs alone", () => {
+  for (const url of ["wss://hub.example-tailnet.ts.net/device", "ws://100.64.1.2:8900",
+    "ws://127.0.0.1:8900", "ws://[::1]:8900", "ws://[fd7a:115c:a1e0::1]:8900",
+    "ws://localhost:8900", "ws://test.localhost:8900", "not a URL", null, undefined]) {
+    assert.equal(hubAddressHint(url), "", `unexpected hint for ${url}`);
+  }
+});
 
 test("validateHubUrl accepts a full ws:// URL with a path unchanged", () => {
   const result = validateHubUrl("ws://100.64.1.2:8900/device");
