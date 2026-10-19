@@ -68,6 +68,23 @@ next.
 
 ---
 
+## "I want to inspect how the page looks"
+
+For exact DOM text, prefer `read`; use `snapshot` when you need actionable element
+refs. For visual QA or interpretation, call `vision_read` directly -- it captures
+the pixels itself, so do not call `screenshot` first. Its default prompt is
+transcription; provide a custom `prompt` describing what to inspect for visual QA.
+
+`vision_read` sends captured pixels to a separately configured external vision model:
+this is deliberate data egress and latency/cost, and its provider comes from the
+environment of the process running the tool, not the active session's model provider. It is
+explicit opt-in; neither `screenshot` nor any DOM-read operation invokes vision
+automatically.
+
+Pixel output shapes differ by surface; see [Agent surfaces: screenshot output shapes](AGENT_SURFACES.md#screenshot-output-shapes).
+
+---
+
 ## Modifiers that change behavior on ANY of the above
 
 ### `wake` -- discarded/sleeping tabs

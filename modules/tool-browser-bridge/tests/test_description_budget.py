@@ -112,6 +112,9 @@ REQUIRED_TOKENS: dict[str, tuple[str, ...]] = {
         "AMPLIFIER_BROWSER_BRIDGE_VISION_PROVIDER",
         "vision_provider",
         "stopped_reason",
+        "inspect or transcribe",
+        "process running this tool",
+        "not necessarily the hub host",
         "max_bytes",
         "25MB",
         "byte_length",
@@ -280,6 +283,24 @@ def test_required_semantics_survive_every_future_trim():
 def test_every_tool_has_a_required_token_list():
     """No tool gets to be exempt from the fidelity gate."""
     assert set(_descriptions()) == set(REQUIRED_TOKENS)
+
+
+def test_capture_surface_distinguishes_native_pixels_from_external_visual_analysis():
+    """Pin the native capture guidance to the built tool surface, not guide prose."""
+    capture = next(tool for tool in _build_tools() if tool.name == "browser_capture")
+    screenshot_line = next(
+        (line for line in capture.description.splitlines() if line.startswith("- screenshot:")), None
+    )
+    vision_line = next(
+        (line for line in capture.description.splitlines() if line.startswith("- vision_read:")), None
+    )
+    assert screenshot_line is not None, "browser_capture has no '- screenshot:' operation line"
+    assert vision_line is not None, "browser_capture has no '- vision_read:' operation line"
+
+    for text in ("pixel data only", "base64 TEXT", "not an image attachment", "vision_read", "visual QA"):
+        assert text in screenshot_line
+    for text in ("visual QA/interpretation", "OCR", "separate external vision-model call"):
+        assert text in vision_line
 
 
 def test_detail_taken_off_the_wire_is_findable_in_the_docs():
